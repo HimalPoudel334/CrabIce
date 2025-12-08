@@ -7,8 +7,8 @@ use iced::{
     border::width,
     highlighter,
     widget::{
-        Column, Space, button, column, container, horizontal_space, pick_list, row, scrollable,
-        text, text_editor, text_input, tooltip,
+        Column, Space, button, checkbox, column, container, horizontal_space, pick_list, row,
+        scrollable, text, text_editor, text_input, tooltip,
     },
 };
 use tokio::time::Instant;
@@ -37,6 +37,13 @@ enum Message {
     CancelRequest,
     SaveBinaryResponse,
     FileSaved(Result<String, String>),
+
+    // Query params
+    QueryParamAdd,
+    QueryParamRemove(usize),
+    QueryParamKeyChanged(usize, String),
+    QueryParamValueChanged(usize, String),
+    QueryParamToggled(usize),
 
     //Subscription
     Tick,
@@ -77,6 +84,7 @@ enum Message {
 
 struct CrabiPie {
     // Request configuration
+    base_url: String,
     url: String,
     method: HttpMethod,
     headers_content: text_editor::Content,
@@ -84,8 +92,11 @@ struct CrabiPie {
     auth_type: AuthType,
     bearer_token: String,
     content_type: ContentType,
+    query_params: Vec<QueryParam>,
     form_data: Vec<FormField>,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    //video response
     video_player: Option<iced_video_player::Video>,
     video_state: Option<VideoState>,
 
@@ -119,20 +130,18 @@ struct CrabiPie {
 
 impl Default for CrabiPie {
     fn default() -> Self {
+        let base = "https://jsonplaceholder.typicode.com/posts".to_string();
         Self {
-            url: "https://jsonplaceholder.typicode.com/posts".to_string(),
+            base_url: base.clone(),
+            url: base,
             method: HttpMethod::GET,
             headers_content: text_editor::Content::with_text(HEADERS_DEFAULT),
             body_content: text_editor::Content::with_text(BODY_DEFAULT),
             auth_type: AuthType::None,
             bearer_token: String::new(),
             content_type: ContentType::Json,
-            form_data: vec![FormField {
-                key: String::new(),
-                value: String::new(),
-                files: Vec::new(),
-                field_type: FormFieldType::Text,
-            }],
+            query_params: vec![QueryParam::new()],
+            form_data: vec![FormField::new()],
             video_player: None,
             video_state: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -164,13 +173,20 @@ impl Default for CrabiPie {
 impl CrabiPie {
     fn render_request_section(&self) -> Element<'_, Message> {
         let tabs = row![
+            button(if self.active_request_tab == RequestTab::Query {
+                "[Query]"
+            } else {
+                "Query"
+            })
+            .on_press(Message::RequestTabSelected(RequestTab::Query))
+            .style(button::text),
             button(if self.active_request_tab == RequestTab::Body {
                 "[Body]"
             } else {
                 "Body"
             })
             .on_press(Message::RequestTabSelected(RequestTab::Body))
-            .style(button::success),
+            .style(button::text),
             button(if self.active_request_tab == RequestTab::Headers {
                 "[Headers]"
             } else {
@@ -189,6 +205,7 @@ impl CrabiPie {
         .spacing(5);
 
         let content = match self.active_request_tab {
+            RequestTab::Query => self.render_query_tab(),
             RequestTab::Body => self.render_body_tab(),
             RequestTab::Headers => self.render_headers_tab(),
             RequestTab::Auth => self.render_auth_tab(),
@@ -349,11 +366,71 @@ impl CrabiPie {
         }
 
         fields_col = fields_col.push(
-            button(text("➕ Add Field").shaping(text::Shaping::Advanced))
-                .on_press(Message::FormFieldAdd),
+            button(text("➕ Add").shaping(text::Shaping::Advanced)).on_press(Message::FormFieldAdd),
         );
 
         scrollable(fields_col).height(Length::Fill).into()
+    }
+
+    fn render_query_tab(&self) -> Element<'_, Message> {
+        let mut params_col = Column::new().spacing(10);
+
+        for (idx, param) in self.query_params.iter().enumerate() {
+            let checkbox =
+                checkbox("", param.enabled).on_toggle(move |_| Message::QueryParamToggled(idx));
+
+            let key_input = text_input("key", &param.key)
+                .on_input(move |key| Message::QueryParamKeyChanged(idx, key))
+                .width(200);
+
+            let value_input = text_input("value", &param.value)
+                .on_input(move |val| Message::QueryParamValueChanged(idx, val))
+                .width(300);
+
+            let remove_btn = button(text("❌").shaping(text::Shaping::Advanced))
+                .on_press(Message::QueryParamRemove(idx));
+
+            let param_row = row![
+                checkbox,
+                text("Key:"),
+                key_input,
+                text("Value:"),
+                value_input,
+                remove_btn,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            params_col = params_col.push(param_row);
+        }
+
+        params_col = params_col.push(
+            button(text("➕ Add").shaping(text::Shaping::Advanced))
+                .on_press(Message::QueryParamAdd),
+        );
+
+        scrollable(params_col).height(Length::Fill).into()
+    }
+
+    fn build_query_string(&self) -> String {
+        let params: Vec<String> = self
+            .query_params
+            .iter()
+            .filter(|p| p.enabled && !p.key.is_empty())
+            .map(|p| {
+                format!(
+                    "{}={}",
+                    urlencoding::encode(&p.key),
+                    urlencoding::encode(&p.value)
+                )
+            })
+            .collect();
+
+        if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        }
     }
 
     fn render_headers_tab(&self) -> Element<'_, Message> {
@@ -663,6 +740,30 @@ impl CrabiPie {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    fn update_query<F: FnOnce(&mut QueryParam)>(&mut self, idx: usize, f: F) {
+        if let Some(param) = self.query_params.get_mut(idx) {
+            f(param);
+        }
+        self.rebuild_url();
+    }
+
+    fn rebuild_url(&mut self) {
+        let base = self.base_url.trim_end_matches('?').to_string();
+        let mut qp: Vec<String> = Vec::new();
+
+        for p in &self.query_params {
+            if p.enabled && !p.key.is_empty() {
+                qp.push(format!("{}={}", p.key, p.value));
+            }
+        }
+
+        if qp.is_empty() {
+            self.url = base;
+        } else {
+            self.url = format!("{}?{}", base, qp.join("&"));
+        }
     }
 
     fn send_request(&mut self) -> iced::Task<Message> {
@@ -1204,6 +1305,34 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.copied = false;
             iced::Task::none()
         }
+        Message::QueryParamAdd => {
+            app.query_params.push(QueryParam::new());
+            app.rebuild_url();
+            iced::Task::none()
+        }
+
+        Message::QueryParamRemove(idx) => {
+            if idx < app.query_params.len() {
+                app.query_params.remove(idx);
+            }
+            app.rebuild_url();
+            iced::Task::none()
+        }
+
+        Message::QueryParamKeyChanged(idx, key) => {
+            app.update_query(idx, |p| p.key = key);
+            iced::Task::none()
+        }
+
+        Message::QueryParamValueChanged(idx, value) => {
+            app.update_query(idx, |p| p.value = value);
+            iced::Task::none()
+        }
+
+        Message::QueryParamToggled(idx) => {
+            app.update_query(idx, |p| p.enabled = !p.enabled);
+            iced::Task::none()
+        }
         Message::FormFieldKeyChanged(index, key) => {
             if let Some(field) = app.form_data.get_mut(index) {
                 field.key = key;
@@ -1261,7 +1390,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::FormFieldRemove(index) => {
-            app.form_data.remove(index);
+            if index < app.form_data.len() {
+                app.form_data.remove(index);
+            }
             iced::Task::none()
         }
         Message::FormFieldAdd => {
@@ -1448,6 +1579,7 @@ enum RequestTab {
     Body,
     Headers,
     Auth,
+    Query,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1502,6 +1634,17 @@ struct FormField {
     field_type: FormFieldType,
 }
 
+impl FormField {
+    pub fn new() -> Self {
+        Self {
+            key: String::new(),
+            value: String::new(),
+            files: Vec::new(),
+            field_type: FormFieldType::Text,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum AuthType {
     None,
@@ -1549,4 +1692,21 @@ pub struct VideoState {
     pub dragging: bool,
     pub volume: f64,
     pub buffering: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryParam {
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+}
+
+impl QueryParam {
+    pub fn new() -> Self {
+        Self {
+            key: String::new(),
+            value: String::new(),
+            enabled: true,
+        }
+    }
 }
