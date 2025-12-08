@@ -1,12 +1,17 @@
-use iced::theme;
-#[allow(unused)]
+#![allow(unused)]
+
+use std::sync::atomic::Ordering;
+
 use iced::{
-    Alignment, Border, Element, Event, Length, Padding, alignment, highlighter,
+    Alignment, Border, Element, Event, Length, Padding, alignment,
+    border::width,
+    highlighter,
     widget::{
         Column, Space, button, column, container, horizontal_space, pick_list, row, scrollable,
         text, text_editor, text_input, tooltip,
     },
 };
+use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -21,12 +26,29 @@ enum Message {
     ResponseReceived(HttpResponse),
     RequestTabSelected(RequestTab),
     ResponseTabSelected(ResponseTab),
+    ResponseBodyAction(text_editor::Action),
+    ResponseHeadersAction(text_editor::Action),
     ToggleLayout,
     PrettifyJson,
     CopyToClipboard,
     ResetCopied,
     JsonThemeChanged(highlighter::Theme),
     AppThemeChanged(iced::Theme),
+    CancelRequest,
+    SaveBinaryResponse,
+    FileSaved(Result<String, String>),
+
+    //Subscription
+    Tick,
+
+    //Video
+    TogglePause,
+    VideoVolume(f64),
+    ToggleLoop,
+    Seek(f64),
+    SeekRelease,
+    EndOfStream,
+    NewFrame,
 
     // Form data messages
     FormFieldKeyChanged(usize, String),
@@ -63,6 +85,9 @@ struct CrabiPie {
     bearer_token: String,
     content_type: ContentType,
     form_data: Vec<FormField>,
+    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    video_player: Option<iced_video_player::Video>,
+    video_state: Option<VideoState>,
 
     // Response data
     response_status: String,
@@ -72,6 +97,7 @@ struct CrabiPie {
     response_filename: String,
     response_bytes: Vec<u8>,
     response_content_type: String,
+    response_time: Option<std::time::Duration>,
 
     // UI state
     loading: bool,
@@ -80,6 +106,7 @@ struct CrabiPie {
     copied: bool,
     json_theme: highlighter::Theme,
     app_theme: iced::Theme,
+    svg_rotation: f32,
 
     // Find dialog
     find_dialog_open: bool,
@@ -106,6 +133,9 @@ impl Default for CrabiPie {
                 files: Vec::new(),
                 field_type: FormFieldType::Text,
             }],
+            video_player: None,
+            video_state: None,
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             response_status: String::new(),
             response_headers_content: text_editor::Content::new(),
             response_body_content: text_editor::Content::new(),
@@ -113,9 +143,11 @@ impl Default for CrabiPie {
             response_filename: String::new(),
             response_bytes: Vec::new(),
             response_content_type: String::new(),
+            response_time: None,
             loading: false,
+            svg_rotation: 0.0,
             active_request_tab: RequestTab::Body,
-            active_response_tab: ResponseTab::None,
+            active_response_tab: ResponseTab::Body,
             copied: false,
             find_dialog_open: false,
             find_replace_mode: false,
@@ -124,7 +156,7 @@ impl Default for CrabiPie {
             case_sensitive: false,
             whole_word: false,
             json_theme: highlighter::Theme::SolarizedDark,
-            app_theme: iced::Theme::default(),
+            app_theme: iced::Theme::CatppuccinMocha,
         }
     }
 }
@@ -207,8 +239,7 @@ impl CrabiPie {
                 &ContentType::ALL[..],
                 Some(self.content_type.clone()),
                 Message::ContentTypeSelected
-            )
-            .width(150),
+            ),
             horizontal_space(),
             prettify_button,
         ]
@@ -224,7 +255,7 @@ impl CrabiPie {
             )
             .height(Length::Fill)
             .into(),
-            ContentType::FormData => self.render_form_data(),
+            _ => self.render_form_data(),
         };
 
         column![type_selector, editor_content]
@@ -234,64 +265,79 @@ impl CrabiPie {
     }
 
     fn render_form_data(&self) -> Element<'_, Message> {
+        let is_url_encoded = matches!(self.content_type, ContentType::XWWWFormUrlEncoded);
+
         let mut fields_col = Column::new().spacing(10);
 
         for (idx, field) in self.form_data.iter().enumerate() {
-            // Match arm returning Element<Message> for the value/file part
-            let value_or_file: Element<'_, Message> = match field.field_type {
-                FormFieldType::Text => row![
-                    text("Value:"),
-                    text_input("value", &field.value)
-                        .on_input(move |val| Message::FormFieldValueChanged(idx, val))
-                        .width(200),
-                ]
-                .spacing(5)
-                .into(),
-
-                FormFieldType::File => {
-                    let file_count_text: Element<'_, Message> = if !field.files.is_empty() {
-                        text(format!("📎 {} file(s)", field.files.len())).into()
-                    } else {
-                        Space::new(0, 0).into()
-                    };
-
-                    row![
-                        text("File:"),
-                        button("📁 Choose").on_press(Message::FormFieldFileSelect(idx)),
-                        file_count_text
-                    ]
-                    .spacing(5)
-                    .into()
-                }
+            // Force text type if URL-encoded
+            let effective_type = if is_url_encoded {
+                FormFieldType::Text
+            } else {
+                field.field_type.clone()
             };
 
-            let field_row = row![
+            // Value input (always shown)
+            let value_input = text_input("value", &field.value)
+                .on_input(move |val| Message::FormFieldValueChanged(idx, val))
+                .width(280);
+
+            let value_or_file: Element<'_, Message> = if effective_type == FormFieldType::Text {
+                row![text("Value:"), value_input].spacing(8).into()
+            } else {
+                let file_count_text: Element<'_, Message> = if !field.files.is_empty() {
+                    text(format!("📎{} file(s)", field.files.len()))
+                        .shaping(text::Shaping::Advanced)
+                        .into()
+                } else {
+                    Space::new(0, 0).into()
+                };
+
+                row![
+                    text("File:"),
+                    button(text("📁 Choose").shaping(text::Shaping::Advanced))
+                        .on_press(Message::FormFieldFileSelect(idx)),
+                    file_count_text
+                ]
+                .spacing(8)
+                .into()
+            };
+
+            // Build the main row — conditionally include type picker
+            let mut field_row = row![
                 text("Key:"),
                 text_input("key", &field.key)
                     .on_input(move |key| Message::FormFieldKeyChanged(idx, key))
-                    .width(150),
-                pick_list(
+                    .width(160),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            // Only show type selector if NOT urlencoded
+            if !is_url_encoded {
+                field_row = field_row.push(pick_list(
                     &FormFieldType::ALL[..],
                     Some(field.field_type.clone()),
-                    move |ft| Message::FormFieldTypeSelected(idx, ft)
-                )
-                .width(80),
-                value_or_file,
-                button("❌").on_press(Message::FormFieldRemove(idx)),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center);
+                    move |ft| Message::FormFieldTypeSelected(idx, ft),
+                ));
+            }
+
+            field_row = field_row.push(value_or_file).push(
+                button(text("❌").shaping(text::Shaping::Advanced))
+                    .on_press(Message::FormFieldRemove(idx)),
+            );
 
             fields_col = fields_col.push(field_row);
 
-            if field.field_type == FormFieldType::File && !field.files.is_empty() {
-                let mut files_col = Column::new().spacing(2);
+            // Show selected files (only for File type and not urlencoded)
+            if effective_type == FormFieldType::File && !field.files.is_empty() && !is_url_encoded {
+                let mut files_col = Column::new().spacing(4);
                 for file in &field.files {
                     let filename = std::path::Path::new(file)
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or(file);
-                    files_col = files_col.push(text(format!("  • {}", filename)).size(12));
+                    files_col = files_col.push(text(format!(" • {filename}")).size(13));
                 }
                 fields_col = fields_col.push(container(files_col).padding(Padding {
                     top: 0.0,
@@ -302,7 +348,10 @@ impl CrabiPie {
             }
         }
 
-        fields_col = fields_col.push(button("➕ Add Field").on_press(Message::FormFieldAdd));
+        fields_col = fields_col.push(
+            button(text("➕ Add Field").shaping(text::Shaping::Advanced))
+                .on_press(Message::FormFieldAdd),
+        );
 
         scrollable(fields_col).height(Length::Fill).into()
     }
@@ -357,11 +406,12 @@ impl CrabiPie {
         } else {
             Space::new(0, 0).into()
         };
-
         let header_row =
             row![text("Response"), horizontal_space(), status_view,].align_y(Alignment::Center);
-
-        let tabs = row![
+        let mut tabs = iced::widget::Row::new()
+            .spacing(10)
+            .align_y(Alignment::Center);
+        tabs = tabs.push(
             button(if self.active_response_tab == ResponseTab::Body {
                 "[Body]"
             } else {
@@ -369,6 +419,8 @@ impl CrabiPie {
             })
             .on_press(Message::ResponseTabSelected(ResponseTab::Body))
             .style(button::text),
+        );
+        tabs = tabs.push(
             button(if self.active_response_tab == ResponseTab::Headers {
                 "[Headers]"
             } else {
@@ -376,50 +428,197 @@ impl CrabiPie {
             })
             .on_press(Message::ResponseTabSelected(ResponseTab::Headers))
             .style(button::text),
-            horizontal_space(),
-            text("Json Theme: "),
-            pick_list(
-                &highlighter::Theme::ALL[..],
-                Some(&self.json_theme),
-                Message::JsonThemeChanged,
-            ),
-            tooltip(
-                button(
-                    text(if self.copied { "✅" } else { "📋" }).shaping(text::Shaping::Advanced)
-                )
+        );
+        if let Some(resp_time) = self.response_time {
+            tabs = tabs.push(
+                text(format!("⏱️{:.2}ms", resp_time.as_secs_f32() * 1000.0))
+                    .shaping(text::Shaping::Advanced),
+            );
+        }
+        if self.is_response_binary {
+            tabs = tabs.push(
+                text(format!(
+                    "🗃️{:.2} KB",
+                    self.response_bytes.len() as f32 / 1024.0
+                ))
+                .shaping(text::Shaping::Advanced),
+            );
+        }
+        tabs = tabs.push(horizontal_space());
+        tabs = tabs.push(text("Json Theme: "));
+        tabs = tabs.push(pick_list(
+            &highlighter::Theme::ALL[..],
+            Some(&self.json_theme),
+            Message::JsonThemeChanged,
+        ));
+        tabs = tabs.push(tooltip(
+            button(text(if self.copied { "✅" } else { "📋" }).shaping(text::Shaping::Advanced))
                 .on_press(Message::CopyToClipboard)
                 .style(button::text),
-                if self.copied {
-                    "Copied"
-                } else {
-                    "Copy to Clipboard"
-                },
-                tooltip::Position::Bottom
-            ),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
+            if self.copied {
+                "Copied"
+            } else {
+                "Copy to Clipboard"
+            },
+            tooltip::Position::Bottom,
+        ));
+
+        let loading_overlay = if self.loading {
+            Some(
+                container(column![
+                    iced::widget::svg(iced::advanced::svg::Handle::from_memory(include_bytes!(
+                        "./assets/ring-with-bg.svg"
+                    )))
+                    .width(80)
+                    .height(80)
+                    .rotation(iced::Radians::from(
+                        self.svg_rotation * std::f32::consts::PI / 180.0,
+                    )),
+                    text("📤 Sending...").shaping(text::Shaping::Advanced)
+                ])
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fill)
+                .align_x(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
+                .style(|theme: &iced::Theme| {
+                    container::Style {
+                        background: Some(iced::Background::Color(
+                            iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5), // Semi-transparent overlay
+                        )),
+                        ..Default::default()
+                    }
+                }),
+            )
+        } else {
+            None
+        };
 
         let content: Element<Message> = match self.active_response_tab {
             ResponseTab::None => Space::new(0, 0).into(),
             ResponseTab::Body => {
                 if self.is_response_binary {
-                    column![
-                        text(format!(
-                            "📄 Binary file received: {}",
-                            self.response_filename
-                        ))
-                        .style(|_| text::Style {
-                            color: Some(iced::Color::from_rgb(1.0, 0.65, 0.0)),
-                        }),
-                        text(format!("Size: {} bytes", self.response_bytes.len())),
-                    ]
-                    .spacing(10)
-                    .into()
+                    let mut body_column = iced::widget::Column::new().spacing(5);
+                    body_column = body_column.push(
+                        button(text("💾 Save").shaping(text::Shaping::Advanced))
+                            .on_press(Message::SaveBinaryResponse)
+                            .style(|_, _| button::Style {
+                                text_color: iced::Color::from_rgb(1.0, 0.65, 0.0),
+                                background: None,
+                                ..Default::default()
+                            }),
+                    );
+                    if self.response_content_type.starts_with("image/") {
+                        body_column = body_column.push(
+                            scrollable(
+                                iced::widget::image(iced::advanced::image::Handle::from_bytes(
+                                    self.response_bytes.clone(),
+                                ))
+                                .content_fit(iced::ContentFit::None),
+                            )
+                            .height(Length::Fill)
+                            .width(Length::Fill),
+                        );
+                    } else if self.response_content_type.starts_with("video/") {
+                        // Video playback
+                        if let Some(video) = &self.video_player {
+                            let vs = self.video_state.as_ref().unwrap();
+                            body_column = body_column
+                                .push(
+                                    container::Container::new(
+                                        iced_video_player::VideoPlayer::new(video)
+                                            .width(iced::Length::Fill)
+                                            .height(iced::Length::Fill)
+                                            .content_fit(iced::ContentFit::Contain)
+                                            .on_end_of_stream(Message::EndOfStream)
+                                            .on_new_frame(Message::NewFrame),
+                                    )
+                                    .align_x(iced::Alignment::Center)
+                                    .align_y(iced::Alignment::Center)
+                                    .width(iced::Length::Fill)
+                                    .height(iced::Length::Fill),
+                                )
+                                .push(
+                                    container::Container::new(
+                                        iced::widget::Slider::new(
+                                            0.0..=video.duration().as_secs_f64(),
+                                            vs.position,
+                                            Message::Seek,
+                                        )
+                                        .step(0.1)
+                                        .on_release(Message::SeekRelease),
+                                    )
+                                    .padding(iced::Padding::new(5.0).left(10.0).right(10.0)),
+                                )
+                                .spacing(4)
+                                .push(
+                                    iced::widget::Row::new()
+                                        .spacing(2)
+                                        .align_y(iced::alignment::Vertical::Center)
+                                        .padding(iced::Padding::new(10.0).top(0.0))
+                                        .push(
+                                            button::Button::new(
+                                                text::Text::new(if video.paused() {
+                                                    "▶️"
+                                                } else {
+                                                    "⏸️"
+                                                })
+                                                .shaping(text::Shaping::Advanced),
+                                            )
+                                            .style(button::text)
+                                            .on_press(Message::TogglePause),
+                                        )
+                                        .push(
+                                            button::Button::new(
+                                                text::Text::new(if video.looping() {
+                                                    "🔁❌"
+                                                } else {
+                                                    "🔁"
+                                                })
+                                                .shaping(text::Shaping::Advanced),
+                                            )
+                                            .style(button::text)
+                                            .on_press(Message::ToggleLoop),
+                                        )
+                                        .push(
+                                            text::Text::new(format!(
+                                                "{}:{:02}s / {}:{:02}s",
+                                                vs.position as u64 / 60,
+                                                vs.position as u64 % 60,
+                                                video.duration().as_secs() / 60,
+                                                video.duration().as_secs() % 60,
+                                            ))
+                                            .width(iced::Length::Fill)
+                                            .align_x(iced::alignment::Horizontal::Right),
+                                        ),
+                                );
+                        } else {
+                            body_column = body_column.push(
+                                text("🎬 Loading video...")
+                                    .shaping(text::Shaping::Advanced)
+                                    .style(|_| text::Style {
+                                        color: Some(iced::Color::from_rgb(1.0, 0.65, 0.0)),
+                                    }),
+                            );
+                        }
+                    } else {
+                        body_column = body_column.push(
+                            text(format!(
+                                "📄 Binary file received: {}",
+                                self.response_filename
+                            ))
+                            .shaping(text::Shaping::Advanced)
+                            .style(|_| text::Style {
+                                color: Some(iced::Color::from_rgb(1.0, 0.65, 0.0)),
+                            }),
+                        );
+                        body_column = body_column
+                            .push(text(format!("Size: {} bytes", self.response_bytes.len())));
+                    }
+                    body_column.into()
                 } else {
                     scrollable(
                         text_editor(&self.response_body_content)
-                            .on_action(Message::BodyAction)
+                            .on_action(Message::ResponseBodyAction)
                             .highlight("json", self.json_theme)
                             .height(Length::Shrink),
                     )
@@ -429,12 +628,18 @@ impl CrabiPie {
             }
             ResponseTab::Headers => scrollable(
                 text_editor(&self.response_headers_content)
-                    .on_action(Message::HeadersAction)
+                    .on_action(Message::ResponseHeadersAction)
                     .highlight("json", self.json_theme)
                     .height(Length::Shrink),
             )
             .height(Length::Fill)
             .into(),
+        };
+
+        let content: Element<'_, Message> = if let Some(overlay) = loading_overlay {
+            iced::widget::stack![content, overlay].into()
+        } else {
+            content.into()
         };
 
         container(
@@ -460,7 +665,7 @@ impl CrabiPie {
         .into()
     }
 
-    fn send_request(&self) -> iced::Task<Message> {
+    fn send_request(&mut self) -> iced::Task<Message> {
         let url = self.url.clone();
         let method = self.method.clone();
         let body = self.body_content.text();
@@ -470,8 +675,27 @@ impl CrabiPie {
         let content_type = self.content_type.clone();
         let form_data = self.form_data.clone();
 
+        // Reset cancel flag, start timer, and clear previous response time
+        self.cancel_flag.store(false, Ordering::Relaxed);
+        self.response_time = None;
+
+        let cancel_flag = self.cancel_flag.clone();
+
         iced::Task::perform(
             async move {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return HttpResponse {
+                        status: "Cancelled".to_string(),
+                        headers: String::new(),
+                        body: "Request was cancelled".to_string(),
+                        is_binary: false,
+                        filename: String::new(),
+                        bytes: Vec::new(),
+                        content_type: String::new(),
+                        response_time: None,
+                        accepts_range: false,
+                    };
+                }
                 // Parse headers
                 let mut header_map = reqwest::header::HeaderMap::new();
 
@@ -519,6 +743,17 @@ impl CrabiPie {
                             ContentType::Json => {
                                 req.body(body).header("Content-Type", "application/json")
                             }
+                            ContentType::XWWWFormUrlEncoded => {
+                                let mut params = vec![];
+                                for field in &form_data {
+                                    if !field.key.is_empty()
+                                        && field.field_type == FormFieldType::Text
+                                    {
+                                        params.push((field.key.clone(), field.value.clone()));
+                                    }
+                                }
+                                req.form(&params)
+                            }
                             ContentType::FormData => {
                                 let mut form = reqwest::multipart::Form::new();
                                 for field in form_data {
@@ -551,10 +786,44 @@ impl CrabiPie {
                     }
                 };
 
+                // Check cancellation before sending
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return HttpResponse {
+                        status: "Cancelled".to_string(),
+                        headers: String::new(),
+                        body: "Request was cancelled".to_string(),
+                        is_binary: false,
+                        filename: String::new(),
+                        bytes: Vec::new(),
+                        content_type: String::new(),
+                        response_time: None,
+                        accepts_range: false,
+                    };
+                }
+
                 request = request.headers(header_map.to_owned());
+
+                let start_time = tokio::time::Instant::now();
 
                 match request.send().await {
                     Ok(resp) => {
+                        let response_time = start_time.elapsed();
+
+                        // Check cancellation after receiving response
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            return HttpResponse {
+                                status: "Cancelled".to_string(),
+                                headers: String::new(),
+                                body: "Request was cancelled".to_string(),
+                                is_binary: false,
+                                filename: String::new(),
+                                bytes: Vec::new(),
+                                content_type: String::new(),
+                                response_time: Some(response_time),
+                                accepts_range: false,
+                            };
+                        }
+
                         let status = format!(
                             "{} {}",
                             resp.status().as_u16(),
@@ -586,6 +855,25 @@ impl CrabiPie {
                                 url.split('/').last().unwrap_or("download").to_string()
                             });
 
+                        let accepts_ranges = hm
+                            .get("accept-ranges")
+                            .and_then(|h| h.to_str().ok())
+                            .is_some();
+
+                        if accepts_ranges {
+                            return HttpResponse {
+                                status,
+                                headers,
+                                body: String::new(),
+                                bytes: Vec::new(),
+                                is_binary,
+                                filename,
+                                content_type: ct,
+                                response_time: Some(response_time),
+                                accepts_range: accepts_ranges,
+                            };
+                        }
+
                         let (body, bytes) = if is_binary {
                             match resp.bytes().await {
                                 Ok(b) => (
@@ -603,6 +891,21 @@ impl CrabiPie {
                                 .text()
                                 .await
                                 .unwrap_or_else(|e| format!("Error reading body: {}", e));
+
+                            if cancel_flag.load(Ordering::Relaxed) {
+                                return HttpResponse {
+                                    status: "Cancelled".to_string(),
+                                    headers: String::new(),
+                                    body: "Request was cancelled".to_string(),
+                                    is_binary: false,
+                                    filename: String::new(),
+                                    bytes: Vec::new(),
+                                    content_type: String::new(),
+                                    response_time: Some(response_time),
+                                    accepts_range: accepts_ranges,
+                                };
+                            }
+
                             let body = if let Ok(j) = serde_json::from_str::<serde_json::Value>(&bt)
                             {
                                 serde_json::to_string_pretty(&j).unwrap_or(bt)
@@ -620,21 +923,42 @@ impl CrabiPie {
                             filename,
                             bytes,
                             content_type: ct,
+                            response_time: Some(response_time),
+                            accepts_range: accepts_ranges,
                         }
                     }
-                    Err(e) => HttpResponse {
-                        status: "Error".to_string(),
-                        headers: String::new(),
-                        body: format!("Request failed: {}", e),
-                        is_binary: false,
-                        filename: String::new(),
-                        bytes: Vec::new(),
-                        content_type: String::new(),
-                    },
+                    Err(e) => {
+                        let response_time = start_time.elapsed();
+                        let error_msg = if e.is_timeout() {
+                            format!("Request timed out")
+                        } else {
+                            format!("Request failed: {}", e)
+                        };
+
+                        HttpResponse {
+                            status: "Error".to_string(),
+                            headers: String::new(),
+                            body: error_msg,
+                            is_binary: false,
+                            filename: String::new(),
+                            bytes: Vec::new(),
+                            content_type: String::new(),
+                            response_time: Some(response_time),
+                            accepts_range: false,
+                        }
+                    }
                 }
             },
             Message::ResponseReceived,
         )
+    }
+
+    fn svg_rotation_subscription(&self) -> iced::Subscription<Message> {
+        if self.loading {
+            iced::time::every(std::time::Duration::from_millis(5)).map(|_| Message::Tick)
+        } else {
+            iced::Subscription::none()
+        }
     }
 }
 
@@ -665,7 +989,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::BodyAction(action) => {
-            app.response_body_content.perform(action);
+            app.body_content.perform(action);
             iced::Task::none()
         }
         Message::AuthTypeSelected(auth_type) => {
@@ -680,16 +1004,165 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.content_type = content_type;
             iced::Task::none()
         }
+        Message::CancelRequest => {
+            app.cancel_flag.store(true, Ordering::Relaxed);
+            app.loading = false;
+            app.response_body_content =
+                text_editor::Content::with_text("Request cancelled by user");
+            app.response_status = "Cancelled".to_string();
+            iced::Task::none()
+        }
+        Message::SaveBinaryResponse => {
+            if !app.is_response_binary {
+                return iced::Task::none();
+            }
+
+            let file_name = app.response_filename.clone();
+            let response_bytes = app.response_bytes.clone();
+
+            iced::Task::perform(
+                async move {
+                    match rfd::AsyncFileDialog::new()
+                        .set_file_name(&file_name)
+                        .save_file()
+                        .await
+                    {
+                        Some(file) => match file.write(&response_bytes).await {
+                            Ok(_) => Message::FileSaved(Ok(file.file_name().to_string())),
+                            Err(e) => Message::FileSaved(Err(format!("Failed to save: {}", e))),
+                        },
+                        None => Message::FileSaved(Err("Save dialog cancelled".to_string())),
+                    }
+                },
+                |message| message, // Pass through the message
+            )
+        }
+        Message::FileSaved(result) => {
+            match result {
+                Ok(filename) => {
+                    app.response_body_content = text_editor::Content::with_text(&format!(
+                        "File saved successfully: {}",
+                        filename
+                    ))
+                }
+                Err(error) => {
+                    app.response_body_content =
+                        text_editor::Content::with_text(&format!("Error saving file: {}", error))
+                }
+            }
+            iced::Task::none()
+        }
+        Message::Tick => {
+            app.svg_rotation = (app.svg_rotation + 4.0) % 360.0;
+            iced::Task::none()
+        }
+        Message::TogglePause => {
+            if let Some(vp) = app.video_player.as_mut() {
+                vp.set_paused(!vp.paused());
+            }
+            iced::Task::none()
+        }
+
+        Message::ToggleLoop => {
+            if let Some(vp) = app.video_player.as_mut() {
+                vp.set_looping(!vp.looping());
+            }
+            iced::Task::none()
+        }
+
+        Message::VideoVolume(vol) => {
+            if let Some(vp) = app.video_player.as_mut() {
+                vp.set_volume(vol);
+            }
+            iced::Task::none()
+        }
+
+        Message::Seek(secs) => {
+            if let Some(vs) = app.video_state.as_mut() {
+                vs.dragging = true;
+                vs.position = secs;
+            }
+            if let Some(vp) = app.video_player.as_mut() {
+                vp.set_paused(true);
+            }
+            iced::Task::none()
+        }
+
+        Message::SeekRelease => {
+            if let (Some(vs), Some(vp)) = (app.video_state.as_mut(), app.video_player.as_mut()) {
+                vs.dragging = false;
+
+                vp.seek(std::time::Duration::from_secs_f64(vs.position), false)
+                    .expect("seek");
+
+                vp.set_paused(false);
+            }
+            iced::Task::none()
+        }
+
+        Message::EndOfStream => {
+            println!("end of stream");
+            iced::Task::none()
+        }
+
+        Message::NewFrame => {
+            if let (Some(vs), Some(vp)) = (app.video_state.as_mut(), app.video_player.as_mut()) {
+                if !vs.dragging {
+                    vs.position = vp.position().as_secs_f64();
+                }
+            }
+            iced::Task::none()
+        }
         Message::ResponseReceived(resp) => {
-            app.response_status = resp.status;
-            app.response_headers_content = text_editor::Content::with_text(&resp.headers);
-            app.response_body_content = text_editor::Content::with_text(&resp.body);
-            app.is_response_binary = resp.is_binary;
-            app.response_filename = resp.filename;
-            app.response_bytes = resp.bytes;
-            app.response_content_type = resp.content_type;
             app.loading = false;
             app.active_response_tab = ResponseTab::Body;
+            app.is_response_binary = resp.is_binary;
+
+            if resp.content_type.starts_with("video/") && resp.accepts_range {
+                let url = url::Url::parse(&app.url).unwrap();
+
+                match iced_video_player::Video::new(&url) {
+                    Ok(video) => {
+                        app.video_player = Some(video);
+                        app.video_state = Some(VideoState {
+                            playing: true,
+                            buffering: true,
+                            position: 0.0,
+                            duration: 0.0,
+                            volume: 0.8,
+                            dragging: false,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load video: {e:?}");
+                        app.video_player = None;
+                    }
+                }
+            } else {
+                app.video_player = None;
+                app.response_headers_content = text_editor::Content::with_text(&resp.headers);
+                app.response_body_content = text_editor::Content::with_text(&resp.body);
+                app.response_bytes = resp.bytes;
+            }
+
+            app.response_status = resp.status;
+            app.response_content_type = resp.content_type.clone();
+            app.response_time = resp.response_time;
+
+            iced::Task::none()
+        }
+        Message::ResponseBodyAction(action) => {
+            match action {
+                text_editor::Action::Edit(edit) => {}
+                _ => app.response_body_content.perform(action),
+            };
+            iced::Task::none()
+        }
+        Message::ResponseHeadersAction(action) => {
+            match action {
+                text_editor::Action::Edit(edit) => {}
+                _ => app.response_headers_content.perform(action),
+            };
             iced::Task::none()
         }
         Message::ResponseTabSelected(response_tab) => {
@@ -710,9 +1183,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::CopyToClipboard => {
+            if app.is_response_binary {
+                return iced::Task::none();
+            }
             app.copied = true;
-            let text = app.response_body_content.text();
-
+            let text = match app.active_response_tab {
+                ResponseTab::Body => app.response_body_content.text(),
+                ResponseTab::Headers => app.response_headers_content.text(),
+                ResponseTab::None => String::new(),
+            };
             iced::Task::perform(
                 async {
                     let _ = iced::clipboard::write::<String>(text);
@@ -753,12 +1232,32 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.app_theme = theme;
             iced::Task::none()
         }
-        Message::FormFieldFileSelect(_) => {
-            println!("Event fired");
-            iced::Task::none()
+        Message::FormFieldFileSelect(idx) => {
+            let future = async move {
+                let files = rfd::AsyncFileDialog::new()
+                    .set_directory("~/Downloads")
+                    .pick_files()
+                    .await;
+
+                // Extract file paths as Strings
+                let paths = files
+                    .map(|handles| {
+                        handles
+                            .into_iter()
+                            .filter_map(|handle| handle.path().to_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                Message::FormFieldFilesSelected(idx, paths)
+            };
+
+            iced::Task::perform(future, std::convert::identity)
         }
-        Message::FormFieldFilesSelected(_, _items) => {
-            println!("Event fired");
+        Message::FormFieldFilesSelected(index, files) => {
+            if let Some(field) = app.form_data.get_mut(index) {
+                field.files = files;
+            }
             iced::Task::none()
         }
         Message::FormFieldRemove(index) => {
@@ -851,18 +1350,31 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
         .padding(10)
         .width(Length::Fill);
 
-    let send_button = button(
-        text(if app.loading { "Sending…" } else { "Send" })
-            .align_x(alignment::Horizontal::Center)
-            .width(Length::Fill),
-    )
-    .on_press_maybe(if !app.loading && !app.url.trim().is_empty() {
-        Some(Message::SendRequest)
+    let send_button = if app.loading {
+        button(
+            text("⏹ Cancel")
+                .align_x(alignment::Horizontal::Center)
+                .shaping(text::Shaping::Advanced)
+                .width(Length::Fill),
+        )
+        .on_press(Message::CancelRequest)
+        .padding(10)
+        .width(100)
     } else {
-        None
-    })
-    .padding(10)
-    .width(100);
+        button(
+            text("📤 Send")
+                .shaping(text::Shaping::Advanced)
+                .align_x(alignment::Horizontal::Center)
+                .width(Length::Fill),
+        )
+        .on_press_maybe(if !app.url.trim().is_empty() {
+            Some(Message::SendRequest)
+        } else {
+            None
+        })
+        .padding(10)
+        .width(100)
+    };
 
     let request_row = container(row![method_picker, url_input, send_button].spacing(10))
         .style(|theme: &iced::Theme| container::Style {
@@ -891,6 +1403,7 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
 fn main() -> iced::Result {
     iced::application("CrabiPie", update, view)
         .theme(|app| app.app_theme.clone())
+        .subscription(|app| app.svg_rotation_subscription())
         .window_size(iced::Size::new(1500.0, 800.0))
         .run()
 }
@@ -941,6 +1454,7 @@ enum RequestTab {
 enum ContentType {
     Json,
     FormData,
+    XWWWFormUrlEncoded,
 }
 
 impl std::fmt::Display for ContentType {
@@ -948,12 +1462,17 @@ impl std::fmt::Display for ContentType {
         match self {
             ContentType::Json => write!(f, "JSON"),
             ContentType::FormData => write!(f, "Form Data"),
+            ContentType::XWWWFormUrlEncoded => write!(f, "x-www-form"),
         }
     }
 }
 
 impl ContentType {
-    const ALL: [ContentType; 2] = [ContentType::Json, ContentType::FormData];
+    const ALL: [ContentType; 3] = [
+        ContentType::Json,
+        ContentType::FormData,
+        ContentType::XWWWFormUrlEncoded,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1013,9 +1532,21 @@ enum ResponseTab {
 struct HttpResponse {
     status: String,
     headers: String,
+    accepts_range: bool,
     body: String,
     is_binary: bool,
     filename: String,
     bytes: Vec<u8>,
     content_type: String,
+    response_time: Option<tokio::time::Duration>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoState {
+    pub playing: bool,
+    pub position: f64,
+    pub duration: f64,
+    pub dragging: bool,
+    pub volume: f64,
+    pub buffering: bool,
 }
