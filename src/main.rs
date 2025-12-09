@@ -7,8 +7,8 @@ use iced::{
     border::width,
     highlighter,
     widget::{
-        Column, Space, button, checkbox, column, container, horizontal_space, pick_list, row,
-        scrollable, text, text_editor, text_input, tooltip,
+        Column, Space, button, checkbox, column, container, pick_list, row, rule, scrollable,
+        space, text, text_editor, text_input, tooltip,
     },
 };
 use tokio::time::Instant;
@@ -65,6 +65,7 @@ enum Message {
     FormFieldFilesSelected(usize, Vec<String>),
     FormFieldRemove(usize),
     FormFieldAdd,
+    FormFieldToggled(usize),
 
     // Find/Replace messages
     ToggleFindDialog,
@@ -84,6 +85,7 @@ enum Message {
 
 struct CrabiPie {
     // Request configuration
+    url_id: iced::widget::Id,
     base_url: String,
     url: String,
     method: HttpMethod,
@@ -128,45 +130,49 @@ struct CrabiPie {
     whole_word: bool,
 }
 
-impl Default for CrabiPie {
-    fn default() -> Self {
+impl CrabiPie {
+    fn new() -> (Self, iced::Task<Message>) {
         let base = "https://jsonplaceholder.typicode.com/posts".to_string();
-        Self {
-            base_url: base.clone(),
-            url: base,
-            method: HttpMethod::GET,
-            headers_content: text_editor::Content::with_text(HEADERS_DEFAULT),
-            body_content: text_editor::Content::with_text(BODY_DEFAULT),
-            auth_type: AuthType::None,
-            bearer_token: String::new(),
-            content_type: ContentType::Json,
-            query_params: vec![QueryParam::new()],
-            form_data: vec![FormField::new()],
-            video_player: None,
-            video_state: None,
-            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            response_status: String::new(),
-            response_headers_content: text_editor::Content::new(),
-            response_body_content: text_editor::Content::new(),
-            is_response_binary: false,
-            response_filename: String::new(),
-            response_bytes: Vec::new(),
-            response_content_type: String::new(),
-            response_time: None,
-            loading: false,
-            svg_rotation: 0.0,
-            active_request_tab: RequestTab::Body,
-            active_response_tab: ResponseTab::Body,
-            copied: false,
-            find_dialog_open: false,
-            find_replace_mode: false,
-            find_text: String::new(),
-            replace_text: String::new(),
-            case_sensitive: false,
-            whole_word: false,
-            json_theme: highlighter::Theme::SolarizedDark,
-            app_theme: iced::Theme::CatppuccinMocha,
-        }
+        (
+            Self {
+                url_id: iced::widget::Id::unique(),
+                base_url: base.clone(),
+                url: base,
+                method: HttpMethod::GET,
+                headers_content: text_editor::Content::with_text(HEADERS_DEFAULT),
+                body_content: text_editor::Content::with_text(BODY_DEFAULT),
+                auth_type: AuthType::None,
+                bearer_token: String::new(),
+                content_type: ContentType::Json,
+                query_params: vec![QueryParam::new()],
+                form_data: vec![FormField::new()],
+                video_player: None,
+                video_state: None,
+                cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                response_status: String::new(),
+                response_headers_content: text_editor::Content::new(),
+                response_body_content: text_editor::Content::new(),
+                is_response_binary: false,
+                response_filename: String::new(),
+                response_bytes: Vec::new(),
+                response_content_type: String::new(),
+                response_time: None,
+                loading: false,
+                svg_rotation: 0.0,
+                active_request_tab: RequestTab::Query,
+                active_response_tab: ResponseTab::Body,
+                copied: false,
+                find_dialog_open: false,
+                find_replace_mode: false,
+                find_text: String::new(),
+                replace_text: String::new(),
+                case_sensitive: false,
+                whole_word: false,
+                json_theme: highlighter::Theme::SolarizedDark,
+                app_theme: iced::Theme::CatppuccinMocha,
+            },
+            iced::Task::none(),
+        )
     }
 }
 
@@ -212,14 +218,9 @@ impl CrabiPie {
         };
 
         container(
-            column![
-                text("Request"),
-                tabs,
-                iced::widget::horizontal_rule(1.0),
-                content
-            ]
-            .spacing(10)
-            .padding(10),
+            column![text("Request"), tabs, rule::horizontal(1.0), content]
+                .spacing(10)
+                .padding(10),
         )
         .style(|theme: &iced::Theme| container::Style {
             border: Border {
@@ -247,7 +248,7 @@ impl CrabiPie {
                 .on_press(Message::PrettifyJson)
                 .into()
         } else {
-            Space::new(0, 0).into()
+            Space::new().into()
         };
 
         let type_selector = row![
@@ -257,7 +258,7 @@ impl CrabiPie {
                 Some(self.content_type.clone()),
                 Message::ContentTypeSelected
             ),
-            horizontal_space(),
+            space::horizontal(),
             prettify_button,
         ]
         .spacing(10)
@@ -307,7 +308,7 @@ impl CrabiPie {
                         .shaping(text::Shaping::Advanced)
                         .into()
                 } else {
-                    Space::new(0, 0).into()
+                    Space::new().into()
                 };
 
                 row![
@@ -322,6 +323,7 @@ impl CrabiPie {
 
             // Build the main row — conditionally include type picker
             let mut field_row = row![
+                checkbox(field.enabled).on_toggle(move |_| Message::FormFieldToggled(idx)),
                 text("Key:"),
                 text_input("key", &field.key)
                     .on_input(move |key| Message::FormFieldKeyChanged(idx, key))
@@ -377,7 +379,7 @@ impl CrabiPie {
 
         for (idx, param) in self.query_params.iter().enumerate() {
             let checkbox =
-                checkbox("", param.enabled).on_toggle(move |_| Message::QueryParamToggled(idx));
+                checkbox(param.enabled).on_toggle(move |_| Message::QueryParamToggled(idx));
 
             let key_input = text_input("key", &param.key)
                 .on_input(move |key| Message::QueryParamKeyChanged(idx, key))
@@ -469,7 +471,7 @@ impl CrabiPie {
             .align_y(Alignment::Center)
             .into()
         } else {
-            Space::new(0, 0).into()
+            Space::new().into()
         };
 
         column![type_selector, token_input].spacing(10).into()
@@ -481,10 +483,10 @@ impl CrabiPie {
         } else if !self.response_status.is_empty() {
             text(&self.response_status).into()
         } else {
-            Space::new(0, 0).into()
+            Space::new().into()
         };
         let header_row =
-            row![text("Response"), horizontal_space(), status_view,].align_y(Alignment::Center);
+            row![text("Response"), space::horizontal(), status_view,].align_y(Alignment::Center);
         let mut tabs = iced::widget::Row::new()
             .spacing(10)
             .align_y(Alignment::Center);
@@ -521,7 +523,7 @@ impl CrabiPie {
                 .shaping(text::Shaping::Advanced),
             );
         }
-        tabs = tabs.push(horizontal_space());
+        tabs = tabs.push(space::horizontal());
         tabs = tabs.push(text("Json Theme: "));
         tabs = tabs.push(pick_list(
             &highlighter::Theme::ALL[..],
@@ -571,7 +573,7 @@ impl CrabiPie {
         };
 
         let content: Element<Message> = match self.active_response_tab {
-            ResponseTab::None => Space::new(0, 0).into(),
+            ResponseTab::None => Space::new().into(),
             ResponseTab::Body => {
                 if self.is_response_binary {
                     let mut body_column = iced::widget::Column::new().spacing(5);
@@ -720,14 +722,9 @@ impl CrabiPie {
         };
 
         container(
-            column![
-                header_row,
-                tabs,
-                iced::widget::horizontal_rule(1.0),
-                content
-            ]
-            .spacing(10)
-            .padding(10),
+            column![header_row, tabs, rule::horizontal(1.0), content]
+                .spacing(10)
+                .padding(10),
         )
         .style(|theme: &iced::Theme| container::Style {
             border: Border {
@@ -847,7 +844,8 @@ impl CrabiPie {
                             ContentType::XWWWFormUrlEncoded => {
                                 let mut params = vec![];
                                 for field in &form_data {
-                                    if !field.key.is_empty()
+                                    if field.enabled
+                                        && !field.key.is_empty()
                                         && field.field_type == FormFieldType::Text
                                     {
                                         params.push((field.key.clone(), field.value.clone()));
@@ -858,7 +856,7 @@ impl CrabiPie {
                             ContentType::FormData => {
                                 let mut form = reqwest::multipart::Form::new();
                                 for field in form_data {
-                                    if !field.key.is_empty() {
+                                    if field.enabled && !field.key.is_empty() {
                                         match field.field_type {
                                             FormFieldType::Text => {
                                                 form = form.text(field.key, field.value);
@@ -1060,6 +1058,10 @@ impl CrabiPie {
         } else {
             iced::Subscription::none()
         }
+    }
+
+    fn even_subscription(&self) -> iced::Subscription<Message> {
+        iced::event::listen().map(Message::EventOccurred)
     }
 }
 
@@ -1353,6 +1355,12 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
+        Message::FormFieldToggled(idx) => {
+            if let Some(field) = app.form_data.get_mut(idx) {
+                field.enabled = !field.enabled;
+            }
+            iced::Task::none()
+        }
         Message::JsonThemeChanged(theme) => {
             app.json_theme = theme;
             iced::Task::none()
@@ -1396,12 +1404,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::FormFieldAdd => {
-            app.form_data.push(FormField {
-                key: String::new(),
-                value: String::new(),
-                files: Vec::new(),
-                field_type: FormFieldType::Text,
-            });
+            app.form_data.push(FormField::new());
             iced::Task::none()
         }
         Message::ToggleFindDialog => {
@@ -1448,8 +1451,56 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             println!("Event fired");
             iced::Task::none()
         }
-        Message::EventOccurred(_event) => {
-            println!("Event fired");
+        Message::EventOccurred(event) => {
+            use iced::keyboard::{Event as KeyEvent, Key, Modifiers};
+            if let Event::Keyboard(key_event) = event {
+                match key_event {
+                    KeyEvent::KeyPressed { key, modifiers, .. } if modifiers.control() => {
+                        if let Key::Character(c) = &key {
+                            if c.as_str() == "l" {
+                                println!("Key event: ctrl + l");
+                                return iced::widget::operation::focus(app.url_id.clone()).chain(
+                                    iced::widget::operation::select_all(app.url_id.clone()),
+                                );
+                            }
+                        }
+                        if matches!(key, Key::Named(iced::keyboard::key::Named::Enter)) {
+                            println!("Key event: ctrl + Enter");
+                            return iced::Task::done(Message::SendRequest);
+                        }
+                    }
+                    KeyEvent::KeyPressed {
+                        key: Key::Named(iced::keyboard::key::Named::Enter),
+                        ..
+                    } => {
+                        return iced::widget::operation::is_focused(app.url_id.clone()).then(
+                            |focused| {
+                                if focused {
+                                    iced::Task::done(Message::SendRequest)
+                                } else {
+                                    iced::Task::none()
+                                }
+                            },
+                        );
+                    }
+                    KeyEvent::KeyPressed {
+                        key: Key::Named(iced::keyboard::key::Named::Tab),
+                        modifiers,
+                        ..
+                    } if modifiers.shift() => {
+                        println!("Key event: shift + tab");
+                        return iced::widget::operation::focus_previous();
+                    }
+                    KeyEvent::KeyPressed {
+                        key: Key::Named(iced::keyboard::key::Named::Tab),
+                        ..
+                    } => {
+                        println!("Key event: Tab");
+                        return iced::widget::operation::focus_next();
+                    }
+                    _ => {}
+                }
+            }
             iced::Task::none()
         }
     }
@@ -1458,7 +1509,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 fn view(app: &CrabiPie) -> Element<'_, Message> {
     let title_row = row![
         text("CrabiPie HTTP Client").size(16),
-        horizontal_space(),
+        space::horizontal(),
         text("App theme"),
         pick_list(
             &iced::Theme::ALL[..],
@@ -1477,8 +1528,10 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
     .padding(10);
 
     let url_input = text_input("https://api.example.com/endpoint", &app.url)
+        .id(app.url_id.clone())
         .on_input(Message::UrlChanged)
-        .padding(10)
+        .size(20)
+        .padding(8)
         .width(Length::Fill);
 
     let send_button = if app.loading {
@@ -1532,9 +1585,10 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
 }
 
 fn main() -> iced::Result {
-    iced::application("CrabiPie", update, view)
-        .theme(|app| app.app_theme.clone())
+    iced::application(CrabiPie::new, update, view)
+        .theme(|app: &CrabiPie| app.app_theme.clone())
         .subscription(|app| app.svg_rotation_subscription())
+        .subscription(|app| app.even_subscription())
         .window_size(iced::Size::new(1500.0, 800.0))
         .run()
 }
@@ -1628,6 +1682,7 @@ impl FormFieldType {
 
 #[derive(Debug, Clone)]
 struct FormField {
+    enabled: bool,
     key: String,
     value: String,
     files: Vec<String>,
@@ -1635,8 +1690,9 @@ struct FormField {
 }
 
 impl FormField {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
+            enabled: true,
             key: String::new(),
             value: String::new(),
             files: Vec::new(),
@@ -1686,23 +1742,23 @@ struct HttpResponse {
 
 #[derive(Debug, Clone)]
 pub struct VideoState {
-    pub playing: bool,
-    pub position: f64,
-    pub duration: f64,
-    pub dragging: bool,
-    pub volume: f64,
-    pub buffering: bool,
+    playing: bool,
+    position: f64,
+    duration: f64,
+    dragging: bool,
+    volume: f64,
+    buffering: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct QueryParam {
-    pub key: String,
-    pub value: String,
-    pub enabled: bool,
+    key: String,
+    value: String,
+    enabled: bool,
 }
 
 impl QueryParam {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             key: String::new(),
             value: String::new(),
