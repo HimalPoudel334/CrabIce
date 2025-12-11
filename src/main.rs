@@ -11,6 +11,7 @@ use iced::{
         space, text, text_editor, text_input, tooltip,
     },
 };
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,10 @@ enum Message {
     ResetCopied,
     JsonThemeChanged(highlighter::Theme),
     AppThemeChanged(iced::Theme),
+    SaveRequest,
+    LoadRequest,
+    RequestLoaded(SavedState),
+    RequestLoadFailed(String),
     CancelRequest,
     SaveBinaryResponse,
     FileSaved(Result<String, String>),
@@ -763,6 +768,51 @@ impl CrabiPie {
         }
     }
 
+    fn save_request(&self) -> SavedState {
+        let is_text = !self.is_response_binary;
+
+        SavedState {
+            base_url: self.base_url.clone(),
+            url: self.url.clone(),
+            method: self.method,
+            headers: self.headers_content.text(),
+            body: self.body_content.text(),
+            auth_type: self.auth_type,
+            bearer_token: self.bearer_token.clone(),
+            content_type: self.content_type,
+            query_params: self.query_params.clone(),
+            form_data: self.form_data.clone(),
+            json_theme: self.json_theme.to_string(),
+            app_theme: self.app_theme.to_string(),
+
+            // Save text-only response
+            response_status: is_text.then(|| self.response_status.clone()),
+            response_headers: is_text.then(|| self.response_headers_content.text()),
+            response_body: is_text.then(|| self.response_body_content.text()),
+        }
+    }
+
+    fn load_request(&mut self, s: SavedState) {
+        self.base_url = s.base_url;
+        self.url = s.url;
+        self.method = s.method;
+        self.headers_content = text_editor::Content::with_text(&s.headers);
+        self.body_content = text_editor::Content::with_text(&s.body);
+        self.auth_type = s.auth_type;
+        self.bearer_token = s.bearer_token;
+        self.content_type = s.content_type;
+        self.query_params = s.query_params;
+        self.form_data = s.form_data;
+        // Optionally load response if it's not binary
+        if let Some(body) = s.response_body {
+            self.response_status = s.response_status.unwrap_or_default();
+            self.response_headers_content =
+                text_editor::Content::with_text(&s.response_headers.unwrap_or_default());
+            self.response_body_content = text_editor::Content::with_text(&body);
+            self.is_response_binary = false;
+        }
+    }
+
     fn send_request(&mut self) -> iced::Task<Message> {
         let url = self.url.clone();
         let method = self.method.clone();
@@ -824,7 +874,8 @@ impl CrabiPie {
                     }
                 }
 
-                let client = reqwest::Client::new();
+                // let client = reqwest::Client::new();
+                let client = &HTTP_CLIENT;
 
                 let mut request = match method {
                     HttpMethod::GET => client.get(&url),
@@ -1052,15 +1103,19 @@ impl CrabiPie {
         )
     }
 
+    fn subscription(&self) -> iced::Subscription<Message> {
+        iced::Subscription::batch([self.svg_rotation_subscription(), self.event_subscription()])
+    }
+
     fn svg_rotation_subscription(&self) -> iced::Subscription<Message> {
         if self.loading {
-            iced::time::every(std::time::Duration::from_millis(5)).map(|_| Message::Tick)
+            iced::time::every(std::time::Duration::from_millis(1)).map(|_| Message::Tick)
         } else {
             iced::Subscription::none()
         }
     }
 
-    fn even_subscription(&self) -> iced::Subscription<Message> {
+    fn event_subscription(&self) -> iced::Subscription<Message> {
         iced::event::listen().map(Message::EventOccurred)
     }
 }
@@ -1172,14 +1227,12 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::VideoVolume(vol) => {
             if let Some(vp) = app.video_player.as_mut() {
                 vp.set_volume(vol);
             }
             iced::Task::none()
         }
-
         Message::Seek(secs) => {
             if let Some(vs) = app.video_state.as_mut() {
                 vs.dragging = true;
@@ -1190,7 +1243,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::SeekRelease => {
             if let (Some(vs), Some(vp)) = (app.video_state.as_mut(), app.video_player.as_mut()) {
                 vs.dragging = false;
@@ -1202,12 +1254,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::EndOfStream => {
             println!("end of stream");
             iced::Task::none()
         }
-
         Message::NewFrame => {
             if let (Some(vs), Some(vp)) = (app.video_state.as_mut(), app.video_player.as_mut()) {
                 if !vs.dragging {
@@ -1369,6 +1419,76 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.app_theme = theme;
             iced::Task::none()
         }
+        Message::SaveRequest => {
+            let state = app.save_request();
+
+            iced::Task::perform(
+                async move {
+                    match rfd::AsyncFileDialog::new()
+                        .set_title("Save CrabiPie State")
+                        .set_file_name("crabipie_state.json")
+                        .save_file()
+                        .await
+                    {
+                        Some(file_handle) => {
+                            // Serialize JSON
+                            let json = serde_json::to_string_pretty(&state)
+                                .map_err(|e| format!("Serialization error: {}", e))?;
+
+                            // Async write
+                            tokio::fs::write(file_handle.path(), json)
+                                .await
+                                .map_err(|e| format!("Failed to write file: {}", e))?;
+
+                            Ok::<_, String>(file_handle.file_name().to_string())
+                        }
+                        None => Err("Save dialog cancelled".to_string()),
+                    }
+                },
+                |result| match result {
+                    Ok(filename) => Message::FileSaved(Ok(filename)),
+                    Err(err) => Message::FileSaved(Err(err)),
+                },
+            )
+        }
+        Message::LoadRequest => {
+            iced::Task::perform(
+                async move {
+                    match rfd::AsyncFileDialog::new()
+                        .set_title("Open CrabiPie State")
+                        .pick_file()
+                        .await
+                    {
+                        Some(file_handle) => {
+                            // Async read file
+                            let bytes = tokio::fs::read(file_handle.path())
+                                .await
+                                .map_err(|e| format!("Failed to read file: {}", e))?;
+
+                            // Convert bytes to string
+                            let content = String::from_utf8(bytes)
+                                .map_err(|e| format!("Invalid UTF-8 in file: {}", e))?;
+
+                            // Deserialize JSON into SavedState
+                            let saved_state: SavedState = serde_json::from_str(&content)
+                                .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+                            Ok::<_, String>(saved_state)
+                        }
+                        None => Err("Open file dialog cancelled".to_string()),
+                    }
+                },
+                |result| match result {
+                    Ok(saved_state) => Message::RequestLoaded(saved_state),
+                    Err(err) => Message::RequestLoadFailed(err),
+                },
+            )
+        }
+        Message::RequestLoaded(saved_state) => {
+            app.load_request(saved_state);
+            iced::Task::none()
+        }
+        Message::RequestLoadFailed(err) => iced::Task::none(),
         Message::FormFieldFileSelect(idx) => {
             let future = async move {
                 let files = rfd::AsyncFileDialog::new()
@@ -1515,7 +1635,9 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
             &iced::Theme::ALL[..],
             Some(&app.app_theme),
             Message::AppThemeChanged,
-        )
+        ),
+        button("Open").on_press(Message::LoadRequest),
+        button("Save").on_press(Message::SaveRequest)
     ]
     .spacing(10);
 
@@ -1587,8 +1709,7 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
 fn main() -> iced::Result {
     iced::application(CrabiPie::new, update, view)
         .theme(|app: &CrabiPie| app.app_theme.clone())
-        .subscription(|app| app.svg_rotation_subscription())
-        .subscription(|app| app.even_subscription())
+        .subscription(|app| app.subscription())
         .window_size(iced::Size::new(1500.0, 800.0))
         .run()
 }
@@ -1603,7 +1724,7 @@ const BODY_DEFAULT: &str = r#"{
   "foo": "bar"
 }"#;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum HttpMethod {
     GET,
     POST,
@@ -1628,7 +1749,7 @@ impl std::fmt::Display for HttpMethod {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum RequestTab {
     Body,
     Headers,
@@ -1636,7 +1757,7 @@ enum RequestTab {
     Query,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum ContentType {
     Json,
     FormData,
@@ -1661,7 +1782,7 @@ impl ContentType {
     ];
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum FormFieldType {
     Text,
     File,
@@ -1680,7 +1801,7 @@ impl FormFieldType {
     const ALL: [FormFieldType; 2] = [FormFieldType::Text, FormFieldType::File];
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FormField {
     enabled: bool,
     key: String,
@@ -1701,7 +1822,7 @@ impl FormField {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum AuthType {
     None,
     Bearer,
@@ -1720,7 +1841,7 @@ impl AuthType {
     const ALL: [AuthType; 2] = [AuthType::None, AuthType::Bearer];
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 enum ResponseTab {
     None,
     Body,
@@ -1750,7 +1871,7 @@ pub struct VideoState {
     buffering: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryParam {
     key: String,
     value: String,
@@ -1765,4 +1886,32 @@ impl QueryParam {
             enabled: true,
         }
     }
+}
+
+static HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
+    reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .expect("failed to build http client")
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedState {
+    base_url: String,
+    url: String,
+    method: HttpMethod,
+    headers: String,
+    body: String,
+    auth_type: AuthType,
+    bearer_token: String,
+    content_type: ContentType,
+    query_params: Vec<QueryParam>,
+    form_data: Vec<FormField>,
+    json_theme: String,
+    app_theme: String,
+
+    // Response (only when NOT binary)
+    response_status: Option<String>,
+    response_headers: Option<String>,
+    response_body: Option<String>,
 }

@@ -15,6 +15,7 @@ dependencies = [
  "once_cell",
  "reqwest",
  "rfd",
+ "serde",
  "serde_json",
  "tokio",
  "url",
