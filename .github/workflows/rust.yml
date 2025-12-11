@@ -1,0 +1,30 @@
+name: Rust Build with GStreamer
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      # Install GStreamer dependencies
+      - name: Install GStreamer
+        run: |
+          sudo apt update
+          sudo apt install -y libgstreamer1.0-dev gstreamer1.0-plugins-base \
+                              gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+                              gstreamer1.0-plugins-ugly gstreamer1.0-libav
+
+      # Build the project
+      - run: cargo build --release
+
