@@ -184,61 +184,66 @@ impl CrabiPie {
 
 impl CrabiPie {
     fn render_request_section(&self) -> Element<'_, Message> {
-        let tabs = row![
-            button(if self.active_request_tab == RequestTab::Query {
-                "[Query]"
-            } else {
-                "Query"
-            })
-            .on_press(Message::RequestTabSelected(RequestTab::Query))
-            .style(button::text),
-            button(if self.active_request_tab == RequestTab::Body {
-                "[Body]"
-            } else {
-                "Body"
-            })
-            .on_press(Message::RequestTabSelected(RequestTab::Body))
-            .style(button::text),
-            button(if self.active_request_tab == RequestTab::Headers {
-                "[Headers]"
-            } else {
-                "Headers"
-            })
-            .on_press(Message::RequestTabSelected(RequestTab::Headers))
-            .style(button::text),
-            button(if self.active_request_tab == RequestTab::Auth {
-                "[Auth]"
-            } else {
-                "Auth"
-            })
-            .on_press(Message::RequestTabSelected(RequestTab::Auth))
-            .style(button::text),
-        ]
-        .spacing(5);
+        let req_tabs: iced_aw::Tabs<Message, RequestTab, iced::Theme, iced::Renderer> =
+            iced_aw::Tabs::new(Message::RequestTabSelected)
+                .push(
+                    RequestTab::Query,
+                    iced_aw::TabLabel::Text("Query".into()),
+                    container(self.render_query_tab()).padding(Padding {
+                        top: 10.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    }),
+                )
+                .push(
+                    RequestTab::Body,
+                    iced_aw::TabLabel::Text("Body".into()),
+                    container(self.render_body_tab()).padding(Padding {
+                        top: 10.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    }),
+                )
+                .push(
+                    RequestTab::Headers,
+                    iced_aw::TabLabel::Text("Headers".into()),
+                    container(self.render_headers_tab())
+                        .padding(Padding {
+                            top: 10.0,
+                            right: 0.0,
+                            bottom: 0.0,
+                            left: 0.0,
+                        })
+                        .height(Length::Fill),
+                )
+                .push(
+                    RequestTab::Auth,
+                    iced_aw::TabLabel::Text("Auth".into()),
+                    container(self.render_auth_tab()).padding(Padding {
+                        top: 10.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    }),
+                )
+                .set_active_tab(&self.active_request_tab)
+                .tab_bar_position(iced_aw::TabBarPosition::Top)
+                .into();
 
-        let content = match self.active_request_tab {
-            RequestTab::Query => self.render_query_tab(),
-            RequestTab::Body => self.render_body_tab(),
-            RequestTab::Headers => self.render_headers_tab(),
-            RequestTab::Auth => self.render_auth_tab(),
-        };
-
-        container(
-            column![text("Request"), tabs, rule::horizontal(1.0), content]
-                .spacing(10)
-                .padding(10),
-        )
-        .style(|theme: &iced::Theme| container::Style {
-            border: Border {
-                width: 1.5,
-                color: theme.palette().background,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        container(column![text("Request").height(20), rule::horizontal(1.0), req_tabs,].spacing(10))
+            .style(|theme: &iced::Theme| container::Style {
+                border: Border {
+                    width: 1.5,
+                    color: theme.palette().background,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn render_body_tab(&self) -> Element<'_, Message> {
@@ -491,37 +496,23 @@ impl CrabiPie {
         } else {
             Space::new().into()
         };
-        let header_row =
-            row![text("Response"), space::horizontal(), status_view,].align_y(Alignment::Center);
-        let mut tabs = iced::widget::Row::new()
+
+        let mut header_row = iced::widget::Row::new()
             .spacing(10)
+            .height(20)
             .align_y(Alignment::Center);
-        tabs = tabs.push(
-            button(if self.active_response_tab == ResponseTab::Body {
-                "[Body]"
-            } else {
-                "Body"
-            })
-            .on_press(Message::ResponseTabSelected(ResponseTab::Body))
-            .style(button::text),
-        );
-        tabs = tabs.push(
-            button(if self.active_response_tab == ResponseTab::Headers {
-                "[Headers]"
-            } else {
-                "Headers"
-            })
-            .on_press(Message::ResponseTabSelected(ResponseTab::Headers))
-            .style(button::text),
-        );
+
+        header_row = header_row.push(text("Response"));
+        header_row = header_row.push(status_view);
+
         if let Some(resp_time) = self.response_time {
-            tabs = tabs.push(
+            header_row = header_row.push(
                 text(format!("⏱️{:.2}ms", resp_time.as_secs_f32() * 1000.0))
                     .shaping(text::Shaping::Advanced),
             );
         }
         if self.is_response_binary {
-            tabs = tabs.push(
+            header_row = header_row.push(
                 text(format!(
                     "🗃️{:.2} KB",
                     self.response_bytes.len() as f32 / 1024.0
@@ -529,14 +520,14 @@ impl CrabiPie {
                 .shaping(text::Shaping::Advanced),
             );
         }
-        tabs = tabs.push(space::horizontal());
-        tabs = tabs.push(text("Json Theme: "));
-        tabs = tabs.push(pick_list(
+        header_row = header_row.push(space::horizontal());
+        header_row = header_row.push(text("Json Theme:"));
+        header_row = header_row.push(pick_list(
             &highlighter::Theme::ALL[..],
             Some(&self.json_theme),
             Message::JsonThemeChanged,
         ));
-        tabs = tabs.push(tooltip(
+        header_row = header_row.push(tooltip(
             button(text(if self.copied { "✅" } else { "📋" }).shaping(text::Shaping::Advanced))
                 .on_press(Message::CopyToClipboard)
                 .style(button::text),
@@ -548,201 +539,236 @@ impl CrabiPie {
             tooltip::Position::Bottom,
         ));
 
-        let loading_overlay = if self.loading {
-            Some(
-                container(column![
-                    iced::widget::svg(iced::advanced::svg::Handle::from_memory(include_bytes!(
-                        "./assets/ring-with-bg.svg"
-                    )))
-                    .width(80)
-                    .height(80)
-                    .rotation(iced::Radians::from(
-                        self.svg_rotation * std::f32::consts::PI / 180.0,
-                    )),
-                    text("📤 Sending...").shaping(text::Shaping::Advanced)
-                ])
-                .width(iced::Length::Fill)
-                .height(iced::Length::Fill)
-                .align_x(iced::Alignment::Center)
-                .align_y(iced::Alignment::Center)
-                .style(|theme: &iced::Theme| {
-                    container::Style {
-                        background: Some(iced::Background::Color(
-                            iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5), // Semi-transparent overlay
-                        )),
-                        ..Default::default()
-                    }
-                }),
-            )
-        } else {
-            None
-        };
+        let res_tabs: iced_aw::Tabs<Message, ResponseTab, iced::Theme, iced::Renderer> =
+            iced_aw::Tabs::new(Message::ResponseTabSelected)
+                .push(
+                    ResponseTab::Body,
+                    iced_aw::TabLabel::Text("Body".into()),
+                    container(self.with_overlay(self.render_response_body()))
+                        .padding(Padding {
+                            top: 10.0,
+                            right: 0.0,
+                            bottom: 0.0,
+                            left: 0.0,
+                        })
+                        .height(Length::Fill),
+                )
+                .push(
+                    ResponseTab::Headers,
+                    iced_aw::TabLabel::Text("Header".into()),
+                    container(self.with_overlay(self.render_response_headers()))
+                        .padding(Padding {
+                            top: 10.0,
+                            right: 0.0,
+                            bottom: 0.0,
+                            left: 0.0,
+                        })
+                        .height(Length::Fill),
+                )
+                .set_active_tab(&self.active_response_tab)
+                .tab_bar_position(iced_aw::TabBarPosition::Top)
+                .into();
 
-        let content: Element<Message> = match self.active_response_tab {
-            ResponseTab::None => Space::new().into(),
-            ResponseTab::Body => {
-                if self.is_response_binary {
-                    let mut body_column = iced::widget::Column::new().spacing(5);
-                    body_column = body_column.push(
-                        button(text("💾 Save").shaping(text::Shaping::Advanced))
-                            .on_press(Message::SaveBinaryResponse)
-                            .style(|_, _| button::Style {
-                                text_color: iced::Color::from_rgb(1.0, 0.65, 0.0),
-                                background: None,
-                                ..Default::default()
-                            }),
-                    );
-                    if self.response_content_type.starts_with("image/") {
-                        body_column = body_column.push(
-                            scrollable(
-                                iced::widget::image(iced::advanced::image::Handle::from_bytes(
-                                    self.response_bytes.clone(),
-                                ))
-                                .content_fit(iced::ContentFit::None),
-                            )
-                            .height(Length::Fill)
-                            .width(Length::Fill),
-                        );
-                    } else if self.response_content_type.starts_with("video/") {
-                        // Video playback
-                        if let Some(video) = &self.video_player {
-                            let vs = self.video_state.as_ref().unwrap();
-                            body_column = body_column
-                                .push(
-                                    container::Container::new(
-                                        iced_video_player::VideoPlayer::new(video)
-                                            .width(iced::Length::Fill)
-                                            .height(iced::Length::Fill)
-                                            .content_fit(iced::ContentFit::Contain)
-                                            .on_end_of_stream(Message::EndOfStream)
-                                            .on_new_frame(Message::NewFrame),
-                                    )
-                                    .align_x(iced::Alignment::Center)
-                                    .align_y(iced::Alignment::Center)
+        container(column![header_row, rule::horizontal(1.0), res_tabs].spacing(10))
+            .style(|theme: &iced::Theme| container::Style {
+                border: Border {
+                    width: 1.5,
+                    color: theme.palette().background,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn render_response_body(&self) -> Element<'_, Message> {
+        if self.is_response_binary {
+            let mut body_column = iced::widget::Column::new().spacing(5);
+            body_column = body_column.push(
+                button(text("💾 Save").shaping(text::Shaping::Advanced))
+                    .on_press(Message::SaveBinaryResponse)
+                    .style(|_, _| button::Style {
+                        text_color: iced::Color::from_rgb(1.0, 0.65, 0.0),
+                        background: None,
+                        ..Default::default()
+                    }),
+            );
+            if self.response_content_type.starts_with("image/") {
+                body_column = body_column.push(
+                    scrollable(
+                        iced::widget::image(iced::advanced::image::Handle::from_bytes(
+                            self.response_bytes.clone(),
+                        ))
+                        .content_fit(iced::ContentFit::None),
+                    )
+                    .height(Length::Fill)
+                    .width(Length::Fill),
+                );
+            } else if self.response_content_type.starts_with("video/") {
+                // Video playback
+                if let Some(video) = &self.video_player {
+                    let vs = self.video_state.as_ref().unwrap();
+                    body_column = body_column
+                        .push(
+                            container::Container::new(
+                                iced_video_player::VideoPlayer::new(video)
                                     .width(iced::Length::Fill)
-                                    .height(iced::Length::Fill),
+                                    .height(iced::Length::Fill)
+                                    .content_fit(iced::ContentFit::Contain)
+                                    .on_end_of_stream(Message::EndOfStream)
+                                    .on_new_frame(Message::NewFrame),
+                            )
+                            .align_x(iced::Alignment::Center)
+                            .align_y(iced::Alignment::Center)
+                            .width(iced::Length::Fill)
+                            .height(iced::Length::Fill),
+                        )
+                        .push(
+                            container::Container::new(
+                                iced::widget::Slider::new(
+                                    0.0..=video.duration().as_secs_f64(),
+                                    vs.position,
+                                    Message::Seek,
                                 )
+                                .step(0.1)
+                                .on_release(Message::SeekRelease),
+                            )
+                            .padding(iced::Padding::new(5.0).left(10.0).right(10.0)),
+                        )
+                        .spacing(4)
+                        .push(
+                            iced::widget::Row::new()
+                                .spacing(2)
+                                .align_y(iced::alignment::Vertical::Center)
+                                .padding(iced::Padding::new(10.0).top(0.0))
                                 .push(
-                                    container::Container::new(
-                                        iced::widget::Slider::new(
-                                            0.0..=video.duration().as_secs_f64(),
-                                            vs.position,
-                                            Message::Seek,
-                                        )
-                                        .step(0.1)
-                                        .on_release(Message::SeekRelease),
+                                    button::Button::new(
+                                        text::Text::new(if video.paused() {
+                                            "▶️"
+                                        } else {
+                                            "⏸️"
+                                        })
+                                        .shaping(text::Shaping::Advanced),
                                     )
-                                    .padding(iced::Padding::new(5.0).left(10.0).right(10.0)),
+                                    .style(button::text)
+                                    .on_press(Message::TogglePause),
                                 )
-                                .spacing(4)
                                 .push(
-                                    iced::widget::Row::new()
-                                        .spacing(2)
-                                        .align_y(iced::alignment::Vertical::Center)
-                                        .padding(iced::Padding::new(10.0).top(0.0))
-                                        .push(
-                                            button::Button::new(
-                                                text::Text::new(if video.paused() {
-                                                    "▶️"
-                                                } else {
-                                                    "⏸️"
-                                                })
-                                                .shaping(text::Shaping::Advanced),
-                                            )
-                                            .style(button::text)
-                                            .on_press(Message::TogglePause),
-                                        )
-                                        .push(
-                                            button::Button::new(
-                                                text::Text::new(if video.looping() {
-                                                    "🔁❌"
-                                                } else {
-                                                    "🔁"
-                                                })
-                                                .shaping(text::Shaping::Advanced),
-                                            )
-                                            .style(button::text)
-                                            .on_press(Message::ToggleLoop),
-                                        )
-                                        .push(
-                                            text::Text::new(format!(
-                                                "{}:{:02}s / {}:{:02}s",
-                                                vs.position as u64 / 60,
-                                                vs.position as u64 % 60,
-                                                video.duration().as_secs() / 60,
-                                                video.duration().as_secs() % 60,
-                                            ))
-                                            .width(iced::Length::Fill)
-                                            .align_x(iced::alignment::Horizontal::Right),
-                                        ),
-                                );
-                        } else {
-                            body_column = body_column.push(
-                                text("🎬 Loading video...")
-                                    .shaping(text::Shaping::Advanced)
-                                    .style(|_| text::Style {
-                                        color: Some(iced::Color::from_rgb(1.0, 0.65, 0.0)),
-                                    }),
-                            );
-                        }
-                    } else {
-                        body_column = body_column.push(
-                            text(format!(
-                                "📄 Binary file received: {}",
-                                self.response_filename
-                            ))
+                                    button::Button::new(
+                                        text::Text::new(if video.looping() {
+                                            "🔁❌"
+                                        } else {
+                                            "🔁"
+                                        })
+                                        .shaping(text::Shaping::Advanced),
+                                    )
+                                    .style(button::text)
+                                    .on_press(Message::ToggleLoop),
+                                )
+                                .push(
+                                    text::Text::new(format!(
+                                        "{}:{:02}s / {}:{:02}s",
+                                        vs.position as u64 / 60,
+                                        vs.position as u64 % 60,
+                                        video.duration().as_secs() / 60,
+                                        video.duration().as_secs() % 60,
+                                    ))
+                                    .width(iced::Length::Fill)
+                                    .align_x(iced::alignment::Horizontal::Right),
+                                ),
+                        );
+                } else {
+                    body_column = body_column.push(
+                        text("🎬 Loading video...")
                             .shaping(text::Shaping::Advanced)
                             .style(|_| text::Style {
                                 color: Some(iced::Color::from_rgb(1.0, 0.65, 0.0)),
                             }),
-                        );
-                        body_column = body_column
-                            .push(text(format!("Size: {} bytes", self.response_bytes.len())));
-                    }
-                    body_column.into()
-                } else {
-                    scrollable(
-                        text_editor(&self.response_body_content)
-                            .on_action(Message::ResponseBodyAction)
-                            .highlight("json", self.json_theme)
-                            .height(Length::Shrink),
-                    )
-                    .height(Length::Fill)
-                    .into()
+                    );
                 }
+            } else {
+                body_column = body_column.push(
+                    text(format!(
+                        "📄 Binary file received: {}",
+                        self.response_filename
+                    ))
+                    .shaping(text::Shaping::Advanced)
+                    .style(|_| text::Style {
+                        color: Some(iced::Color::from_rgb(1.0, 0.65, 0.0)),
+                    }),
+                );
+                body_column =
+                    body_column.push(text(format!("Size: {} bytes", self.response_bytes.len())));
             }
-            ResponseTab::Headers => scrollable(
-                text_editor(&self.response_headers_content)
-                    .on_action(Message::ResponseHeadersAction)
+            body_column.into()
+        } else {
+            scrollable(
+                text_editor(&self.response_body_content)
+                    .on_action(Message::ResponseBodyAction)
                     .highlight("json", self.json_theme)
                     .height(Length::Shrink),
             )
             .height(Length::Fill)
-            .into(),
-        };
+            .into()
+        }
+    }
 
-        let content: Element<'_, Message> = if let Some(overlay) = loading_overlay {
-            iced::widget::stack![content, overlay].into()
-        } else {
-            content.into()
-        };
-
-        container(
-            column![header_row, tabs, rule::horizontal(1.0), content]
-                .spacing(10)
-                .padding(10),
+    fn render_response_headers(&self) -> Element<'_, Message> {
+        scrollable(
+            text_editor(&self.response_headers_content)
+                .on_action(Message::ResponseHeadersAction)
+                .highlight("json", self.json_theme)
+                .height(Length::Shrink),
         )
-        .style(|theme: &iced::Theme| container::Style {
-            border: Border {
-                width: 1.5,
-                color: theme.palette().background,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        })
-        .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    fn loading_overlay(&self) -> Option<Element<'_, Message>> {
+        if !self.loading {
+            return None;
+        }
+
+        Some(
+            container(column![
+                iced::widget::svg(iced::advanced::svg::Handle::from_memory(include_bytes!(
+                    "./assets/ring-with-bg.svg"
+                )))
+                .width(80)
+                .height(80)
+                .rotation(iced::Radians::from(
+                    self.svg_rotation * std::f32::consts::PI / 180.0,
+                )),
+                text("📤 Sending...").shaping(text::Shaping::Advanced)
+            ])
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .align_x(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center)
+            .style(|theme: &iced::Theme| {
+                container::Style {
+                    background: Some(iced::Background::Color(
+                        iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5), // Semi-transparent overlay
+                    )),
+                    ..Default::default()
+                }
+            })
+            .into(),
+        )
+    }
+
+    fn with_overlay<'a>(
+        &'a self,
+        content: impl Into<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
+        let content = content.into();
+        if let Some(overlay) = self.loading_overlay() {
+            iced::widget::stack![content, overlay].into()
+        } else {
+            content
+        }
     }
 
     fn update_query<F: FnOnce(&mut QueryParam)>(&mut self, idx: usize, f: F) {
@@ -1164,10 +1190,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 iced::Task::none()
             }
         }
-        Message::RequestTabSelected(request_tab) => {
-            app.active_request_tab = request_tab;
-            iced::Task::none()
-        }
         Message::HeadersAction(action) => {
             app.headers_content.perform(action);
             iced::Task::none()
@@ -1246,7 +1268,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::ToggleLoop => {
             if let Some(vp) = app.video_player.as_mut() {
                 vp.set_looping(!vp.looping());
@@ -1369,7 +1390,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             let text = match app.active_response_tab {
                 ResponseTab::Body => app.response_body_content.text(),
                 ResponseTab::Headers => app.response_headers_content.text(),
-                ResponseTab::None => String::new(),
             };
 
             app.copied = true;
@@ -1393,7 +1413,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.rebuild_url();
             iced::Task::none()
         }
-
         Message::QueryParamRemove(idx) => {
             if idx < app.query_params.len() {
                 app.query_params.remove(idx);
@@ -1401,17 +1420,14 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.rebuild_url();
             iced::Task::none()
         }
-
         Message::QueryParamKeyChanged(idx, key) => {
             app.update_query(idx, |p| p.key = key);
             iced::Task::none()
         }
-
         Message::QueryParamValueChanged(idx, value) => {
             app.update_query(idx, |p| p.value = value);
             iced::Task::none()
         }
-
         Message::QueryParamToggled(idx) => {
             app.update_query(idx, |p| p.enabled = !p.enabled);
             iced::Task::none()
@@ -1663,6 +1679,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
+        Message::RequestTabSelected(request_tab) => {
+            app.active_request_tab = request_tab;
+            iced::Task::none()
+        }
     }
 }
 
@@ -1790,14 +1810,6 @@ impl std::fmt::Display for HttpMethod {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
-enum RequestTab {
-    Body,
-    Headers,
-    Auth,
-    Query,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum ContentType {
     Json,
     FormData,
@@ -1881,13 +1893,6 @@ impl AuthType {
     const ALL: [AuthType; 2] = [AuthType::None, AuthType::Bearer];
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum ResponseTab {
-    None,
-    Body,
-    Headers,
-}
-
 #[derive(Debug, Clone)]
 struct HttpResponse {
     status: String,
@@ -1955,3 +1960,64 @@ struct SavedState {
     response_headers: Option<String>,
     response_body: Option<String>,
 }
+
+trait Tab {
+    type Message;
+
+    fn title(&self) -> String;
+
+    fn tab_label(&self) -> iced_aw::TabLabel;
+
+    fn view(&self) -> Element<'_, Self::Message> {
+        let column = Column::new()
+            .spacing(20)
+            .push(iced::widget::Text::new(self.title()).size(HEADER_SIZE))
+            .push(self.content())
+            .align_x(iced::Alignment::Center);
+
+        iced::widget::container::Container::new(column)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(alignment::Horizontal::Center)
+            .align_y(alignment::Vertical::Center)
+            .padding(TAB_PADDING)
+            .into()
+    }
+
+    fn content(&self) -> Element<'_, Self::Message>;
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+enum RequestTab {
+    Body,
+    Headers,
+    Auth,
+    Query,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ResponseTab {
+    Body,
+    Headers,
+}
+
+enum Icon {
+    User,
+    Heart,
+    Calc,
+    CogAlt,
+}
+
+impl From<Icon> for char {
+    fn from(icon: Icon) -> Self {
+        match icon {
+            Icon::User => '\u{E800}',
+            Icon::Heart => '\u{E801}',
+            Icon::Calc => '\u{F1EC}',
+            Icon::CogAlt => '\u{E802}',
+        }
+    }
+}
+
+const HEADER_SIZE: u32 = 32;
+const TAB_PADDING: u16 = 16;

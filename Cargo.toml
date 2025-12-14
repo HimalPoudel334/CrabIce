@@ -20,6 +20,7 @@ gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
 gstreamer-base = "0.23"
+iced_aw = { version = "0.13.0", features = ["tabs", "tab_bar"] }
 
 
 [profile.release]
