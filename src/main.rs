@@ -1,4 +1,5 @@
 #![allow(unused)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::atomic::Ordering;
 
@@ -768,6 +769,30 @@ impl CrabiPie {
         }
     }
 
+    fn parse_url_query(&mut self) {
+        self.query_params.clear();
+
+        if let Some(q_index) = self.url.find('?') {
+            let query = &self.url[q_index + 1..];
+
+            for pair in query.split('&') {
+                if pair.is_empty() {
+                    continue;
+                }
+
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next().unwrap_or("").to_string();
+                let value = parts.next().unwrap_or("").to_string();
+
+                self.query_params.push(QueryParam {
+                    key,
+                    value,
+                    enabled: true,
+                });
+            }
+        }
+    }
+
     fn save_request(&self) -> SavedState {
         let is_text = !self.is_response_binary;
 
@@ -1109,7 +1134,7 @@ impl CrabiPie {
 
     fn svg_rotation_subscription(&self) -> iced::Subscription<Message> {
         if self.loading {
-            iced::time::every(std::time::Duration::from_millis(1)).map(|_| Message::Tick)
+            iced::time::every(std::time::Duration::from_millis(5)).map(|_| Message::Tick)
         } else {
             iced::Subscription::none()
         }
@@ -1128,6 +1153,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::UrlChanged(url) => {
             app.url = url;
+            app.parse_url_query();
             iced::Task::none()
         }
         Message::SendRequest => {
@@ -1339,19 +1365,24 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             if app.is_response_binary {
                 return iced::Task::none();
             }
-            app.copied = true;
+
             let text = match app.active_response_tab {
                 ResponseTab::Body => app.response_body_content.text(),
                 ResponseTab::Headers => app.response_headers_content.text(),
                 ResponseTab::None => String::new(),
             };
-            iced::Task::perform(
-                async {
-                    let _ = iced::clipboard::write::<String>(text);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                },
-                |_| Message::ResetCopied,
-            )
+
+            app.copied = true;
+
+            iced::Task::batch([
+                iced::clipboard::write(text),
+                iced::Task::perform(
+                    async {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    },
+                    |_| Message::ResetCopied,
+                ),
+            ])
         }
         Message::ResetCopied => {
             app.copied = false;
@@ -1573,6 +1604,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::EventOccurred(event) => {
             use iced::keyboard::{Event as KeyEvent, Key, Modifiers};
+            if let Event::Window(window_event) = &event {
+                match window_event {
+                    iced::window::Event::Unfocused => {
+                        println!("window was unfocused");
+                        return iced::Task::none();
+                    }
+                    _ => {}
+                }
+            }
             if let Event::Keyboard(key_event) = event {
                 match key_event {
                     KeyEvent::KeyPressed { key, modifiers, .. } if modifiers.control() => {
