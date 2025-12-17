@@ -17,6 +17,11 @@ use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
 enum Message {
+    //Tabs
+    AddNewTab,
+    TabSelected(usize),
+    CloseTab(usize),
+
     UrlChanged(String),
     MethodSelected(HttpMethod),
     HeadersAction(text_editor::Action),
@@ -126,6 +131,8 @@ struct CrabiPie {
     json_theme: highlighter::Theme,
     app_theme: iced::Theme,
     svg_rotation: f32,
+    tabs: Vec<SavedState>,
+    active_tab: usize,
 
     // Find dialog
     find_dialog_open: bool,
@@ -143,7 +150,7 @@ impl CrabiPie {
             Self {
                 url_id: iced::widget::Id::unique(),
                 base_url: base.clone(),
-                url: base,
+                url: base.clone(),
                 method: HttpMethod::GET,
                 headers_content: text_editor::Content::with_text(HEADERS_DEFAULT),
                 body_content: text_editor::Content::with_text(BODY_DEFAULT),
@@ -163,6 +170,8 @@ impl CrabiPie {
                 response_bytes: Vec::new(),
                 response_content_type: String::new(),
                 response_time: None,
+                tabs: vec![SavedState::default()],
+                active_tab: 0,
                 loading: false,
                 svg_rotation: 0.0,
                 active_request_tab: RequestTab::Query,
@@ -182,7 +191,193 @@ impl CrabiPie {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedState {
+    id: usize,
+    title: String,
+    base_url: String,
+    url: String,
+    method: HttpMethod,
+    headers: String,
+    body: String,
+    auth_type: AuthType,
+    bearer_token: String,
+    content_type: ContentType,
+    query_params: Vec<QueryParam>,
+    form_data: Vec<FormField>,
+    json_theme: String,
+    app_theme: String,
+
+    // Response (only when NOT binary)
+    response_status: Option<String>,
+    response_headers: Option<String>,
+    response_body: Option<String>,
+}
+
+impl Default for SavedState {
+    fn default() -> Self {
+        let base = "https://jsonplaceholder.typicode.com/posts".to_string();
+        Self {
+            id: 0,
+            title: "Request-1".into(),
+            url: base.clone(),
+            base_url: base,
+            method: HttpMethod::GET,
+            headers: String::new(),
+            body: String::new(),
+            auth_type: AuthType::None,
+            bearer_token: String::new(),
+            content_type: ContentType::Json,
+            query_params: vec![QueryParam::new()],
+            form_data: vec![FormField::new()],
+            json_theme: String::new(),
+            app_theme: String::new(),
+            response_status: None,
+            response_headers: None,
+            response_body: None,
+        }
+    }
+}
+
 impl CrabiPie {
+    fn render_tabs(&self) -> Element<'_, Message> {
+        let mut tab_bar = iced::widget::Row::new().spacing(2);
+
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let is_active = index == self.active_tab;
+
+            let button_or_space: Element<'_, Message> = if self.tabs.len() > 1 {
+                button(text("×"))
+                    .on_press(Message::CloseTab(index))
+                    .style(button::text)
+                    .into()
+            } else {
+                space::horizontal().width(Length::Shrink).into()
+            };
+            let tab_button = button(
+                row![text(&tab.title), button_or_space]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+            )
+            .on_press(Message::TabSelected(index))
+            .style(if is_active {
+                button::primary
+            } else {
+                button::secondary
+            });
+
+            tab_bar = tab_bar.push(tab_button);
+        }
+
+        // Add the "+" button
+        let add_button = button(text("+").size(20))
+            .on_press(Message::AddNewTab)
+            .style(button::text);
+
+        tab_bar = tab_bar.push(add_button);
+
+        container(tab_bar)
+            .style(|theme: &iced::Theme| container::Style {
+                border: Border {
+                    width: 0.0,
+                    color: iced::Color::TRANSPARENT,
+                    radius: 0.0.into(),
+                },
+                background: Some(iced::Background::Color(theme.palette().background)),
+                ..Default::default()
+            })
+            .padding(5)
+            .into()
+    }
+
+    fn render_active_tab_content(&self) -> Element<'_, Message> {
+        let tab = &self.tabs[self.active_tab];
+
+        // Render the content using the active tab's data
+        column![
+            self.render_title_row(),
+            self.render_request_row(),
+            row![
+                self.render_request_section(),
+                self.render_response_section()
+            ]
+            .spacing(10)
+        ]
+        .spacing(10)
+        .into()
+    }
+    fn render_title_row(&self) -> Element<'_, Message> {
+        row![
+            text("CrabiPie HTTP Client").size(16),
+            space::horizontal(),
+            text("App theme"),
+            pick_list(
+                &iced::Theme::ALL[..],
+                Some(&self.app_theme),
+                Message::AppThemeChanged,
+            ),
+            button("Open").on_press(Message::LoadRequest),
+            button("Save").on_press(Message::SaveRequest)
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    fn render_request_row(&self) -> Element<'_, Message> {
+        let method_picker = pick_list(
+            &HttpMethod::ALL[..],
+            Some(self.method.clone()),
+            Message::MethodSelected,
+        )
+        .width(100)
+        .padding(10);
+
+        let url_input = text_input("https://api.example.com/endpoint", &self.url)
+            .id(self.url_id.clone())
+            .on_input(Message::UrlChanged)
+            .size(20)
+            .padding(8)
+            .width(Length::Fill);
+
+        let send_button = if self.loading {
+            button(
+                text("⏹ Cancel")
+                    .align_x(alignment::Horizontal::Center)
+                    .shaping(text::Shaping::Advanced)
+                    .width(Length::Fill),
+            )
+            .on_press(Message::CancelRequest)
+            .padding(10)
+            .width(100)
+        } else {
+            button(
+                text("📤 Send")
+                    .shaping(text::Shaping::Advanced)
+                    .align_x(alignment::Horizontal::Center)
+                    .width(Length::Fill),
+            )
+            .on_press_maybe(if !self.url.trim().is_empty() {
+                Some(Message::SendRequest)
+            } else {
+                None
+            })
+            .padding(10)
+            .width(100)
+        };
+
+        container(row![method_picker, url_input, send_button].spacing(10))
+            .style(|theme: &iced::Theme| container::Style {
+                border: Border {
+                    width: 1.5,
+                    color: theme.palette().background,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .padding(10)
+            .into()
+    }
+
     fn render_request_section(&self) -> Element<'_, Message> {
         let req_tabs: iced_aw::Tabs<Message, RequestTab, iced::Theme, iced::Renderer> =
             iced_aw::Tabs::new(Message::RequestTabSelected)
@@ -209,14 +404,12 @@ impl CrabiPie {
                 .push(
                     RequestTab::Headers,
                     iced_aw::TabLabel::Text("Headers".into()),
-                    container(self.render_headers_tab())
-                        .padding(Padding {
-                            top: 10.0,
-                            right: 0.0,
-                            bottom: 0.0,
-                            left: 0.0,
-                        })
-                        .height(Length::Fill),
+                    container(self.render_headers_tab()).padding(Padding {
+                        top: 10.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    }),
                 )
                 .push(
                     RequestTab::Auth,
@@ -544,26 +737,22 @@ impl CrabiPie {
                 .push(
                     ResponseTab::Body,
                     iced_aw::TabLabel::Text("Body".into()),
-                    container(self.with_overlay(self.render_response_body()))
-                        .padding(Padding {
-                            top: 10.0,
-                            right: 0.0,
-                            bottom: 0.0,
-                            left: 0.0,
-                        })
-                        .height(Length::Fill),
+                    container(self.with_overlay(self.render_response_body())).padding(Padding {
+                        top: 10.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    }),
                 )
                 .push(
                     ResponseTab::Headers,
                     iced_aw::TabLabel::Text("Header".into()),
-                    container(self.with_overlay(self.render_response_headers()))
-                        .padding(Padding {
-                            top: 10.0,
-                            right: 0.0,
-                            bottom: 0.0,
-                            left: 0.0,
-                        })
-                        .height(Length::Fill),
+                    container(self.with_overlay(self.render_response_headers())).padding(Padding {
+                        top: 10.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    }),
                 )
                 .set_active_tab(&self.active_response_tab)
                 .tab_bar_position(iced_aw::TabBarPosition::Top)
@@ -707,8 +896,7 @@ impl CrabiPie {
             scrollable(
                 text_editor(&self.response_body_content)
                     .on_action(Message::ResponseBodyAction)
-                    .highlight("json", self.json_theme)
-                    .height(Length::Shrink),
+                    .highlight("json", self.json_theme),
             )
             .height(Length::Fill)
             .into()
@@ -719,8 +907,7 @@ impl CrabiPie {
         scrollable(
             text_editor(&self.response_headers_content)
                 .on_action(Message::ResponseHeadersAction)
-                .highlight("json", self.json_theme)
-                .height(Length::Shrink),
+                .highlight("json", self.json_theme),
         )
         .height(Length::Fill)
         .into()
@@ -765,7 +952,9 @@ impl CrabiPie {
     ) -> Element<'a, Message> {
         let content = content.into();
         if let Some(overlay) = self.loading_overlay() {
-            iced::widget::stack![content, overlay].into()
+            iced::widget::stack![content, overlay]
+                .height(Length::Fill)
+                .into()
         } else {
             content
         }
@@ -823,6 +1012,8 @@ impl CrabiPie {
         let is_text = !self.is_response_binary;
 
         SavedState {
+            id: self.active_tab,
+            title: String::new(),
             base_url: self.base_url.clone(),
             url: self.url.clone(),
             method: self.method,
@@ -1173,6 +1364,31 @@ impl CrabiPie {
 
 fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
     match message {
+        Message::TabSelected(index) => {
+            app.active_tab = index;
+            iced::Task::none()
+        }
+        Message::AddNewTab => {
+            let mut default_tab = SavedState::default();
+            let new_id = app.tabs.len();
+            default_tab.id = new_id;
+            default_tab.title = format!("Request-{}", new_id + 1);
+            app.tabs.push(default_tab);
+            app.active_tab = app.tabs.len() - 1;
+            iced::Task::none()
+        }
+        Message::CloseTab(index) => {
+            if app.tabs.len() > 1 {
+                app.tabs.remove(index);
+                if app.active_tab >= app.tabs.len() {
+                    app.active_tab = app.tabs.len() - 1;
+                } else if app.active_tab > index {
+                    app.active_tab -= 1;
+                }
+            }
+            iced::Task::none()
+        }
+
         Message::MethodSelected(method) => {
             app.method = method;
             iced::Task::none()
@@ -1687,83 +1903,11 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 }
 
 fn view(app: &CrabiPie) -> Element<'_, Message> {
-    let title_row = row![
-        text("CrabiPie HTTP Client").size(16),
-        space::horizontal(),
-        text("App theme"),
-        pick_list(
-            &iced::Theme::ALL[..],
-            Some(&app.app_theme),
-            Message::AppThemeChanged,
-        ),
-        button("Open").on_press(Message::LoadRequest),
-        button("Save").on_press(Message::SaveRequest)
-    ]
-    .spacing(10);
+    let tabs = app.render_tabs();
 
-    let method_picker = pick_list(
-        &HttpMethod::ALL[..],
-        Some(app.method.clone()),
-        Message::MethodSelected,
-    )
-    .width(100)
-    .padding(10);
-
-    let url_input = text_input("https://api.example.com/endpoint", &app.url)
-        .id(app.url_id.clone())
-        .on_input(Message::UrlChanged)
-        .size(20)
-        .padding(8)
-        .width(Length::Fill);
-
-    let send_button = if app.loading {
-        button(
-            text("⏹ Cancel")
-                .align_x(alignment::Horizontal::Center)
-                .shaping(text::Shaping::Advanced)
-                .width(Length::Fill),
-        )
-        .on_press(Message::CancelRequest)
+    container(column![tabs, app.render_active_tab_content()].spacing(10))
         .padding(10)
-        .width(100)
-    } else {
-        button(
-            text("📤 Send")
-                .shaping(text::Shaping::Advanced)
-                .align_x(alignment::Horizontal::Center)
-                .width(Length::Fill),
-        )
-        .on_press_maybe(if !app.url.trim().is_empty() {
-            Some(Message::SendRequest)
-        } else {
-            None
-        })
-        .padding(10)
-        .width(100)
-    };
-
-    let request_row = container(row![method_picker, url_input, send_button].spacing(10))
-        .style(|theme: &iced::Theme| container::Style {
-            border: Border {
-                width: 1.5,
-                color: theme.palette().background,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        })
-        .padding(10);
-
-    let app_container = container(
-        column![
-            title_row,
-            request_row,
-            row![app.render_request_section(), app.render_response_section()].spacing(10)
-        ]
-        .spacing(10),
-    )
-    .padding(10);
-
-    app_container.into()
+        .into()
 }
 
 fn main() -> iced::Result {
@@ -1939,27 +2083,6 @@ static HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::La
         .build()
         .expect("failed to build http client")
 });
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SavedState {
-    base_url: String,
-    url: String,
-    method: HttpMethod,
-    headers: String,
-    body: String,
-    auth_type: AuthType,
-    bearer_token: String,
-    content_type: ContentType,
-    query_params: Vec<QueryParam>,
-    form_data: Vec<FormField>,
-    json_theme: String,
-    app_theme: String,
-
-    // Response (only when NOT binary)
-    response_status: Option<String>,
-    response_headers: Option<String>,
-    response_body: Option<String>,
-}
 
 trait Tab {
     type Message;
