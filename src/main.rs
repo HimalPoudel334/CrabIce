@@ -95,6 +95,29 @@ enum Message {
 }
 
 struct CrabiPie {
+    // Tab management
+    tabs: Vec<TabState>,
+    active_tab: usize,
+    next_tab_id: usize,
+
+    // Global UI state (shared across all tabs)
+    json_theme: highlighter::Theme,
+    app_theme: iced::Theme,
+    svg_rotation: f32,
+
+    // Find dialog (global)
+    find_dialog_open: bool,
+    find_replace_mode: bool,
+    find_text: String,
+    replace_text: String,
+    case_sensitive: bool,
+    whole_word: bool,
+}
+
+struct TabState {
+    id: usize,
+    title: String,
+
     // Request configuration
     url_id: iced::widget::Id,
     base_url: String,
@@ -109,7 +132,7 @@ struct CrabiPie {
     form_data: Vec<FormField>,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
-    //video response
+    // Video response
     video_player: Option<iced_video_player::Video>,
     video_state: Option<VideoState>,
 
@@ -123,71 +146,171 @@ struct CrabiPie {
     response_content_type: String,
     response_time: Option<std::time::Duration>,
 
-    // UI state
+    // Tab-specific UI state
     loading: bool,
     active_request_tab: RequestTab,
     active_response_tab: ResponseTab,
     copied: bool,
-    json_theme: highlighter::Theme,
-    app_theme: iced::Theme,
-    svg_rotation: f32,
-    tabs: Vec<SavedState>,
-    active_tab: usize,
+}
 
-    // Find dialog
-    find_dialog_open: bool,
-    find_replace_mode: bool,
-    find_text: String,
-    replace_text: String,
-    case_sensitive: bool,
-    whole_word: bool,
+impl TabState {
+    fn new(id: usize) -> Self {
+        let base = "https://jsonplaceholder.typicode.com/posts".to_string();
+        Self {
+            id,
+            title: format!("Request {}", id + 1),
+            url_id: iced::widget::Id::unique(),
+            base_url: base.clone(),
+            url: base,
+            method: HttpMethod::GET,
+            headers_content: text_editor::Content::with_text(HEADERS_DEFAULT),
+            body_content: text_editor::Content::with_text(BODY_DEFAULT),
+            auth_type: AuthType::None,
+            bearer_token: String::new(),
+            content_type: ContentType::Json,
+            query_params: vec![QueryParam::new()],
+            form_data: vec![FormField::new()],
+            video_player: None,
+            video_state: None,
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            response_status: String::new(),
+            response_headers_content: text_editor::Content::new(),
+            response_body_content: text_editor::Content::new(),
+            is_response_binary: false,
+            response_filename: String::new(),
+            response_bytes: Vec::new(),
+            response_content_type: String::new(),
+            response_time: None,
+            loading: false,
+            active_request_tab: RequestTab::Query,
+            active_response_tab: ResponseTab::Body,
+            copied: false,
+        }
+    }
+
+    fn from_saved(saved: SavedState) -> Self {
+        Self {
+            id: saved.id,
+            title: saved.title,
+            url_id: iced::widget::Id::unique(),
+            base_url: saved.base_url,
+            url: saved.url,
+            method: saved.method,
+            headers_content: text_editor::Content::with_text(&saved.headers),
+            body_content: text_editor::Content::with_text(&saved.body),
+            auth_type: saved.auth_type,
+            bearer_token: saved.bearer_token,
+            content_type: saved.content_type,
+            query_params: saved.query_params,
+            form_data: saved.form_data,
+            video_player: None,
+            video_state: None,
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            response_status: saved.response_status.unwrap_or_default(),
+            response_headers_content: text_editor::Content::with_text(
+                &saved.response_headers.unwrap_or_default(),
+            ),
+            response_body_content: text_editor::Content::with_text(
+                &saved.response_body.unwrap_or_default(),
+            ),
+            is_response_binary: false,
+            response_filename: String::new(),
+            response_bytes: Vec::new(),
+            response_content_type: String::new(),
+            response_time: None,
+            loading: false,
+            active_request_tab: RequestTab::Query,
+            active_response_tab: ResponseTab::Body,
+            copied: false,
+        }
+    }
+
+    fn to_saved(&self, json_theme: &str, app_theme: &str) -> SavedState {
+        SavedState {
+            id: self.id,
+            title: self.title.clone(),
+            base_url: self.base_url.clone(),
+            url: self.url.clone(),
+            method: self.method.clone(),
+            headers: self.headers_content.text(),
+            body: self.body_content.text(),
+            auth_type: self.auth_type.clone(),
+            bearer_token: self.bearer_token.clone(),
+            content_type: self.content_type.clone(),
+            query_params: self.query_params.clone(),
+            form_data: self.form_data.clone(),
+            json_theme: json_theme.to_string(),
+            app_theme: app_theme.to_string(),
+            response_status: if self.response_status.is_empty() {
+                None
+            } else {
+                Some(self.response_status.clone())
+            },
+            response_headers: if self.response_headers_content.text().is_empty() {
+                None
+            } else {
+                Some(self.response_headers_content.text())
+            },
+            response_body: if self.response_body_content.text().is_empty() {
+                None
+            } else {
+                Some(self.response_body_content.text())
+            },
+        }
+    }
 }
 
 impl CrabiPie {
     fn new() -> (Self, iced::Task<Message>) {
-        let base = "https://jsonplaceholder.typicode.com/posts".to_string();
         (
             Self {
-                url_id: iced::widget::Id::unique(),
-                base_url: base.clone(),
-                url: base.clone(),
-                method: HttpMethod::GET,
-                headers_content: text_editor::Content::with_text(HEADERS_DEFAULT),
-                body_content: text_editor::Content::with_text(BODY_DEFAULT),
-                auth_type: AuthType::None,
-                bearer_token: String::new(),
-                content_type: ContentType::Json,
-                query_params: vec![QueryParam::new()],
-                form_data: vec![FormField::new()],
-                video_player: None,
-                video_state: None,
-                cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                response_status: String::new(),
-                response_headers_content: text_editor::Content::new(),
-                response_body_content: text_editor::Content::new(),
-                is_response_binary: false,
-                response_filename: String::new(),
-                response_bytes: Vec::new(),
-                response_content_type: String::new(),
-                response_time: None,
-                tabs: vec![SavedState::default()],
+                tabs: vec![TabState::new(0)],
                 active_tab: 0,
-                loading: false,
+                next_tab_id: 1,
+                json_theme: highlighter::Theme::SolarizedDark,
+                app_theme: iced::Theme::CatppuccinMocha,
                 svg_rotation: 0.0,
-                active_request_tab: RequestTab::Query,
-                active_response_tab: ResponseTab::Body,
-                copied: false,
                 find_dialog_open: false,
                 find_replace_mode: false,
                 find_text: String::new(),
                 replace_text: String::new(),
                 case_sensitive: false,
                 whole_word: false,
-                json_theme: highlighter::Theme::SolarizedDark,
-                app_theme: iced::Theme::CatppuccinMocha,
             },
             iced::Task::none(),
         )
+    }
+
+    fn current_tab(&self) -> &TabState {
+        &self.tabs[self.active_tab]
+    }
+
+    fn current_tab_mut(&mut self) -> &mut TabState {
+        &mut self.tabs[self.active_tab]
+    }
+
+    fn add_tab(&mut self) {
+        let new_tab = TabState::new(self.next_tab_id);
+        self.tabs.push(new_tab);
+        self.active_tab = self.tabs.len() - 1;
+        self.next_tab_id += 1;
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() > 1 {
+            self.tabs.remove(index);
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            } else if self.active_tab > index {
+                self.active_tab -= 1;
+            }
+        }
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.active_tab = index;
+        }
     }
 }
 
@@ -247,9 +370,9 @@ impl CrabiPie {
             let is_active = index == self.active_tab;
 
             let button_or_space: Element<'_, Message> = if self.tabs.len() > 1 {
-                button(text("×"))
-                    .on_press(Message::CloseTab(index))
+                button(text("❌").size(8).shaping(text::Shaping::Advanced))
                     .style(button::text)
+                    .on_press(Message::CloseTab(index))
                     .into()
             } else {
                 space::horizontal().width(Length::Shrink).into()
@@ -278,15 +401,9 @@ impl CrabiPie {
 
         container(tab_bar)
             .style(|theme: &iced::Theme| container::Style {
-                border: Border {
-                    width: 0.0,
-                    color: iced::Color::TRANSPARENT,
-                    radius: 0.0.into(),
-                },
                 background: Some(iced::Background::Color(theme.palette().background)),
                 ..Default::default()
             })
-            .padding(5)
             .into()
     }
 
@@ -295,7 +412,6 @@ impl CrabiPie {
 
         // Render the content using the active tab's data
         column![
-            self.render_title_row(),
             self.render_request_row(),
             row![
                 self.render_request_section(),
@@ -326,20 +442,20 @@ impl CrabiPie {
     fn render_request_row(&self) -> Element<'_, Message> {
         let method_picker = pick_list(
             &HttpMethod::ALL[..],
-            Some(self.method.clone()),
+            Some(self.current_tab().method.clone()),
             Message::MethodSelected,
         )
         .width(100)
         .padding(10);
 
-        let url_input = text_input("https://api.example.com/endpoint", &self.url)
-            .id(self.url_id.clone())
+        let url_input = text_input("https://api.example.com/endpoint", &self.current_tab().url)
+            .id(self.current_tab().url_id.clone())
             .on_input(Message::UrlChanged)
             .size(20)
             .padding(8)
             .width(Length::Fill);
 
-        let send_button = if self.loading {
+        let send_button = if self.current_tab().loading {
             button(
                 text("⏹ Cancel")
                     .align_x(alignment::Horizontal::Center)
@@ -356,7 +472,7 @@ impl CrabiPie {
                     .align_x(alignment::Horizontal::Center)
                     .width(Length::Fill),
             )
-            .on_press_maybe(if !self.url.trim().is_empty() {
+            .on_press_maybe(if !self.current_tab().url.trim().is_empty() {
                 Some(Message::SendRequest)
             } else {
                 None
@@ -421,7 +537,7 @@ impl CrabiPie {
                         left: 0.0,
                     }),
                 )
-                .set_active_tab(&self.active_request_tab)
+                .set_active_tab(&self.current_tab().active_request_tab)
                 .tab_bar_position(iced_aw::TabBarPosition::Top)
                 .into();
 
@@ -441,25 +557,26 @@ impl CrabiPie {
 
     fn render_body_tab(&self) -> Element<'_, Message> {
         if !matches!(
-            self.method,
+            self.current_tab().method,
             HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH
         ) {
             return text("Select POST, PUT, or PATCH to edit body.").into();
         }
 
-        let prettify_button: Element<'_, Message> = if self.content_type == ContentType::Json {
-            button(text("✨ Prettify").shaping(text::Shaping::Advanced))
-                .on_press(Message::PrettifyJson)
-                .into()
-        } else {
-            Space::new().into()
-        };
+        let prettify_button: Element<'_, Message> =
+            if self.current_tab().content_type == ContentType::Json {
+                button(text("✨ Prettify").shaping(text::Shaping::Advanced))
+                    .on_press(Message::PrettifyJson)
+                    .into()
+            } else {
+                Space::new().into()
+            };
 
         let type_selector = row![
             text("Type:"),
             pick_list(
                 &ContentType::ALL[..],
-                Some(self.content_type.clone()),
+                Some(self.current_tab().content_type.clone()),
                 Message::ContentTypeSelected
             ),
             space::horizontal(),
@@ -468,9 +585,9 @@ impl CrabiPie {
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let editor_content = match self.content_type {
+        let editor_content = match self.current_tab().content_type {
             ContentType::Json => scrollable(
-                text_editor(&self.body_content)
+                text_editor(&self.current_tab().body_content)
                     .on_action(Message::BodyAction)
                     .highlight("json", self.json_theme)
                     .height(Length::Shrink),
@@ -487,11 +604,14 @@ impl CrabiPie {
     }
 
     fn render_form_data(&self) -> Element<'_, Message> {
-        let is_url_encoded = matches!(self.content_type, ContentType::XWWWFormUrlEncoded);
+        let is_url_encoded = matches!(
+            self.current_tab().content_type,
+            ContentType::XWWWFormUrlEncoded
+        );
 
         let mut fields_col = Column::new().spacing(10);
 
-        for (idx, field) in self.form_data.iter().enumerate() {
+        for (idx, field) in self.current_tab().form_data.iter().enumerate() {
             // Force text type if URL-encoded
             let effective_type = if is_url_encoded {
                 FormFieldType::Text
@@ -581,7 +701,7 @@ impl CrabiPie {
     fn render_query_tab(&self) -> Element<'_, Message> {
         let mut params_col = Column::new().spacing(10);
 
-        for (idx, param) in self.query_params.iter().enumerate() {
+        for (idx, param) in self.current_tab().query_params.iter().enumerate() {
             let checkbox =
                 checkbox(param.enabled).on_toggle(move |_| Message::QueryParamToggled(idx));
 
@@ -620,6 +740,7 @@ impl CrabiPie {
 
     fn build_query_string(&self) -> String {
         let params: Vec<String> = self
+            .current_tab()
             .query_params
             .iter()
             .filter(|p| p.enabled && !p.key.is_empty())
@@ -641,7 +762,7 @@ impl CrabiPie {
 
     fn render_headers_tab(&self) -> Element<'_, Message> {
         scrollable(
-            text_editor(&self.headers_content)
+            text_editor(&self.current_tab().headers_content)
                 .on_action(Message::HeadersAction)
                 .highlight("json", self.json_theme)
                 .height(Length::Shrink),
@@ -655,7 +776,7 @@ impl CrabiPie {
             text("Type:"),
             pick_list(
                 &AuthType::ALL[..],
-                Some(self.auth_type.clone()),
+                Some(self.current_tab().auth_type.clone()),
                 Message::AuthTypeSelected
             )
             .width(150),
@@ -663,10 +784,11 @@ impl CrabiPie {
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let token_input: Element<'_, Message> = if self.auth_type == AuthType::Bearer {
+        let token_input: Element<'_, Message> = if self.current_tab().auth_type == AuthType::Bearer
+        {
             row![
                 text("Token:"),
-                text_input("", &self.bearer_token)
+                text_input("", &self.current_tab().bearer_token)
                     .on_input(Message::BearerTokenChanged)
                     .width(Length::Fill)
                     .padding(10)
@@ -682,10 +804,10 @@ impl CrabiPie {
     }
 
     fn render_response_section(&self) -> Element<'_, Message> {
-        let status_view: Element<'_, Message> = if self.loading {
+        let status_view: Element<'_, Message> = if self.current_tab().loading {
             text("Loading...").into()
-        } else if !self.response_status.is_empty() {
-            text(&self.response_status).into()
+        } else if !self.current_tab().response_status.is_empty() {
+            text(&self.current_tab().response_status).into()
         } else {
             Space::new().into()
         };
@@ -698,17 +820,17 @@ impl CrabiPie {
         header_row = header_row.push(text("Response"));
         header_row = header_row.push(status_view);
 
-        if let Some(resp_time) = self.response_time {
+        if let Some(resp_time) = self.current_tab().response_time {
             header_row = header_row.push(
                 text(format!("⏱️{:.2}ms", resp_time.as_secs_f32() * 1000.0))
                     .shaping(text::Shaping::Advanced),
             );
         }
-        if self.is_response_binary {
+        if self.current_tab().is_response_binary {
             header_row = header_row.push(
                 text(format!(
                     "🗃️{:.2} KB",
-                    self.response_bytes.len() as f32 / 1024.0
+                    self.current_tab().response_bytes.len() as f32 / 1024.0
                 ))
                 .shaping(text::Shaping::Advanced),
             );
@@ -721,10 +843,17 @@ impl CrabiPie {
             Message::JsonThemeChanged,
         ));
         header_row = header_row.push(tooltip(
-            button(text(if self.copied { "✅" } else { "📋" }).shaping(text::Shaping::Advanced))
-                .on_press(Message::CopyToClipboard)
-                .style(button::text),
-            if self.copied {
+            button(
+                text(if self.current_tab().copied {
+                    "✅"
+                } else {
+                    "📋"
+                })
+                .shaping(text::Shaping::Advanced),
+            )
+            .on_press(Message::CopyToClipboard)
+            .style(button::text),
+            if self.current_tab().copied {
                 "Copied"
             } else {
                 "Copy to Clipboard"
@@ -754,7 +883,7 @@ impl CrabiPie {
                         left: 0.0,
                     }),
                 )
-                .set_active_tab(&self.active_response_tab)
+                .set_active_tab(&self.current_tab().active_response_tab)
                 .tab_bar_position(iced_aw::TabBarPosition::Top)
                 .into();
 
@@ -773,7 +902,7 @@ impl CrabiPie {
     }
 
     fn render_response_body(&self) -> Element<'_, Message> {
-        if self.is_response_binary {
+        if self.current_tab().is_response_binary {
             let mut body_column = iced::widget::Column::new().spacing(5);
             body_column = body_column.push(
                 button(text("💾 Save").shaping(text::Shaping::Advanced))
@@ -784,21 +913,29 @@ impl CrabiPie {
                         ..Default::default()
                     }),
             );
-            if self.response_content_type.starts_with("image/") {
+            if self
+                .current_tab()
+                .response_content_type
+                .starts_with("image/")
+            {
                 body_column = body_column.push(
                     scrollable(
                         iced::widget::image(iced::advanced::image::Handle::from_bytes(
-                            self.response_bytes.clone(),
+                            self.current_tab().response_bytes.clone(),
                         ))
                         .content_fit(iced::ContentFit::None),
                     )
                     .height(Length::Fill)
                     .width(Length::Fill),
                 );
-            } else if self.response_content_type.starts_with("video/") {
+            } else if self
+                .current_tab()
+                .response_content_type
+                .starts_with("video/")
+            {
                 // Video playback
-                if let Some(video) = &self.video_player {
-                    let vs = self.video_state.as_ref().unwrap();
+                if let Some(video) = &self.current_tab().video_player {
+                    let vs = self.current_tab().video_state.as_ref().unwrap();
                     body_column = body_column
                         .push(
                             container::Container::new(
@@ -881,20 +1018,22 @@ impl CrabiPie {
                 body_column = body_column.push(
                     text(format!(
                         "📄 Binary file received: {}",
-                        self.response_filename
+                        self.current_tab().response_filename
                     ))
                     .shaping(text::Shaping::Advanced)
                     .style(|_| text::Style {
                         color: Some(iced::Color::from_rgb(1.0, 0.65, 0.0)),
                     }),
                 );
-                body_column =
-                    body_column.push(text(format!("Size: {} bytes", self.response_bytes.len())));
+                body_column = body_column.push(text(format!(
+                    "Size: {} bytes",
+                    self.current_tab().response_bytes.len()
+                )));
             }
             body_column.into()
         } else {
             scrollable(
-                text_editor(&self.response_body_content)
+                text_editor(&self.current_tab().response_body_content)
                     .on_action(Message::ResponseBodyAction)
                     .highlight("json", self.json_theme),
             )
@@ -905,7 +1044,7 @@ impl CrabiPie {
 
     fn render_response_headers(&self) -> Element<'_, Message> {
         scrollable(
-            text_editor(&self.response_headers_content)
+            text_editor(&self.current_tab().response_headers_content)
                 .on_action(Message::ResponseHeadersAction)
                 .highlight("json", self.json_theme),
         )
@@ -914,7 +1053,7 @@ impl CrabiPie {
     }
 
     fn loading_overlay(&self) -> Option<Element<'_, Message>> {
-        if !self.loading {
+        if !self.current_tab().loading {
             return None;
         }
 
@@ -961,34 +1100,40 @@ impl CrabiPie {
     }
 
     fn update_query<F: FnOnce(&mut QueryParam)>(&mut self, idx: usize, f: F) {
-        if let Some(param) = self.query_params.get_mut(idx) {
+        if let Some(param) = self.current_tab_mut().query_params.get_mut(idx) {
             f(param);
         }
         self.rebuild_url();
     }
 
     fn rebuild_url(&mut self) {
-        let base = self.base_url.trim_end_matches('?').to_string();
+        let base = self
+            .current_tab()
+            .base_url
+            .trim_end_matches('?')
+            .to_string();
         let mut qp: Vec<String> = Vec::new();
 
-        for p in &self.query_params {
+        for p in &self.current_tab().query_params {
             if p.enabled && !p.key.is_empty() {
                 qp.push(format!("{}={}", p.key, p.value));
             }
         }
 
         if qp.is_empty() {
-            self.url = base;
+            self.current_tab_mut().url = base;
         } else {
-            self.url = format!("{}?{}", base, qp.join("&"));
+            self.current_tab_mut().url = format!("{}?{}", base, qp.join("&"));
         }
     }
 
     fn parse_url_query(&mut self) {
-        self.query_params.clear();
+        let tab = self.current_tab_mut();
 
-        if let Some(q_index) = self.url.find('?') {
-            let query = &self.url[q_index + 1..];
+        tab.query_params.clear();
+
+        if let Some(q_index) = tab.url.find('?') {
+            let query = &tab.url[q_index + 1..];
 
             for pair in query.split('&') {
                 if pair.is_empty() {
@@ -999,7 +1144,7 @@ impl CrabiPie {
                 let key = parts.next().unwrap_or("").to_string();
                 let value = parts.next().unwrap_or("").to_string();
 
-                self.query_params.push(QueryParam {
+                tab.query_params.push(QueryParam {
                     key,
                     value,
                     enabled: true,
@@ -1008,68 +1153,23 @@ impl CrabiPie {
         }
     }
 
-    fn save_request(&self) -> SavedState {
-        let is_text = !self.is_response_binary;
-
-        SavedState {
-            id: self.active_tab,
-            title: String::new(),
-            base_url: self.base_url.clone(),
-            url: self.url.clone(),
-            method: self.method,
-            headers: self.headers_content.text(),
-            body: self.body_content.text(),
-            auth_type: self.auth_type,
-            bearer_token: self.bearer_token.clone(),
-            content_type: self.content_type,
-            query_params: self.query_params.clone(),
-            form_data: self.form_data.clone(),
-            json_theme: self.json_theme.to_string(),
-            app_theme: self.app_theme.to_string(),
-
-            // Save text-only response
-            response_status: is_text.then(|| self.response_status.clone()),
-            response_headers: is_text.then(|| self.response_headers_content.text()),
-            response_body: is_text.then(|| self.response_body_content.text()),
-        }
-    }
-
-    fn load_request(&mut self, s: SavedState) {
-        self.base_url = s.base_url;
-        self.url = s.url;
-        self.method = s.method;
-        self.headers_content = text_editor::Content::with_text(&s.headers);
-        self.body_content = text_editor::Content::with_text(&s.body);
-        self.auth_type = s.auth_type;
-        self.bearer_token = s.bearer_token;
-        self.content_type = s.content_type;
-        self.query_params = s.query_params;
-        self.form_data = s.form_data;
-        // Optionally load response if it's not binary
-        if let Some(body) = s.response_body {
-            self.response_status = s.response_status.unwrap_or_default();
-            self.response_headers_content =
-                text_editor::Content::with_text(&s.response_headers.unwrap_or_default());
-            self.response_body_content = text_editor::Content::with_text(&body);
-            self.is_response_binary = false;
-        }
-    }
-
     fn send_request(&mut self) -> iced::Task<Message> {
-        let url = self.url.clone();
-        let method = self.method.clone();
-        let body = self.body_content.text();
-        let headers_text = self.headers_content.text();
-        let auth_type = self.auth_type.clone();
-        let bearer_token = self.bearer_token.clone();
-        let content_type = self.content_type.clone();
-        let form_data = self.form_data.clone();
+        let url = self.current_tab().url.clone();
+        let method = self.current_tab().method.clone();
+        let body = self.current_tab().body_content.text();
+        let headers_text = self.current_tab().headers_content.text();
+        let auth_type = self.current_tab().auth_type.clone();
+        let bearer_token = self.current_tab().bearer_token.clone();
+        let content_type = self.current_tab().content_type.clone();
+        let form_data = self.current_tab().form_data.clone();
 
         // Reset cancel flag, start timer, and clear previous response time
-        self.cancel_flag.store(false, Ordering::Relaxed);
-        self.response_time = None;
+        self.current_tab()
+            .cancel_flag
+            .store(false, Ordering::Relaxed);
+        self.current_tab_mut().response_time = None;
 
-        let cancel_flag = self.cancel_flag.clone();
+        let cancel_flag = self.current_tab().cancel_flag.clone();
 
         iced::Task::perform(
             async move {
@@ -1350,7 +1450,7 @@ impl CrabiPie {
     }
 
     fn svg_rotation_subscription(&self) -> iced::Subscription<Message> {
-        if self.loading {
+        if self.current_tab().loading {
             iced::time::every(std::time::Duration::from_millis(5)).map(|_| Message::Tick)
         } else {
             iced::Subscription::none()
@@ -1369,11 +1469,8 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::AddNewTab => {
-            let mut default_tab = SavedState::default();
             let new_id = app.tabs.len();
-            default_tab.id = new_id;
-            default_tab.title = format!("Request-{}", new_id + 1);
-            app.tabs.push(default_tab);
+            app.tabs.push(TabState::new(new_id));
             app.active_tab = app.tabs.len() - 1;
             iced::Task::none()
         }
@@ -1390,57 +1487,59 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
 
         Message::MethodSelected(method) => {
-            app.method = method;
+            app.current_tab_mut().method = method;
             iced::Task::none()
         }
         Message::UrlChanged(url) => {
-            app.url = url;
+            app.current_tab_mut().url = url;
             app.parse_url_query();
             iced::Task::none()
         }
         Message::SendRequest => {
-            if !app.loading && !app.url.trim().is_empty() {
-                app.loading = true;
+            if !app.current_tab_mut().loading && !app.current_tab_mut().url.trim().is_empty() {
+                app.current_tab_mut().loading = true;
                 app.send_request()
             } else {
                 iced::Task::none()
             }
         }
         Message::HeadersAction(action) => {
-            app.headers_content.perform(action);
+            app.current_tab_mut().headers_content.perform(action);
             iced::Task::none()
         }
         Message::BodyAction(action) => {
-            app.body_content.perform(action);
+            app.current_tab_mut().body_content.perform(action);
             iced::Task::none()
         }
         Message::AuthTypeSelected(auth_type) => {
-            app.auth_type = auth_type;
+            app.current_tab_mut().auth_type = auth_type;
             iced::Task::none()
         }
         Message::BearerTokenChanged(token) => {
-            app.bearer_token = token;
+            app.current_tab_mut().bearer_token = token;
             iced::Task::none()
         }
         Message::ContentTypeSelected(content_type) => {
-            app.content_type = content_type;
+            app.current_tab_mut().content_type = content_type;
             iced::Task::none()
         }
         Message::CancelRequest => {
-            app.cancel_flag.store(true, Ordering::Relaxed);
-            app.loading = false;
-            app.response_body_content =
+            app.current_tab_mut()
+                .cancel_flag
+                .store(true, Ordering::Relaxed);
+            app.current_tab_mut().loading = false;
+            app.current_tab_mut().response_body_content =
                 text_editor::Content::with_text("Request cancelled by user");
-            app.response_status = "Cancelled".to_string();
+            app.current_tab_mut().response_status = "Cancelled".to_string();
             iced::Task::none()
         }
         Message::SaveBinaryResponse => {
-            if !app.is_response_binary {
+            if !app.current_tab().is_response_binary {
                 return iced::Task::none();
             }
 
-            let file_name = app.response_filename.clone();
-            let response_bytes = app.response_bytes.clone();
+            let file_name = app.current_tab().response_filename.clone();
+            let response_bytes = app.current_tab().response_bytes.clone();
 
             iced::Task::perform(
                 async move {
@@ -1462,13 +1561,12 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         Message::FileSaved(result) => {
             match result {
                 Ok(filename) => {
-                    app.response_body_content = text_editor::Content::with_text(&format!(
-                        "File saved successfully: {}",
-                        filename
-                    ))
+                    app.current_tab_mut().response_body_content = text_editor::Content::with_text(
+                        &format!("File saved successfully: {}", filename),
+                    )
                 }
                 Err(error) => {
-                    app.response_body_content =
+                    app.current_tab_mut().response_body_content =
                         text_editor::Content::with_text(&format!("Error saving file: {}", error))
                 }
             }
@@ -1479,40 +1577,39 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::TogglePause => {
-            if let Some(vp) = app.video_player.as_mut() {
+            if let Some(vp) = app.current_tab_mut().video_player.as_mut() {
                 vp.set_paused(!vp.paused());
             }
             iced::Task::none()
         }
         Message::ToggleLoop => {
-            if let Some(vp) = app.video_player.as_mut() {
+            if let Some(vp) = app.current_tab_mut().video_player.as_mut() {
                 vp.set_looping(!vp.looping());
             }
             iced::Task::none()
         }
         Message::VideoVolume(vol) => {
-            if let Some(vp) = app.video_player.as_mut() {
+            if let Some(vp) = app.current_tab_mut().video_player.as_mut() {
                 vp.set_volume(vol);
             }
             iced::Task::none()
         }
         Message::Seek(secs) => {
-            if let Some(vs) = app.video_state.as_mut() {
+            if let Some(vs) = app.current_tab_mut().video_state.as_mut() {
                 vs.dragging = true;
                 vs.position = secs;
             }
-            if let Some(vp) = app.video_player.as_mut() {
+            if let Some(vp) = app.current_tab_mut().video_player.as_mut() {
                 vp.set_paused(true);
             }
             iced::Task::none()
         }
         Message::SeekRelease => {
-            if let (Some(vs), Some(vp)) = (app.video_state.as_mut(), app.video_player.as_mut()) {
+            let tab = app.current_tab_mut();
+            if let (Some(vs), Some(vp)) = (tab.video_state.as_mut(), tab.video_player.as_mut()) {
                 vs.dragging = false;
-
                 vp.seek(std::time::Duration::from_secs_f64(vs.position), false)
                     .expect("seek");
-
                 vp.set_paused(false);
             }
             iced::Task::none()
@@ -1522,7 +1619,8 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::NewFrame => {
-            if let (Some(vs), Some(vp)) = (app.video_state.as_mut(), app.video_player.as_mut()) {
+            let tab = app.current_tab_mut();
+            if let (Some(vs), Some(vp)) = (tab.video_state.as_mut(), tab.video_player.as_mut()) {
                 if !vs.dragging {
                     vs.position = vp.position().as_secs_f64();
                 }
@@ -1530,17 +1628,17 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::ResponseReceived(resp) => {
-            app.loading = false;
-            app.active_response_tab = ResponseTab::Body;
-            app.is_response_binary = resp.is_binary;
+            app.current_tab_mut().loading = false;
+            app.current_tab_mut().active_response_tab = ResponseTab::Body;
+            app.current_tab_mut().is_response_binary = resp.is_binary;
 
             if resp.content_type.starts_with("video/") && resp.accepts_range {
-                let url = url::Url::parse(&app.url).unwrap();
+                let url = url::Url::parse(&app.current_tab().url).unwrap();
 
                 match iced_video_player::Video::new(&url) {
                     Ok(video) => {
-                        app.video_player = Some(video);
-                        app.video_state = Some(VideoState {
+                        app.current_tab_mut().video_player = Some(video);
+                        app.current_tab_mut().video_state = Some(VideoState {
                             playing: true,
                             buffering: true,
                             position: 0.0,
@@ -1551,38 +1649,43 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     }
                     Err(e) => {
                         eprintln!("Failed to load video: {e:?}");
-                        app.video_player = None;
+                        app.current_tab_mut().video_player = None;
                     }
                 }
             } else {
-                app.video_player = None;
-                app.response_headers_content = text_editor::Content::with_text(&resp.headers);
-                app.response_body_content = text_editor::Content::with_text(&resp.body);
-                app.response_bytes = resp.bytes;
+                app.current_tab_mut().video_player = None;
+                app.current_tab_mut().response_headers_content =
+                    text_editor::Content::with_text(&resp.headers);
+                app.current_tab_mut().response_body_content =
+                    text_editor::Content::with_text(&resp.body);
+                app.current_tab_mut().response_bytes = resp.bytes;
             }
 
-            app.response_status = resp.status;
-            app.response_content_type = resp.content_type.clone();
-            app.response_time = resp.response_time;
+            app.current_tab_mut().response_status = resp.status;
+            app.current_tab_mut().response_content_type = resp.content_type.clone();
+            app.current_tab_mut().response_time = resp.response_time;
 
             iced::Task::none()
         }
         Message::ResponseBodyAction(action) => {
             match action {
                 text_editor::Action::Edit(edit) => {}
-                _ => app.response_body_content.perform(action),
+                _ => app.current_tab_mut().response_body_content.perform(action),
             };
             iced::Task::none()
         }
         Message::ResponseHeadersAction(action) => {
             match action {
                 text_editor::Action::Edit(edit) => {}
-                _ => app.response_headers_content.perform(action),
+                _ => app
+                    .current_tab_mut()
+                    .response_headers_content
+                    .perform(action),
             };
             iced::Task::none()
         }
         Message::ResponseTabSelected(response_tab) => {
-            app.active_response_tab = response_tab;
+            app.current_tab_mut().active_response_tab = response_tab;
             iced::Task::none()
         }
         Message::ToggleLayout => {
@@ -1590,25 +1693,25 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::PrettifyJson => {
-            let body_text = app.body_content.text();
+            let body_text = app.current_tab().body_content.text();
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
                 if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-                    app.body_content = text_editor::Content::with_text(&pretty);
+                    app.current_tab_mut().body_content = text_editor::Content::with_text(&pretty);
                 }
             }
             iced::Task::none()
         }
         Message::CopyToClipboard => {
-            if app.is_response_binary {
+            if app.current_tab().is_response_binary {
                 return iced::Task::none();
             }
 
-            let text = match app.active_response_tab {
-                ResponseTab::Body => app.response_body_content.text(),
-                ResponseTab::Headers => app.response_headers_content.text(),
+            let text = match app.current_tab().active_response_tab {
+                ResponseTab::Body => app.current_tab().response_body_content.text(),
+                ResponseTab::Headers => app.current_tab().response_headers_content.text(),
             };
 
-            app.copied = true;
+            app.current_tab_mut().copied = true;
 
             iced::Task::batch([
                 iced::clipboard::write(text),
@@ -1621,17 +1724,17 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             ])
         }
         Message::ResetCopied => {
-            app.copied = false;
+            app.current_tab_mut().copied = false;
             iced::Task::none()
         }
         Message::QueryParamAdd => {
-            app.query_params.push(QueryParam::new());
+            app.current_tab_mut().query_params.push(QueryParam::new());
             app.rebuild_url();
             iced::Task::none()
         }
         Message::QueryParamRemove(idx) => {
-            if idx < app.query_params.len() {
-                app.query_params.remove(idx);
+            if idx < app.current_tab().query_params.len() {
+                app.current_tab_mut().query_params.remove(idx);
             }
             app.rebuild_url();
             iced::Task::none()
@@ -1649,19 +1752,19 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::FormFieldKeyChanged(index, key) => {
-            if let Some(field) = app.form_data.get_mut(index) {
+            if let Some(field) = app.current_tab_mut().form_data.get_mut(index) {
                 field.key = key;
             }
             iced::Task::none()
         }
         Message::FormFieldValueChanged(index, value) => {
-            if let Some(field) = app.form_data.get_mut(index) {
+            if let Some(field) = app.current_tab_mut().form_data.get_mut(index) {
                 field.value = value;
             }
             iced::Task::none()
         }
         Message::FormFieldTypeSelected(idx, form_field_type) => {
-            if let Some(field) = app.form_data.get_mut(idx) {
+            if let Some(field) = app.current_tab_mut().form_data.get_mut(idx) {
                 field.field_type = form_field_type;
                 field.value.clear();
                 field.files.clear();
@@ -1669,7 +1772,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::FormFieldToggled(idx) => {
-            if let Some(field) = app.form_data.get_mut(idx) {
+            if let Some(field) = app.current_tab_mut().form_data.get_mut(idx) {
                 field.enabled = !field.enabled;
             }
             iced::Task::none()
@@ -1683,7 +1786,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::SaveRequest => {
-            let state = app.save_request();
+            let state = app
+                .current_tab()
+                .to_saved(&app.json_theme.to_string(), &app.app_theme.to_string());
 
             iced::Task::perform(
                 async move {
@@ -1748,7 +1853,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             )
         }
         Message::RequestLoaded(saved_state) => {
-            app.load_request(saved_state);
+            *app.current_tab_mut() = TabState::from_saved(saved_state);
             iced::Task::none()
         }
         Message::RequestLoadFailed(err) => iced::Task::none(),
@@ -1775,19 +1880,19 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::perform(future, std::convert::identity)
         }
         Message::FormFieldFilesSelected(index, files) => {
-            if let Some(field) = app.form_data.get_mut(index) {
+            if let Some(field) = app.current_tab_mut().form_data.get_mut(index) {
                 field.files = files;
             }
             iced::Task::none()
         }
         Message::FormFieldRemove(index) => {
-            if index < app.form_data.len() {
-                app.form_data.remove(index);
+            if index < app.current_tab().form_data.len() {
+                app.current_tab_mut().form_data.remove(index);
             }
             iced::Task::none()
         }
         Message::FormFieldAdd => {
-            app.form_data.push(FormField::new());
+            app.current_tab_mut().form_data.push(FormField::new());
             iced::Task::none()
         }
         Message::ToggleFindDialog => {
@@ -1851,8 +1956,13 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         if let Key::Character(c) = &key {
                             if c.as_str() == "l" {
                                 println!("Key event: ctrl + l");
-                                return iced::widget::operation::focus(app.url_id.clone()).chain(
-                                    iced::widget::operation::select_all(app.url_id.clone()),
+                                return iced::widget::operation::focus(
+                                    app.current_tab().url_id.clone(),
+                                )
+                                .chain(
+                                    iced::widget::operation::select_all(
+                                        app.current_tab().url_id.clone(),
+                                    ),
                                 );
                             }
                         }
@@ -1865,15 +1975,16 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         key: Key::Named(iced::keyboard::key::Named::Enter),
                         ..
                     } => {
-                        return iced::widget::operation::is_focused(app.url_id.clone()).then(
-                            |focused| {
-                                if focused {
-                                    iced::Task::done(Message::SendRequest)
-                                } else {
-                                    iced::Task::none()
-                                }
-                            },
-                        );
+                        return iced::widget::operation::is_focused(
+                            app.current_tab().url_id.clone(),
+                        )
+                        .then(|focused| {
+                            if focused {
+                                iced::Task::done(Message::SendRequest)
+                            } else {
+                                iced::Task::none()
+                            }
+                        });
                     }
                     KeyEvent::KeyPressed {
                         key: Key::Named(iced::keyboard::key::Named::Tab),
@@ -1896,18 +2007,21 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::RequestTabSelected(request_tab) => {
-            app.active_request_tab = request_tab;
+            app.current_tab_mut().active_request_tab = request_tab;
             iced::Task::none()
         }
     }
 }
 
 fn view(app: &CrabiPie) -> Element<'_, Message> {
-    let tabs = app.render_tabs();
-
-    container(column![tabs, app.render_active_tab_content()].spacing(10))
-        .padding(10)
-        .into()
+    container(column![
+        app.render_title_row(),
+        app.render_tabs(),
+        rule::horizontal(1.0),
+        app.render_active_tab_content()
+    ])
+    .padding(10)
+    .into()
 }
 
 fn main() -> iced::Result {
