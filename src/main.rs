@@ -804,10 +804,27 @@ impl CrabiPie {
     }
 
     fn render_response_section(&self) -> Element<'_, Message> {
+        fn status_color(status: &str) -> iced::Color {
+            let code = status
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u16>().ok());
+
+            match code {
+                Some(200..=299) => iced::Color::from_rgb(0.2, 0.8, 0.2), // green
+                Some(300..=399) => iced::Color::from_rgb(0.2, 0.6, 0.9), // blue
+                Some(400..=499) => iced::Color::from_rgb(0.9, 0.6, 0.2), // orange
+                Some(500..=599) => iced::Color::from_rgb(0.9, 0.2, 0.2), // red
+                _ => iced::Color::WHITE,
+            }
+        }
+
         let status_view: Element<'_, Message> = if self.current_tab().loading {
             text("Loading...").into()
         } else if !self.current_tab().response_status.is_empty() {
-            text(&self.current_tab().response_status).into()
+            text(&self.current_tab().response_status)
+                .color(status_color(&self.current_tab().response_status))
+                .into()
         } else {
             Space::new().into()
         };
@@ -1316,6 +1333,7 @@ impl CrabiPie {
                             };
                         }
 
+                        let status_code = resp.status();
                         let status = format!(
                             "{} {}",
                             resp.status().as_u16(),
@@ -1410,7 +1428,13 @@ impl CrabiPie {
                         HttpResponse {
                             status,
                             headers,
-                            body,
+                            body: if status_code == reqwest::StatusCode::NOT_FOUND
+                                && body.is_empty()
+                            {
+                                "Ops! the requested resource was not found".to_string()
+                            } else {
+                                body
+                            },
                             is_binary,
                             filename,
                             bytes,
