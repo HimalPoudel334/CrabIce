@@ -312,6 +312,99 @@ impl CrabiPie {
             self.active_tab = index;
         }
     }
+
+    fn view_find_replace(&self) -> Element<'_, Message> {
+        let find_row = row![
+            tooltip(
+                button(
+                    text(if !self.find_replace_mode {
+                        "⬇️"
+                    } else {
+                        "⬆️"
+                    })
+                    .shaping(text::Shaping::Advanced)
+                )
+                .style(button::text)
+                .on_press(Message::ToggleFindReplaceDialog),
+                "Toggle between find and replace",
+                tooltip::Position::Bottom
+            ),
+            text_input("Find...", &self.find_text).on_input(Message::FindTextChanged),
+            tooltip(
+                button(text("🔍").shaping(text::Shaping::Advanced))
+                    .style(button::text)
+                    .on_press(Message::FindNext),
+                "Find Next",
+                tooltip::Position::Bottom
+            ),
+            tooltip(
+                button(text("✖").shaping(text::Shaping::Advanced))
+                    .style(button::text)
+                    .on_press(Message::CloseFindDialog),
+                "Close",
+                tooltip::Position::Bottom
+            )
+        ]
+        .spacing(0);
+
+        let replace_input_or_space: Element<'_, Message> = if self.find_replace_mode {
+            row![
+                text_input("Replace with...", &self.replace_text)
+                    .on_input(Message::ReplaceTextChanged),
+                tooltip(
+                    button(text("✏️").shaping(text::Shaping::Advanced))
+                        .style(button::text)
+                        .on_press(Message::FindNext),
+                    "Replace Next",
+                    tooltip::Position::Bottom
+                ),
+                tooltip(
+                    button(text("🔁").shaping(text::Shaping::Advanced))
+                        .style(button::text)
+                        .on_press(Message::ReplaceAll),
+                    "Replace All",
+                    tooltip::Position::Bottom
+                ),
+            ]
+            .spacing(0)
+            .into()
+        } else {
+            space::horizontal().width(0).into()
+        };
+
+        let buttons = row![
+            tooltip(
+                button("Aa").style(button::text).on_press(Message::Replace),
+                "Match case",
+                tooltip::Position::Bottom
+            ),
+            tooltip(
+                button("[ab]")
+                    .style(button::text)
+                    .on_press(Message::ReplaceAll),
+                "Match whole word",
+                tooltip::Position::Bottom
+            )
+        ]
+        .spacing(8);
+
+        let content = column![find_row, replace_input_or_space, buttons,]
+            .spacing(8)
+            .align_x(Alignment::Start);
+
+        container(content)
+            .width(Length::Fixed(400.0))
+            // .style(|theme: &iced::Theme| container::Appearance {
+            //     background: Some(theme.palette().background.into()),
+            //     border: iced::Border {
+            //         color: theme.palette().primary,
+            //         width: 2.0,
+            //         radius: 8.0.into(),
+            //     },
+            //     ..Default::default()
+            // })
+            .into()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +630,7 @@ impl CrabiPie {
                         left: 0.0,
                     }),
                 )
+                .height(Length::Fill)
                 .set_active_tab(&self.current_tab().active_request_tab)
                 .tab_bar_position(iced_aw::TabBarPosition::Top)
                 .into();
@@ -567,6 +661,7 @@ impl CrabiPie {
             if self.current_tab().content_type == ContentType::Json {
                 button(text("✨ Prettify").shaping(text::Shaping::Advanced))
                     .on_press(Message::PrettifyJson)
+                    .style(button::text)
                     .into()
             } else {
                 Space::new().into()
@@ -582,18 +677,16 @@ impl CrabiPie {
             space::horizontal(),
             prettify_button,
         ]
+        .height(20)
         .spacing(10)
         .align_y(Alignment::Center);
 
         let editor_content = match self.current_tab().content_type {
-            ContentType::Json => scrollable(
-                text_editor(&self.current_tab().body_content)
-                    .on_action(Message::BodyAction)
-                    .highlight("json", self.json_theme)
-                    .height(Length::Shrink),
-            )
-            .height(Length::Fill)
-            .into(),
+            ContentType::Json => text_editor(&self.current_tab().body_content)
+                .on_action(Message::BodyAction)
+                .highlight("json", self.json_theme)
+                .height(Length::Fill)
+                .into(),
             _ => self.render_form_data(),
         };
 
@@ -761,14 +854,11 @@ impl CrabiPie {
     }
 
     fn render_headers_tab(&self) -> Element<'_, Message> {
-        scrollable(
-            text_editor(&self.current_tab().headers_content)
-                .on_action(Message::HeadersAction)
-                .highlight("json", self.json_theme)
-                .height(Length::Shrink),
-        )
-        .height(Length::Fill)
-        .into()
+        text_editor(&self.current_tab().headers_content)
+            .on_action(Message::HeadersAction)
+            .highlight("json", self.json_theme)
+            .height(Length::Fill)
+            .into()
     }
 
     fn render_auth_tab(&self) -> Element<'_, Message> {
@@ -900,6 +990,7 @@ impl CrabiPie {
                         left: 0.0,
                     }),
                 )
+                .height(Length::Fill)
                 .set_active_tab(&self.current_tab().active_response_tab)
                 .tab_bar_position(iced_aw::TabBarPosition::Top)
                 .into();
@@ -913,8 +1004,6 @@ impl CrabiPie {
                 },
                 ..Default::default()
             })
-            .width(Length::Fill)
-            .height(Length::Fill)
             .into()
     }
 
@@ -1049,24 +1138,20 @@ impl CrabiPie {
             }
             body_column.into()
         } else {
-            scrollable(
-                text_editor(&self.current_tab().response_body_content)
-                    .on_action(Message::ResponseBodyAction)
-                    .highlight("json", self.json_theme),
-            )
-            .height(Length::Fill)
-            .into()
+            text_editor(&self.current_tab().response_body_content)
+                .on_action(Message::ResponseBodyAction)
+                .highlight("json", self.json_theme)
+                .height(Length::Fill)
+                .into()
         }
     }
 
     fn render_response_headers(&self) -> Element<'_, Message> {
-        scrollable(
-            text_editor(&self.current_tab().response_headers_content)
-                .on_action(Message::ResponseHeadersAction)
-                .highlight("json", self.json_theme),
-        )
-        .height(Length::Fill)
-        .into()
+        text_editor(&self.current_tab().response_headers_content)
+            .on_action(Message::ResponseHeadersAction)
+            .highlight("json", self.json_theme)
+            .height(Length::Fill)
+            .into()
     }
 
     fn loading_overlay(&self) -> Option<Element<'_, Message>> {
@@ -1720,7 +1805,14 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             let body_text = app.current_tab().body_content.text();
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
                 if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-                    app.current_tab_mut().body_content = text_editor::Content::with_text(&pretty);
+                    app.current_tab_mut()
+                        .body_content
+                        .perform(text_editor::Action::SelectAll);
+                    app.current_tab_mut()
+                        .body_content
+                        .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                            std::sync::Arc::new(pretty),
+                        )));
                 }
             }
             iced::Task::none()
@@ -1920,15 +2012,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::ToggleFindDialog => {
-            println!("Event fired");
+            app.find_dialog_open = !app.find_dialog_open;
             iced::Task::none()
         }
         Message::ToggleFindReplaceDialog => {
-            println!("Event fired");
+            app.find_replace_mode = !app.find_replace_mode;
             iced::Task::none()
         }
         Message::CloseFindDialog => {
-            println!("Event fired");
+            app.find_dialog_open = false;
             iced::Task::none()
         }
         Message::FindTextChanged(_) => {
@@ -1988,6 +2080,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                                         app.current_tab().url_id.clone(),
                                     ),
                                 );
+                            } else if c.as_str() == "f" {
+                                println!("Key event: ctrl + f");
+                                return iced::Task::done(Message::ToggleFindDialog);
                             }
                         }
                         if matches!(key, Key::Named(iced::keyboard::key::Named::Enter)) {
@@ -2038,14 +2133,32 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 }
 
 fn view(app: &CrabiPie) -> Element<'_, Message> {
-    container(column![
+    let main_content = column![
         app.render_title_row(),
         app.render_tabs(),
         rule::horizontal(1.0),
         app.render_active_tab_content()
-    ])
-    .padding(10)
-    .into()
+    ];
+
+    let main_content: Element<'_, Message> = if app.find_dialog_open {
+        let overlay = container(app.view_find_replace())
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .height(Length::Fill);
+        // .style(|_theme: &Theme| container::Appearance {
+        //     background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5).into()),
+        //     ..Default::default()
+        // });
+
+        iced::widget::stack![main_content, overlay].into()
+    } else {
+        main_content.into()
+    };
+
+    container(main_content).padding(10).into()
 }
 
 fn main() -> iced::Result {
