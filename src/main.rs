@@ -1,6 +1,7 @@
 #![allow(unused)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use core::net;
 use std::sync::atomic::Ordering;
 
 use iced::{
@@ -114,6 +115,9 @@ struct CrabiPie {
     replace_text: String,
     case_sensitive: bool,
     whole_word: bool,
+    current_match: usize,
+    current_match_pos: Option<usize>,
+    total_matches: usize,
 }
 
 struct TabState {
@@ -280,6 +284,9 @@ impl CrabiPie {
                 replace_text: String::new(),
                 case_sensitive: false,
                 whole_word: false,
+                current_match: 0,
+                current_match_pos: None,
+                total_matches: 0,
             },
             iced::Task::none(),
         )
@@ -318,22 +325,27 @@ impl CrabiPie {
     }
 
     fn view_find_replace(&self) -> Element<'_, Message> {
-        let find_row = row![
-            tooltip(
-                button(
-                    text(if !self.find_replace_mode {
-                        "⬇️"
-                    } else {
-                        "⬆️"
-                    })
-                    .shaping(text::Shaping::Advanced)
-                )
-                .style(button::text)
-                .on_press(Message::ToggleFindReplaceDialog),
-                "Toggle between find and replace",
-                tooltip::Position::Bottom
-            ),
-            text_input("Find...", &self.find_text).on_input(Message::FindTextChanged),
+        let toggle: Element<'_, Message> = tooltip(
+            button(
+                text(if !self.find_replace_mode {
+                    "⬇️"
+                } else {
+                    "⬆️"
+                })
+                .shaping(text::Shaping::Advanced),
+            )
+            .style(button::text)
+            .on_press(Message::ToggleFindReplaceDialog),
+            "Toggle between find and replace",
+            tooltip::Position::Bottom,
+        )
+        .into();
+
+        let find_input: Element<'_, Message> = text_input("Find...", &self.find_text)
+            .on_input(Message::FindTextChanged)
+            .into();
+
+        let find_btns_row = row![
             tooltip(
                 button(text("🔍").shaping(text::Shaping::Advanced))
                     .style(button::text)
@@ -348,13 +360,18 @@ impl CrabiPie {
                 "Close",
                 tooltip::Position::Bottom
             )
-        ]
-        .spacing(0);
+        ];
 
         let replace_input_or_space: Element<'_, Message> = if self.find_replace_mode {
+            text_input("Replace with...", &self.replace_text)
+                .on_input(Message::ReplaceTextChanged)
+                .into()
+        } else {
+            space::horizontal().width(0).into()
+        };
+
+        let replace_btns_or_space: Element<'_, Message> = if self.find_replace_mode {
             row![
-                text_input("Replace with...", &self.replace_text)
-                    .on_input(Message::ReplaceTextChanged),
                 tooltip(
                     button(text("✏️").shaping(text::Shaping::Advanced))
                         .style(button::text)
@@ -370,13 +387,24 @@ impl CrabiPie {
                     tooltip::Position::Bottom
                 ),
             ]
-            .spacing(0)
+            .align_y(iced::Alignment::End)
             .into()
         } else {
             space::horizontal().width(0).into()
         };
 
-        let buttons = row![
+        let match_info: Element<'_, Message> = if !self.find_text.is_empty() {
+            text(format!(
+                "{} / {} matches",
+                self.current_match, self.total_matches,
+            ))
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            space::horizontal().width(0).into()
+        };
+
+        let find_mode_buttons = row![
             tooltip(
                 button("Aa").style(button::text).on_press(Message::Replace),
                 "Match case",
@@ -388,13 +416,17 @@ impl CrabiPie {
                     .on_press(Message::ReplaceAll),
                 "Match whole word",
                 tooltip::Position::Bottom
-            )
-        ]
-        .spacing(8);
+            ),
+            match_info
+        ];
 
-        let content = column![find_row, replace_input_or_space, buttons,]
-            .spacing(8)
-            .align_x(Alignment::Start);
+        let find_replace_col = column![find_input, replace_input_or_space].spacing(5.0);
+
+        let content = row![
+            toggle,
+            column![find_replace_col, find_mode_buttons],
+            column![find_btns_row, replace_btns_or_space]
+        ];
 
         container(content)
             .width(Length::Fixed(400.0))
@@ -408,6 +440,109 @@ impl CrabiPie {
             //     ..Default::default()
             // })
             .into()
+    }
+
+    fn find_matches(&self, text: &str, pattern: &str) -> Vec<usize> {
+        if pattern.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+
+        if self.case_sensitive {
+            if self.whole_word {
+                // Case sensitive + whole word
+                let mut start = 0;
+                while let Some(pos) = text[start..].find(pattern) {
+                    let abs_pos = start + pos;
+                    let before =
+                        abs_pos == 0 || !text[..abs_pos].chars().last().unwrap().is_alphanumeric();
+                    let after_pos = abs_pos + pattern.len();
+                    let after = after_pos >= text.len()
+                        || !text[after_pos..].chars().next().unwrap().is_alphanumeric();
+
+                    if before && after {
+                        matches.push(abs_pos);
+                    }
+                    start = abs_pos + 1;
+                }
+            } else {
+                // Case sensitive only
+                let mut start = 0;
+                while let Some(pos) = text[start..].find(pattern) {
+                    matches.push(start + pos);
+                    start += pos + 1;
+                }
+            }
+        } else {
+            let text_lower = text.to_lowercase();
+            let pattern_lower = pattern.to_lowercase();
+
+            if self.whole_word {
+                // Case insensitive + whole word
+                let mut start = 0;
+                while let Some(pos) = text_lower[start..].find(&pattern_lower) {
+                    let abs_pos = start + pos;
+                    let before =
+                        abs_pos == 0 || !text[..abs_pos].chars().last().unwrap().is_alphanumeric();
+                    let after_pos = abs_pos + pattern.len();
+                    let after = after_pos >= text.len()
+                        || !text[after_pos..].chars().next().unwrap().is_alphanumeric();
+
+                    if before && after {
+                        matches.push(abs_pos);
+                    }
+                    start = abs_pos + 1;
+                }
+            } else {
+                // Case insensitive only
+                let mut start = 0;
+                while let Some(pos) = text_lower[start..].find(&pattern_lower) {
+                    matches.push(start + pos);
+                    start += pos + 1;
+                }
+            }
+        }
+
+        matches
+    }
+
+    fn find_next(&mut self) {
+        if !self.find_dialog_open {
+            return;
+        }
+
+        let text = self.current_tab().response_body_content.text(); // self.get_search_text().to_string();
+        let matches = self.find_matches(&text, &self.find_text);
+        self.total_matches = matches.len();
+
+        if matches.is_empty() {
+            self.current_match = 0;
+            self.current_match_pos = None;
+        } else {
+            if self.current_match == 0 || self.current_match >= matches.len() {
+                self.current_match = 1;
+            } else {
+                self.current_match += 1;
+            }
+            if self.current_match > matches.len() {
+                self.current_match = 1;
+            }
+            if self.current_match > 0 {
+                let match_pos = matches[self.current_match - 1];
+                self.current_match_pos = Some(match_pos);
+
+                // let line_number = text[..match_pos.min(text.len())]
+                //     .chars()
+                //     .filter(|c| *c == '\n')
+                //     .count();
+                // let target_y = (line_number as f32 * self.line_height)
+                //     - self.line_height * 2.5;
+                // self.find_dialog.target_scroll_y = Some(target_y.max(0.0));
+            }
+        }
+
+        // self.find_dialog.scroll_to_match = self.find_dialog.current_match_pos.is_some();
     }
 }
 
@@ -599,9 +734,7 @@ impl CrabiPie {
                     iced_aw::TabLabel::Text("Query".into()),
                     container(self.render_query_tab()).padding(Padding {
                         top: 10.0,
-                        right: 0.0,
-                        bottom: 0.0,
-                        left: 0.0,
+                        ..Default::default()
                     }),
                 )
                 .push(
@@ -609,9 +742,7 @@ impl CrabiPie {
                     iced_aw::TabLabel::Text("Body".into()),
                     container(self.render_body_tab()).padding(Padding {
                         top: 10.0,
-                        right: 0.0,
-                        bottom: 0.0,
-                        left: 0.0,
+                        ..Default::default()
                     }),
                 )
                 .push(
@@ -619,9 +750,7 @@ impl CrabiPie {
                     iced_aw::TabLabel::Text("Headers".into()),
                     container(self.render_headers_tab()).padding(Padding {
                         top: 10.0,
-                        right: 0.0,
-                        bottom: 0.0,
-                        left: 0.0,
+                        ..Default::default()
                     }),
                 )
                 .push(
@@ -629,9 +758,7 @@ impl CrabiPie {
                     iced_aw::TabLabel::Text("Auth".into()),
                     container(self.render_auth_tab()).padding(Padding {
                         top: 10.0,
-                        right: 0.0,
-                        bottom: 0.0,
-                        left: 0.0,
+                        ..Default::default()
                     }),
                 )
                 .height(Length::Fill)
@@ -695,6 +822,7 @@ impl CrabiPie {
                         font: None,
                     },
                 )
+                .height(Length::Fill)
                 .into(),
             _ => self.render_form_data(),
         };
@@ -785,10 +913,8 @@ impl CrabiPie {
                     files_col = files_col.push(text(format!(" • {filename}")).size(13));
                 }
                 fields_col = fields_col.push(container(files_col).padding(Padding {
-                    top: 0.0,
-                    right: 0.0,
-                    bottom: 0.0,
                     left: 20.0,
+                    ..Default::default()
                 }));
             }
         }
@@ -990,9 +1116,7 @@ impl CrabiPie {
                     iced_aw::TabLabel::Text("Body".into()),
                     container(self.with_overlay(self.render_response_body())).padding(Padding {
                         top: 10.0,
-                        right: 0.0,
-                        bottom: 0.0,
-                        left: 0.0,
+                        ..Default::default()
                     }),
                 )
                 .push(
@@ -1000,9 +1124,7 @@ impl CrabiPie {
                     iced_aw::TabLabel::Text("Header".into()),
                     container(self.with_overlay(self.render_response_headers())).padding(Padding {
                         top: 10.0,
-                        right: 0.0,
-                        bottom: 0.0,
-                        left: 0.0,
+                        ..Default::default()
                     }),
                 )
                 .height(Length::Fill)
@@ -1082,7 +1204,12 @@ impl CrabiPie {
                                 .step(0.1)
                                 .on_release(Message::SeekRelease),
                             )
-                            .padding(iced::Padding::new(5.0).left(10.0).right(10.0)),
+                            .padding(Padding {
+                                right: 10.0,
+                                left: 10.0,
+                                top: 5.0,
+                                bottom: 5.0,
+                            }),
                         )
                         .spacing(4)
                         .push(
@@ -2050,24 +2177,29 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.find_dialog_open = false;
             iced::Task::none()
         }
-        Message::FindTextChanged(_) => {
-            println!("Event fired");
+        Message::FindTextChanged(find_text) => {
+            app.current_match = 0;
+            app.total_matches = 0;
+            app.current_match_pos = None;
+            app.find_text = find_text;
+
+            app.find_next();
             iced::Task::none()
         }
-        Message::ReplaceTextChanged(_) => {
-            println!("Event fired");
+        Message::ReplaceTextChanged(replace_text) => {
+            app.replace_text = replace_text;
             iced::Task::none()
         }
         Message::ToggleCaseSensitive => {
-            println!("Event fired");
+            app.case_sensitive = !app.case_sensitive;
             iced::Task::none()
         }
         Message::ToggleWholeWord => {
-            println!("Event fired");
+            app.whole_word = !app.whole_word;
             iced::Task::none()
         }
         Message::FindNext => {
-            println!("Event fired");
+            app.find_next();
             iced::Task::none()
         }
         Message::FindPrevious => {
