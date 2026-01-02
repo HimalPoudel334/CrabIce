@@ -41,7 +41,7 @@ enum Message {
     PrettifyJson,
     CopyToClipboard,
     ResetCopied,
-    JsonThemeChanged(highlighter::Theme),
+    JsonThemeChanged(json_highlighter::JsonThemeWrapper),
     AppThemeChanged(iced::Theme),
     SaveRequest,
     LoadRequest,
@@ -103,7 +103,7 @@ struct CrabiPie {
     next_tab_id: usize,
 
     // Global UI state (shared across all tabs)
-    json_theme: highlighter::Theme,
+    json_theme: json_highlighter::JsonThemeWrapper,
     app_theme: iced::Theme,
     svg_rotation: f32,
 
@@ -269,7 +269,9 @@ impl CrabiPie {
                 tabs: vec![TabState::new(0)],
                 active_tab: 0,
                 next_tab_id: 1,
-                json_theme: json_highlighter::JsonColorTheme::default_dark(), //highlighter::Theme::SolarizedDark,
+                json_theme: json_highlighter::JsonThemeWrapper::Custom(
+                    json_highlighter::CustomJsonTheme::VSCODE_DARK,
+                ),
                 app_theme: iced::Theme::CatppuccinMocha,
                 svg_rotation: 0.0,
                 find_dialog_open: false,
@@ -687,7 +689,7 @@ impl CrabiPie {
             ContentType::Json => text_editor(&self.current_tab().body_content)
                 .on_action(Message::BodyAction)
                 .highlight_with::<json_highlighter::JsonHighlighter>(
-                    json_highlighter::JsonColorTheme::default_dark(),
+                    self.json_theme,
                     |color, _theme| iced::advanced::text::highlighter::Format {
                         color: Some(*color),
                         font: None,
@@ -864,7 +866,7 @@ impl CrabiPie {
         text_editor(&self.current_tab().headers_content)
             .on_action(Message::HeadersAction)
             .highlight_with::<json_highlighter::JsonHighlighter>(
-                json_highlighter::JsonColorTheme::vscode_dark(),
+                self.json_theme,
                 |color, _theme| iced::advanced::text::highlighter::Format {
                     color: Some(*color),
                     font: None,
@@ -958,7 +960,7 @@ impl CrabiPie {
         header_row = header_row.push(space::horizontal());
         header_row = header_row.push(text("Json Theme:"));
         header_row = header_row.push(pick_list(
-            &highlighter::Theme::ALL[..],
+            &json_highlighter::JsonThemeWrapper::ALL[..],
             Some(&self.json_theme),
             Message::JsonThemeChanged,
         ));
@@ -1154,7 +1156,7 @@ impl CrabiPie {
             text_editor(&self.current_tab().response_body_content)
                 .on_action(Message::ResponseBodyAction)
                 .highlight_with::<json_highlighter::JsonHighlighter>(
-                    json_highlighter::JsonColorTheme::vscode_dark(),
+                    self.json_theme,
                     |color, _theme| iced::advanced::text::highlighter::Format {
                         color: Some(*color),
                         font: None,
@@ -1169,7 +1171,7 @@ impl CrabiPie {
         text_editor(&self.current_tab().response_headers_content)
             .on_action(Message::ResponseHeadersAction)
             .highlight_with::<json_highlighter::JsonHighlighter>(
-                json_highlighter::JsonColorTheme::default_dark(),
+                self.json_theme,
                 |color, _theme| iced::advanced::text::highlighter::Format {
                     color: Some(*color),
                     font: None,

@@ -15,25 +15,155 @@ pub enum JsonToken {
 
 pub struct JsonHighlighter {
     current_line_number: usize,
-    settings: JsonColorTheme,
+    settings: JsonThemeWrapper,
 }
 
 impl JsonHighlighter {
     fn token_color(&self, token: JsonToken) -> Color {
         match token {
-            JsonToken::Key => self.settings.key,
-            JsonToken::String => self.settings.string,
-            JsonToken::Number => self.settings.number,
-            JsonToken::Boolean => self.settings.boolean,
-            JsonToken::Null => self.settings.null,
-            JsonToken::Punctuation => self.settings.punctuation,
-            JsonToken::Whitespace => self.settings.text,
+            JsonToken::Key => self.settings.key_color(),
+            JsonToken::String => self.settings.string_color(),
+            JsonToken::Number => self.settings.number_color(),
+            JsonToken::Boolean => self.settings.boolean_color(),
+            JsonToken::Null => self.settings.null_color(),
+            JsonToken::Punctuation => self.settings.punctuation_color(),
+            JsonToken::Whitespace => self.settings.text_color(),
         }
     }
 }
 
+// Wrapper enum that combines built-in and custom themes
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct JsonColorTheme {
+pub enum JsonThemeWrapper {
+    Builtin(iced::highlighter::Theme),
+    Custom(CustomJsonTheme),
+}
+
+impl JsonThemeWrapper {
+    pub const ALL: &'static [JsonThemeWrapper] = &[
+        // Built-in themes
+        JsonThemeWrapper::Builtin(iced::highlighter::Theme::Base16Eighties),
+        JsonThemeWrapper::Builtin(iced::highlighter::Theme::Base16Mocha),
+        JsonThemeWrapper::Builtin(iced::highlighter::Theme::Base16Ocean),
+        JsonThemeWrapper::Builtin(iced::highlighter::Theme::SolarizedDark),
+        JsonThemeWrapper::Builtin(iced::highlighter::Theme::InspiredGitHub),
+        // Custom themes
+        JsonThemeWrapper::Custom(CustomJsonTheme::DEFAULT_DARK),
+        JsonThemeWrapper::Custom(CustomJsonTheme::DEFAULT_LIGHT),
+        JsonThemeWrapper::Custom(CustomJsonTheme::VSCODE_DARK),
+    ];
+
+    // Helper methods to extract colors
+    fn key_color(&self) -> Color {
+        match self {
+            JsonThemeWrapper::Builtin(theme) => Self::builtin_key_color(*theme),
+            JsonThemeWrapper::Custom(custom) => custom.key,
+        }
+    }
+
+    fn string_color(&self) -> Color {
+        match self {
+            JsonThemeWrapper::Builtin(theme) => Self::builtin_string_color(*theme),
+            JsonThemeWrapper::Custom(custom) => custom.string,
+        }
+    }
+
+    fn number_color(&self) -> Color {
+        match self {
+            JsonThemeWrapper::Builtin(theme) => Self::builtin_number_color(*theme),
+            JsonThemeWrapper::Custom(custom) => custom.number,
+        }
+    }
+
+    fn boolean_color(&self) -> Color {
+        match self {
+            JsonThemeWrapper::Builtin(theme) => Self::builtin_boolean_color(*theme),
+            JsonThemeWrapper::Custom(custom) => custom.boolean,
+        }
+    }
+
+    fn null_color(&self) -> Color {
+        match self {
+            JsonThemeWrapper::Builtin(theme) => Self::builtin_null_color(*theme),
+            JsonThemeWrapper::Custom(custom) => custom.null,
+        }
+    }
+
+    fn punctuation_color(&self) -> Color {
+        match self {
+            JsonThemeWrapper::Builtin(theme) => Self::builtin_punctuation_color(*theme),
+            JsonThemeWrapper::Custom(custom) => custom.punctuation,
+        }
+    }
+
+    fn text_color(&self) -> Color {
+        match self {
+            JsonThemeWrapper::Builtin(theme) => Self::builtin_text_color(*theme),
+            JsonThemeWrapper::Custom(custom) => custom.text,
+        }
+    }
+
+    // Map built-in theme colors (approximate mapping to JSON syntax)
+    fn builtin_key_color(theme: iced::highlighter::Theme) -> Color {
+        // Keys are like function names in code
+        match theme {
+            iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.51, 0.58, 0.0),
+            _ => Color::from_rgb(0.4, 0.76, 0.94), // Default blue
+        }
+    }
+
+    fn builtin_string_color(theme: iced::highlighter::Theme) -> Color {
+        match theme {
+            iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.16, 0.63, 0.6),
+            _ => Color::from_rgb(0.73, 0.87, 0.53), // Default green
+        }
+    }
+
+    fn builtin_number_color(theme: iced::highlighter::Theme) -> Color {
+        match theme {
+            iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.8, 0.29, 0.09),
+            _ => Color::from_rgb(0.88, 0.73, 0.53), // Default orange
+        }
+    }
+
+    fn builtin_boolean_color(theme: iced::highlighter::Theme) -> Color {
+        match theme {
+            iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.83, 0.21, 0.51),
+            _ => Color::from_rgb(0.86, 0.47, 0.65), // Default pink
+        }
+    }
+
+    fn builtin_null_color(theme: iced::highlighter::Theme) -> Color {
+        Self::builtin_boolean_color(theme)
+    }
+
+    fn builtin_punctuation_color(theme: iced::highlighter::Theme) -> Color {
+        match theme {
+            iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.58, 0.63, 0.63),
+            _ => Color::from_rgb(0.8, 0.8, 0.8),
+        }
+    }
+
+    fn builtin_text_color(theme: iced::highlighter::Theme) -> Color {
+        match theme {
+            iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.58, 0.63, 0.63),
+            _ => Color::WHITE,
+        }
+    }
+}
+
+impl std::fmt::Display for JsonThemeWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JsonThemeWrapper::Builtin(theme) => write!(f, "{}", theme),
+            JsonThemeWrapper::Custom(custom) => write!(f, "{}", custom),
+        }
+    }
+}
+
+// Custom JSON-specific themes
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CustomJsonTheme {
     pub key: Color,
     pub string: Color,
     pub number: Color,
@@ -43,46 +173,54 @@ pub struct JsonColorTheme {
     pub text: Color,
 }
 
-impl JsonColorTheme {
-    pub fn default_dark() -> Self {
-        Self {
-            key: Color::from_rgb(0.4, 0.76, 0.94), // Light blue for keys
-            string: Color::from_rgb(0.73, 0.87, 0.53), // Light green for strings
-            number: Color::from_rgb(0.88, 0.73, 0.53), // Orange for numbers
-            boolean: Color::from_rgb(0.86, 0.47, 0.65), // Pink for booleans
-            null: Color::from_rgb(0.86, 0.47, 0.65), // Pink for null
-            punctuation: Color::from_rgb(0.8, 0.8, 0.8), // Light gray
-            text: Color::WHITE,
-        }
-    }
+impl CustomJsonTheme {
+    pub const DEFAULT_DARK: Self = Self {
+        key: Color::from_rgb(0.4, 0.76, 0.94),
+        string: Color::from_rgb(0.73, 0.87, 0.53),
+        number: Color::from_rgb(0.88, 0.73, 0.53),
+        boolean: Color::from_rgb(0.86, 0.47, 0.65),
+        null: Color::from_rgb(0.86, 0.47, 0.65),
+        punctuation: Color::from_rgb(0.8, 0.8, 0.8),
+        text: Color::WHITE,
+    };
 
-    pub fn default_light() -> Self {
-        Self {
-            key: Color::from_rgb(0.0, 0.33, 0.8),        // Blue for keys
-            string: Color::from_rgb(0.13, 0.54, 0.13),   // Green for strings
-            number: Color::from_rgb(0.8, 0.4, 0.0),      // Orange for numbers
-            boolean: Color::from_rgb(0.6, 0.0, 0.6),     // Purple for booleans
-            null: Color::from_rgb(0.6, 0.0, 0.6),        // Purple for null
-            punctuation: Color::from_rgb(0.3, 0.3, 0.3), // Dark gray
-            text: Color::BLACK,
-        }
-    }
+    pub const DEFAULT_LIGHT: Self = Self {
+        key: Color::from_rgb(0.0, 0.33, 0.8),
+        string: Color::from_rgb(0.13, 0.54, 0.13),
+        number: Color::from_rgb(0.8, 0.4, 0.0),
+        boolean: Color::from_rgb(0.6, 0.0, 0.6),
+        null: Color::from_rgb(0.6, 0.0, 0.6),
+        punctuation: Color::from_rgb(0.3, 0.3, 0.3),
+        text: Color::BLACK,
+    };
 
-    pub fn vscode_dark() -> Self {
-        Self {
-            key: Color::from_rgb(0.61, 0.82, 0.96),         // VS Code blue
-            string: Color::from_rgb(0.81, 0.71, 0.58),      // VS Code beige
-            number: Color::from_rgb(0.71, 0.86, 0.65),      // VS Code light green
-            boolean: Color::from_rgb(0.34, 0.63, 0.83),     // VS Code blue
-            null: Color::from_rgb(0.34, 0.63, 0.83),        // VS Code blue
-            punctuation: Color::from_rgb(0.85, 0.85, 0.85), // Light gray
-            text: Color::from_rgb(0.85, 0.85, 0.85),
+    pub const VSCODE_DARK: Self = Self {
+        key: Color::from_rgb(0.61, 0.82, 0.96),
+        string: Color::from_rgb(0.81, 0.71, 0.58),
+        number: Color::from_rgb(0.71, 0.86, 0.65),
+        boolean: Color::from_rgb(0.34, 0.63, 0.83),
+        null: Color::from_rgb(0.34, 0.63, 0.83),
+        punctuation: Color::from_rgb(0.85, 0.85, 0.85),
+        text: Color::from_rgb(0.85, 0.85, 0.85),
+    };
+}
+
+impl std::fmt::Display for CustomJsonTheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if *self == Self::DEFAULT_DARK {
+            write!(f, "Custom Dark")
+        } else if *self == Self::DEFAULT_LIGHT {
+            write!(f, "Custom Light")
+        } else if *self == Self::VSCODE_DARK {
+            write!(f, "VS Code Dark")
+        } else {
+            write!(f, "Custom")
         }
     }
 }
 
 impl text::Highlighter for JsonHighlighter {
-    type Settings = JsonColorTheme;
+    type Settings = JsonThemeWrapper;
     type Highlight = Color;
     type Iterator<'a> = Box<dyn Iterator<Item = (Range<usize>, Self::Highlight)> + 'a>;
 
@@ -199,8 +337,3 @@ impl text::Highlighter for JsonHighlighter {
         self.current_line_number
     }
 }
-
-// Usage example:
-// text_editor(&self.current_tab().response_body_content)
-//     .on_action(Message::ResponseBodyAction)
-//     .highlight::<JsonHighlighter>(JsonColorTheme::default_dark())
