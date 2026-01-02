@@ -15,6 +15,8 @@ use iced::{
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
+mod json_highlighter;
+
 #[derive(Debug, Clone)]
 enum Message {
     //Tabs
@@ -267,7 +269,7 @@ impl CrabiPie {
                 tabs: vec![TabState::new(0)],
                 active_tab: 0,
                 next_tab_id: 1,
-                json_theme: highlighter::Theme::SolarizedDark,
+                json_theme: json_highlighter::JsonColorTheme::default_dark(), //highlighter::Theme::SolarizedDark,
                 app_theme: iced::Theme::CatppuccinMocha,
                 svg_rotation: 0.0,
                 find_dialog_open: false,
@@ -684,8 +686,13 @@ impl CrabiPie {
         let editor_content = match self.current_tab().content_type {
             ContentType::Json => text_editor(&self.current_tab().body_content)
                 .on_action(Message::BodyAction)
-                .highlight("json", self.json_theme)
-                .height(Length::Fill)
+                .highlight_with::<json_highlighter::JsonHighlighter>(
+                    json_highlighter::JsonColorTheme::default_dark(),
+                    |color, _theme| iced::advanced::text::highlighter::Format {
+                        color: Some(*color),
+                        font: None,
+                    },
+                )
                 .into(),
             _ => self.render_form_data(),
         };
@@ -856,7 +863,13 @@ impl CrabiPie {
     fn render_headers_tab(&self) -> Element<'_, Message> {
         text_editor(&self.current_tab().headers_content)
             .on_action(Message::HeadersAction)
-            .highlight("json", self.json_theme)
+            .highlight_with::<json_highlighter::JsonHighlighter>(
+                json_highlighter::JsonColorTheme::vscode_dark(),
+                |color, _theme| iced::advanced::text::highlighter::Format {
+                    color: Some(*color),
+                    font: None,
+                },
+            )
             .height(Length::Fill)
             .into()
     }
@@ -1140,7 +1153,13 @@ impl CrabiPie {
         } else {
             text_editor(&self.current_tab().response_body_content)
                 .on_action(Message::ResponseBodyAction)
-                .highlight("json", self.json_theme)
+                .highlight_with::<json_highlighter::JsonHighlighter>(
+                    json_highlighter::JsonColorTheme::vscode_dark(),
+                    |color, _theme| iced::advanced::text::highlighter::Format {
+                        color: Some(*color),
+                        font: None,
+                    },
+                )
                 .height(Length::Fill)
                 .into()
         }
@@ -1149,7 +1168,13 @@ impl CrabiPie {
     fn render_response_headers(&self) -> Element<'_, Message> {
         text_editor(&self.current_tab().response_headers_content)
             .on_action(Message::ResponseHeadersAction)
-            .highlight("json", self.json_theme)
+            .highlight_with::<json_highlighter::JsonHighlighter>(
+                json_highlighter::JsonColorTheme::default_dark(),
+                |color, _theme| iced::advanced::text::highlighter::Format {
+                    color: Some(*color),
+                    font: None,
+                },
+            )
             .height(Length::Fill)
             .into()
     }
