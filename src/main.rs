@@ -342,6 +342,7 @@ impl CrabiPie {
         .into();
 
         let find_input: Element<'_, Message> = text_input("Find...", &self.find_text)
+            .id("find_input")
             .on_input(Message::FindTextChanged)
             .into();
 
@@ -364,6 +365,7 @@ impl CrabiPie {
 
         let replace_input_or_space: Element<'_, Message> = if self.find_replace_mode {
             text_input("Replace with...", &self.replace_text)
+                .id("replace_input")
                 .on_input(Message::ReplaceTextChanged)
                 .into()
         } else {
@@ -406,14 +408,24 @@ impl CrabiPie {
 
         let find_mode_buttons = row![
             tooltip(
-                button("Aa").style(button::text).on_press(Message::Replace),
+                button("Aa")
+                    .style(if !self.case_sensitive {
+                        button::text
+                    } else {
+                        button::subtle
+                    })
+                    .on_press(Message::ToggleCaseSensitive),
                 "Match case",
                 tooltip::Position::Bottom
             ),
             tooltip(
                 button("[ab]")
-                    .style(button::text)
-                    .on_press(Message::ReplaceAll),
+                    .style(if !self.whole_word {
+                        button::text
+                    } else {
+                        button::subtle
+                    })
+                    .on_press(Message::ToggleWholeWord),
                 "Match whole word",
                 tooltip::Position::Bottom
             ),
@@ -424,21 +436,21 @@ impl CrabiPie {
 
         let content = row![
             toggle,
-            column![find_replace_col, find_mode_buttons],
+            column![find_replace_col, find_mode_buttons].spacing(5.0),
             column![find_btns_row, replace_btns_or_space]
         ];
 
         container(content)
             .width(Length::Fixed(400.0))
-            // .style(|theme: &iced::Theme| container::Appearance {
-            //     background: Some(theme.palette().background.into()),
-            //     border: iced::Border {
-            //         color: theme.palette().primary,
-            //         width: 2.0,
-            //         radius: 8.0.into(),
-            //     },
-            //     ..Default::default()
-            // })
+            .style(|theme: &iced::Theme| container::Style {
+                border: Border {
+                    width: 0.5,
+                    color: theme.palette().primary,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .padding(5.0)
             .into()
     }
 
@@ -714,15 +726,15 @@ impl CrabiPie {
         };
 
         container(row![method_picker, url_input, send_button].spacing(10))
-            .style(|theme: &iced::Theme| container::Style {
-                border: Border {
-                    width: 1.5,
-                    color: theme.palette().background,
-                    radius: 6.0.into(),
-                },
-                ..Default::default()
-            })
-            .padding(10)
+            // .style(|theme: &iced::Theme| container::Style {
+            //     border: Border {
+            //         width: 0.5,
+            //         color: theme.palette().primary,
+            //         radius: 6.0.into(),
+            //     },
+            //     ..Default::default()
+            // })
+            .padding(Padding::new(0.0).top(10.0))
             .into()
     }
 
@@ -769,12 +781,13 @@ impl CrabiPie {
         container(column![text("Request").height(20), rule::horizontal(1.0), req_tabs,].spacing(10))
             .style(|theme: &iced::Theme| container::Style {
                 border: Border {
-                    width: 1.5,
-                    color: theme.palette().background,
+                    width: 0.5,
+                    color: theme.palette().primary,
                     radius: 6.0.into(),
                 },
                 ..Default::default()
             })
+            .padding(5.0)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -897,6 +910,7 @@ impl CrabiPie {
 
             field_row = field_row.push(value_or_file).push(
                 button(text("❌").shaping(text::Shaping::Advanced))
+                    .style(button::subtle)
                     .on_press(Message::FormFieldRemove(idx)),
             );
 
@@ -920,7 +934,9 @@ impl CrabiPie {
         }
 
         fields_col = fields_col.push(
-            button(text("➕ Add").shaping(text::Shaping::Advanced)).on_press(Message::FormFieldAdd),
+            button(text("➕ Add").shaping(text::Shaping::Advanced))
+                .on_press(Message::FormFieldAdd)
+                .style(button::subtle),
         );
 
         scrollable(fields_col).height(Length::Fill).into()
@@ -942,6 +958,7 @@ impl CrabiPie {
                 .width(300);
 
             let remove_btn = button(text("❌").shaping(text::Shaping::Advanced))
+                .style(button::subtle)
                 .on_press(Message::QueryParamRemove(idx));
 
             let param_row = row![
@@ -960,6 +977,7 @@ impl CrabiPie {
 
         params_col = params_col.push(
             button(text("➕ Add").shaping(text::Shaping::Advanced))
+                .style(button::subtle)
                 .on_press(Message::QueryParamAdd),
         );
 
@@ -1135,12 +1153,13 @@ impl CrabiPie {
         container(column![header_row, rule::horizontal(1.0), res_tabs].spacing(10))
             .style(|theme: &iced::Theme| container::Style {
                 border: Border {
-                    width: 1.5,
-                    color: theme.palette().background,
+                    width: 0.5,
+                    color: theme.palette().primary,
                     radius: 6.0.into(),
                 },
                 ..Default::default()
             })
+            .padding(5.0)
             .into()
     }
 
@@ -2167,11 +2186,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::ToggleFindDialog => {
             app.find_dialog_open = !app.find_dialog_open;
-            iced::Task::none()
+            iced::widget::operation::focus("find_input")
         }
         Message::ToggleFindReplaceDialog => {
             app.find_replace_mode = !app.find_replace_mode;
-            iced::Task::none()
+            iced::widget::operation::focus(if app.find_replace_mode {
+                "replace_input"
+            } else {
+                "find_input"
+            })
         }
         Message::CloseFindDialog => {
             app.find_dialog_open = false;
@@ -2230,7 +2253,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     KeyEvent::KeyPressed { key, modifiers, .. } if modifiers.control() => {
                         if let Key::Character(c) = &key {
                             if c.as_str() == "l" {
-                                println!("Key event: ctrl + l");
                                 return iced::widget::operation::focus(
                                     app.current_tab().url_id.clone(),
                                 )
@@ -2240,8 +2262,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                                     ),
                                 );
                             } else if c.as_str() == "f" {
-                                println!("Key event: ctrl + f");
                                 return iced::Task::done(Message::ToggleFindDialog);
+                            } else if c.as_str() == "h" {
+                                return iced::Task::done(Message::ToggleFindReplaceDialog);
                             }
                         }
                         if matches!(key, Key::Named(iced::keyboard::key::Named::Enter)) {
@@ -2253,16 +2276,31 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         key: Key::Named(iced::keyboard::key::Named::Enter),
                         ..
                     } => {
-                        return iced::widget::operation::is_focused(
-                            app.current_tab().url_id.clone(),
-                        )
-                        .then(|focused| {
-                            if focused {
-                                iced::Task::done(Message::SendRequest)
-                            } else {
-                                iced::Task::none()
-                            }
-                        });
+                        let tasks = vec![
+                            iced::widget::operation::is_focused("find_input").then(|f| {
+                                if f {
+                                    iced::Task::done(Message::FindNext)
+                                } else {
+                                    iced::Task::none()
+                                }
+                            }),
+                            iced::widget::operation::is_focused("replace_input").then(|f| {
+                                if f {
+                                    iced::Task::done(Message::Replace)
+                                } else {
+                                    iced::Task::none()
+                                }
+                            }),
+                            iced::widget::operation::is_focused(app.current_tab().url_id.clone())
+                                .then(|f| {
+                                    if f {
+                                        iced::Task::done(Message::SendRequest)
+                                    } else {
+                                        iced::Task::none()
+                                    }
+                                }),
+                        ];
+                        return iced::Task::batch(tasks);
                     }
                     KeyEvent::KeyPressed {
                         key: Key::Named(iced::keyboard::key::Named::Tab),

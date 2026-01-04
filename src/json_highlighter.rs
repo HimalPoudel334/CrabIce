@@ -240,22 +240,27 @@ impl text::Highlighter for JsonHighlighter {
     }
 
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
-        let mut highlights = Vec::new();
+        // Early return for empty lines
+        if line.is_empty() {
+            return Box::new(std::iter::empty());
+        }
+
+        let mut highlights = Vec::with_capacity(line.len() / 10); // Pre-allocate
         let chars: Vec<char> = line.chars().collect();
+        let len = chars.len();
         let mut i = 0;
         let mut current_context_is_key = true;
 
-        while i < chars.len() {
+        while i < len {
             let ch = chars[i];
             let start = i;
 
             match ch {
                 '"' => {
-                    // Find the end of the string
                     i += 1;
-                    while i < chars.len() {
-                        if chars[i] == '\\' && i + 1 < chars.len() {
-                            i += 2; // Skip escaped character
+                    while i < len {
+                        if chars[i] == '\\' && i + 1 < len {
+                            i += 2;
                             continue;
                         }
                         if chars[i] == '"' {
@@ -270,7 +275,6 @@ impl text::Highlighter for JsonHighlighter {
                     } else {
                         JsonToken::String
                     };
-
                     highlights.push((start..i, self.token_color(token)));
                 }
                 ':' => {
@@ -286,45 +290,29 @@ impl text::Highlighter for JsonHighlighter {
                     i += 1;
                 }
                 c if c.is_ascii_digit() || c == '-' => {
-                    // Parse number
-                    while i < chars.len()
-                        && (chars[i].is_ascii_digit()
-                            || chars[i] == '.'
-                            || chars[i] == '-'
-                            || chars[i] == 'e'
-                            || chars[i] == 'E'
-                            || chars[i] == '+')
-                    {
+                    while i < len && matches!(chars[i], '0'..='9' | '.' | '-' | 'e' | 'E' | '+') {
                         i += 1;
                     }
                     highlights.push((start..i, self.token_color(JsonToken::Number)));
                 }
-                't' | 'f' if i + 4 <= chars.len() => {
-                    let word: String = chars[i..std::cmp::min(i + 5, chars.len())].iter().collect();
-                    if word.starts_with("true") {
-                        highlights.push((start..i + 4, self.token_color(JsonToken::Boolean)));
-                        i += 4;
-                    } else if word.starts_with("false") {
-                        highlights.push((start..i + 5, self.token_color(JsonToken::Boolean)));
-                        i += 5;
-                    } else {
-                        highlights.push((start..i + 1, self.token_color(JsonToken::Whitespace)));
-                        i += 1;
-                    }
+                't' if line[start..].starts_with("true") => {
+                    highlights.push((start..i + 4, self.token_color(JsonToken::Boolean)));
+                    i += 4;
                 }
-                'n' if i + 4 <= chars.len() => {
-                    let word: String = chars[i..i + 4].iter().collect();
-                    if word == "null" {
-                        highlights.push((start..i + 4, self.token_color(JsonToken::Null)));
-                        i += 4;
-                    } else {
-                        highlights.push((start..i + 1, self.token_color(JsonToken::Whitespace)));
-                        i += 1;
-                    }
+                'f' if line[start..].starts_with("false") => {
+                    highlights.push((start..i + 5, self.token_color(JsonToken::Boolean)));
+                    i += 5;
+                }
+                'n' if line[start..].starts_with("null") => {
+                    highlights.push((start..i + 4, self.token_color(JsonToken::Null)));
+                    i += 4;
+                }
+                // Skip whitespace without highlighting
+                c if c.is_whitespace() => {
+                    i += 1;
+                    continue;
                 }
                 _ => {
-                    // Whitespace or other
-                    highlights.push((start..i + 1, self.token_color(JsonToken::Whitespace)));
                     i += 1;
                 }
             }
