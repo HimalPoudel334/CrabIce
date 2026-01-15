@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use core::net;
-use std::sync::atomic::Ordering;
+use std::{str::FromStr, sync::atomic::Ordering};
 
 use iced::{
     Alignment, Border, Element, Event, Length, Padding, alignment,
@@ -18,6 +18,10 @@ use tokio::time::Instant;
 
 mod json_highlighter;
 
+//TODOS:
+//1 base url
+//2 collections
+
 #[derive(Debug, Clone)]
 enum Message {
     //Tabs
@@ -27,9 +31,19 @@ enum Message {
 
     UrlChanged(String),
     MethodSelected(HttpMethod),
-    HeadersAction(text_editor::Action),
+
+    //headers actions
+    HeaderAdd,
+    HeaderRemove(usize),
+    HeaderKeyChanged(usize, String),
+    HeaderValueChanged(usize, String),
+    HeaderToggled(usize),
+
     BodyAction(text_editor::Action),
     AuthTypeSelected(AuthType),
+    ApiKeyNameChanged(String),
+    ApiKeyChanged(String),
+    ApiKeyPositionChanged(ApiKeyPosition),
     BearerTokenChanged(String),
     ContentTypeSelected(ContentType),
     SendRequest,
@@ -40,6 +54,7 @@ enum Message {
     ResponseHeadersAction(text_editor::Action),
     ToggleLayout,
     PrettifyJson,
+    JsonPrettified(Result<String, String>),
     CopyToClipboard,
     ResetCopied,
     JsonThemeChanged(json_highlighter::JsonThemeWrapper),
@@ -118,6 +133,11 @@ struct CrabiPie {
     current_match: usize,
     current_match_pos: Option<usize>,
     total_matches: usize,
+
+    // For highlighter
+    search_match_positions: Vec<(usize, usize)>, // All matches as (line, col)
+    current_match_line_col: Option<(usize, usize)>, // Current match as (line, col)
+    search_match_length: usize,                  // Length of search term in characters
 }
 
 struct TabState {
@@ -129,10 +149,13 @@ struct TabState {
     base_url: String,
     url: String,
     method: HttpMethod,
-    headers_content: text_editor::Content,
+    headers: Vec<RequestHeaders>,
     body_content: text_editor::Content,
     auth_type: AuthType,
     bearer_token: String,
+    api_key_name: String,
+    api_key: String,
+    api_key_position: ApiKeyPosition,
     content_type: ContentType,
     query_params: Vec<QueryParam>,
     form_data: Vec<FormField>,
@@ -169,10 +192,13 @@ impl TabState {
             base_url: base.clone(),
             url: base,
             method: HttpMethod::GET,
-            headers_content: text_editor::Content::with_text(HEADERS_DEFAULT),
+            headers: RequestHeaders::default(),
             body_content: text_editor::Content::with_text(BODY_DEFAULT),
             auth_type: AuthType::None,
             bearer_token: String::new(),
+            api_key_name: String::new(),
+            api_key: String::new(),
+            api_key_position: ApiKeyPosition::Header,
             content_type: ContentType::Json,
             query_params: vec![QueryParam::new()],
             form_data: vec![FormField::new()],
@@ -202,10 +228,13 @@ impl TabState {
             base_url: saved.base_url,
             url: saved.url,
             method: saved.method,
-            headers_content: text_editor::Content::with_text(&saved.headers),
+            headers: saved.headers,
             body_content: text_editor::Content::with_text(&saved.body),
             auth_type: saved.auth_type,
             bearer_token: saved.bearer_token,
+            api_key_name: saved.api_key_name,
+            api_key: saved.api_key,
+            api_key_position: saved.api_key_position,
             content_type: saved.content_type,
             query_params: saved.query_params,
             form_data: saved.form_data,
@@ -238,10 +267,13 @@ impl TabState {
             base_url: self.base_url.clone(),
             url: self.url.clone(),
             method: self.method.clone(),
-            headers: self.headers_content.text(),
+            headers: self.headers.clone(),
             body: self.body_content.text(),
             auth_type: self.auth_type.clone(),
             bearer_token: self.bearer_token.clone(),
+            api_key_name: self.api_key_name.clone(),
+            api_key: self.api_key.clone(),
+            api_key_position: self.api_key_position,
             content_type: self.content_type.clone(),
             query_params: self.query_params.clone(),
             form_data: self.form_data.clone(),
@@ -287,6 +319,9 @@ impl CrabiPie {
                 current_match: 0,
                 current_match_pos: None,
                 total_matches: 0,
+                search_match_positions: Vec::new(),
+                current_match_line_col: None,
+                search_match_length: 0,
             },
             iced::Task::none(),
         )
@@ -322,6 +357,14 @@ impl CrabiPie {
         if index < self.tabs.len() {
             self.active_tab = index;
         }
+    }
+
+    fn get_highlighter_settings(&self) -> json_highlighter::JsonHighlighterSettings {
+        json_highlighter::JsonHighlighterSettings::new(self.json_theme).with_search(
+            self.search_match_positions.clone(),
+            self.current_match_line_col,
+            self.search_match_length,
+        )
     }
 
     fn view_find_replace(&self) -> Element<'_, Message> {
@@ -454,6 +497,29 @@ impl CrabiPie {
             .into()
     }
 
+    fn position_to_line_col(text: &str, pos: usize) -> (usize, usize) {
+        let mut line = 0;
+        let mut col = 0;
+        let mut char_count = 0;
+
+        for ch in text.chars() {
+            if char_count >= pos {
+                break;
+            }
+
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+
+            char_count += 1;
+        }
+
+        (line, col)
+    }
+
     fn find_matches(&self, text: &str, pattern: &str) -> Vec<usize> {
         if pattern.is_empty() {
             return Vec::new();
@@ -524,37 +590,105 @@ impl CrabiPie {
             return;
         }
 
-        let text = self.current_tab().response_body_content.text(); // self.get_search_text().to_string();
+        let text = self.current_tab().response_body_content.text();
+        println!("=== FIND NEXT ===");
+        println!("Text length: {}", text.len());
+        println!("Number of lines: {}", text.lines().count());
+        println!(
+            "First 200 chars: {:?}",
+            &text.chars().take(200).collect::<String>()
+        );
+
         let matches = self.find_matches(&text, &self.find_text);
+
+        println!("Search text: '{}'", self.find_text);
+        println!("Found {} matches", matches.len());
+        println!("Match positions: {:?}", matches);
+
         self.total_matches = matches.len();
 
         if matches.is_empty() {
             self.current_match = 0;
             self.current_match_pos = None;
-        } else {
-            if self.current_match == 0 || self.current_match >= matches.len() {
-                self.current_match = 1;
-            } else {
-                self.current_match += 1;
-            }
-            if self.current_match > matches.len() {
-                self.current_match = 1;
-            }
-            if self.current_match > 0 {
-                let match_pos = matches[self.current_match - 1];
-                self.current_match_pos = Some(match_pos);
-
-                // let line_number = text[..match_pos.min(text.len())]
-                //     .chars()
-                //     .filter(|c| *c == '\n')
-                //     .count();
-                // let target_y = (line_number as f32 * self.line_height)
-                //     - self.line_height * 2.5;
-                // self.find_dialog.target_scroll_y = Some(target_y.max(0.0));
-            }
+            self.search_match_positions = Vec::new();
+            self.current_match_line_col = None;
+            self.search_match_length = 0;
+            return;
         }
 
-        // self.find_dialog.scroll_to_match = self.find_dialog.current_match_pos.is_some();
+        // Convert all matches to line/col positions
+        let match_positions: Vec<(usize, usize)> = matches
+            .iter()
+            .map(|&pos| Self::position_to_line_col(&text, pos))
+            .collect();
+
+        // println!("Line/col positions: {:?}", match_positions);
+
+        // Update search state
+        self.search_match_positions = match_positions;
+        self.search_match_length = self.find_text.chars().count();
+
+        println!("Match length (chars): {}", self.search_match_length);
+
+        // Move to next match
+        if self.current_match == 0 || self.current_match >= matches.len() {
+            self.current_match = 1;
+        } else {
+            self.current_match += 1;
+        }
+
+        if self.current_match > matches.len() {
+            self.current_match = 1;
+        }
+
+        if self.current_match > 0 {
+            let match_pos = matches[self.current_match - 1];
+            self.current_match_pos = Some(match_pos);
+            self.current_match_line_col = Some(self.search_match_positions[self.current_match - 1]);
+        }
+    }
+
+    fn find_previous(&mut self) {
+        if !self.find_dialog_open {
+            return;
+        }
+
+        let text = self.current_tab().response_body_content.text();
+        let matches = self.find_matches(&text, &self.find_text);
+
+        self.total_matches = matches.len();
+
+        if matches.is_empty() {
+            self.current_match = 0;
+            self.current_match_pos = None;
+            self.search_match_positions = Vec::new();
+            self.current_match_line_col = None;
+            self.search_match_length = 0;
+            return;
+        }
+
+        // Convert all matches to line/col positions
+        let match_positions: Vec<(usize, usize)> = matches
+            .iter()
+            .map(|&pos| Self::position_to_line_col(&text, pos))
+            .collect();
+
+        // Update search state
+        self.search_match_positions = match_positions;
+        self.search_match_length = self.find_text.chars().count();
+
+        // Move to previous match
+        if self.current_match <= 1 {
+            self.current_match = matches.len();
+        } else {
+            self.current_match -= 1;
+        }
+
+        if self.current_match > 0 {
+            let match_pos = matches[self.current_match - 1];
+            self.current_match_pos = Some(match_pos);
+            self.current_match_line_col = Some(self.search_match_positions[self.current_match - 1]);
+        }
     }
 }
 
@@ -565,10 +699,13 @@ struct SavedState {
     base_url: String,
     url: String,
     method: HttpMethod,
-    headers: String,
+    headers: Vec<RequestHeaders>,
     body: String,
     auth_type: AuthType,
     bearer_token: String,
+    api_key_name: String,
+    api_key: String,
+    api_key_position: ApiKeyPosition,
     content_type: ContentType,
     query_params: Vec<QueryParam>,
     form_data: Vec<FormField>,
@@ -590,10 +727,13 @@ impl Default for SavedState {
             url: base.clone(),
             base_url: base,
             method: HttpMethod::GET,
-            headers: String::new(),
+            headers: vec![RequestHeaders::new()],
             body: String::new(),
             auth_type: AuthType::None,
+            api_key_position: ApiKeyPosition::Header,
             bearer_token: String::new(),
+            api_key_name: String::new(),
+            api_key: String::new(),
             content_type: ContentType::Json,
             query_params: vec![QueryParam::new()],
             form_data: vec![FormField::new()],
@@ -829,10 +969,22 @@ impl CrabiPie {
             ContentType::Json => text_editor(&self.current_tab().body_content)
                 .on_action(Message::BodyAction)
                 .highlight_with::<json_highlighter::JsonHighlighter>(
-                    self.json_theme,
-                    |color, _theme| iced::advanced::text::highlighter::Format {
-                        color: Some(*color),
-                        font: None,
+                    self.get_highlighter_settings(),
+                    |highlight, _theme| {
+                        let color = match highlight {
+                            json_highlighter::HighlightType::Syntax(color) => *color,
+                            json_highlighter::HighlightType::SearchMatch => {
+                                iced::Color::from_rgb(1.0, 1.0, 0.0)
+                            }
+                            json_highlighter::HighlightType::CurrentMatch => {
+                                iced::Color::from_rgb(1.0, 0.5, 0.0)
+                            }
+                        };
+
+                        iced::advanced::text::highlighter::Format {
+                            color: Some(color),
+                            font: None,
+                        }
                     },
                 )
                 .height(Length::Fill)
@@ -1007,17 +1159,44 @@ impl CrabiPie {
     }
 
     fn render_headers_tab(&self) -> Element<'_, Message> {
-        text_editor(&self.current_tab().headers_content)
-            .on_action(Message::HeadersAction)
-            .highlight_with::<json_highlighter::JsonHighlighter>(
-                self.json_theme,
-                |color, _theme| iced::advanced::text::highlighter::Format {
-                    color: Some(*color),
-                    font: None,
-                },
-            )
-            .height(Length::Fill)
-            .into()
+        let mut headers_col = Column::new().spacing(10);
+
+        for (idx, header) in self.current_tab().headers.iter().enumerate() {
+            let checkbox = checkbox(header.enabled).on_toggle(move |_| Message::HeaderToggled(idx));
+
+            let key_input = text_input("key", &header.key)
+                .on_input(move |key| Message::HeaderKeyChanged(idx, key))
+                .width(200);
+
+            let value_input = text_input("value", &header.value)
+                .on_input(move |val| Message::HeaderValueChanged(idx, val))
+                .width(300);
+
+            let remove_btn = button(text("❌").shaping(text::Shaping::Advanced))
+                .style(button::subtle)
+                .on_press(Message::HeaderRemove(idx));
+
+            let param_row = row![
+                checkbox,
+                text("Key:"),
+                key_input,
+                text("Value:"),
+                value_input,
+                remove_btn,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            headers_col = headers_col.push(param_row);
+        }
+
+        headers_col = headers_col.push(
+            button(text("➕ Add").shaping(text::Shaping::Advanced))
+                .style(button::subtle)
+                .on_press(Message::HeaderAdd),
+        );
+
+        scrollable(headers_col).height(Length::Fill).into()
     }
 
     fn render_auth_tab(&self) -> Element<'_, Message> {
@@ -1033,23 +1212,43 @@ impl CrabiPie {
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let token_input: Element<'_, Message> = if self.current_tab().auth_type == AuthType::Bearer
-        {
-            row![
+        let auth_form: Element<'_, Message> = match self.current_tab().auth_type {
+            AuthType::None => Space::new().into(),
+            AuthType::Bearer => row![
                 text("Token:"),
                 text_input("", &self.current_tab().bearer_token)
                     .on_input(Message::BearerTokenChanged)
                     .width(Length::Fill)
-                    .padding(10)
+                    .padding(8)
             ]
             .spacing(10)
             .align_y(Alignment::Center)
-            .into()
-        } else {
-            Space::new().into()
+            .into(),
+            AuthType::ApiKey => row![
+                column![text("Key:"), text("Value:"), text("Add to:"),]
+                    .align_x(Alignment::Center)
+                    .spacing(10),
+                column![
+                    text_input("", &self.current_tab().api_key_name)
+                        .on_input(Message::ApiKeyNameChanged)
+                        .width(Length::Fill),
+                    text_input("", &self.current_tab().api_key)
+                        .on_input(Message::ApiKeyChanged)
+                        .width(Length::Fill),
+                    pick_list(
+                        &ApiKeyPosition::ALL[..],
+                        Some(self.current_tab().api_key_position),
+                        Message::ApiKeyPositionChanged
+                    )
+                ]
+                .spacing(10),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(10)
+            .into(),
         };
 
-        column![type_selector, token_input].spacing(10).into()
+        column![type_selector, auth_form].spacing(10).into()
     }
 
     fn render_response_section(&self) -> Element<'_, Message> {
@@ -1185,7 +1384,7 @@ impl CrabiPie {
                         iced::widget::image(iced::advanced::image::Handle::from_bytes(
                             self.current_tab().response_bytes.clone(),
                         ))
-                        .content_fit(iced::ContentFit::None),
+                        .content_fit(iced::ContentFit::Contain),
                     )
                     .height(Length::Fill)
                     .width(Length::Fill),
@@ -1302,10 +1501,24 @@ impl CrabiPie {
             text_editor(&self.current_tab().response_body_content)
                 .on_action(Message::ResponseBodyAction)
                 .highlight_with::<json_highlighter::JsonHighlighter>(
-                    self.json_theme,
-                    |color, _theme| iced::advanced::text::highlighter::Format {
-                        color: Some(*color),
-                        font: None,
+                    self.get_highlighter_settings(),
+                    |highlight, _theme| {
+                        let color = match highlight {
+                            json_highlighter::HighlightType::Syntax(color) => *color,
+                            json_highlighter::HighlightType::SearchMatch => {
+                                println!("Rendering SearchMatch!");
+                                iced::Color::from_rgb(1.0, 1.0, 0.0) // Yellow
+                            }
+                            json_highlighter::HighlightType::CurrentMatch => {
+                                println!("Rendering CurrentMatch!");
+                                iced::Color::from_rgb(1.0, 0.0, 1.0) // Bright magneta - very obvious!
+                            }
+                        };
+
+                        iced::advanced::text::highlighter::Format {
+                            color: Some(color),
+                            font: None,
+                        }
                     },
                 )
                 .height(Length::Fill)
@@ -1317,10 +1530,22 @@ impl CrabiPie {
         text_editor(&self.current_tab().response_headers_content)
             .on_action(Message::ResponseHeadersAction)
             .highlight_with::<json_highlighter::JsonHighlighter>(
-                self.json_theme,
-                |color, _theme| iced::advanced::text::highlighter::Format {
-                    color: Some(*color),
-                    font: None,
+                self.get_highlighter_settings(),
+                |highlight, _theme| {
+                    let color = match highlight {
+                        json_highlighter::HighlightType::Syntax(color) => *color,
+                        json_highlighter::HighlightType::SearchMatch => {
+                            iced::Color::from_rgb(1.0, 1.0, 0.0)
+                        }
+                        json_highlighter::HighlightType::CurrentMatch => {
+                            iced::Color::from_rgb(1.0, 0.5, 0.0)
+                        }
+                    };
+
+                    iced::advanced::text::highlighter::Format {
+                        color: Some(color),
+                        font: None,
+                    }
                 },
             )
             .height(Length::Fill)
@@ -1382,24 +1607,22 @@ impl CrabiPie {
     }
 
     fn rebuild_url(&mut self) {
-        let base = self
-            .current_tab()
-            .base_url
-            .trim_end_matches('?')
-            .to_string();
-        let mut qp: Vec<String> = Vec::new();
+        use reqwest::Url;
 
-        for p in &self.current_tab().query_params {
-            if p.enabled && !p.key.is_empty() {
-                qp.push(format!("{}={}", p.key, p.value));
+        let base = self.current_tab().base_url.trim_end_matches('?');
+
+        let mut url = Url::parse(base).expect("invalid base URL");
+
+        {
+            let mut pairs = url.query_pairs_mut();
+            for p in &self.current_tab().query_params {
+                if p.enabled && !p.key.is_empty() {
+                    pairs.append_pair(&p.key, &p.value);
+                }
             }
         }
 
-        if qp.is_empty() {
-            self.current_tab_mut().url = base;
-        } else {
-            self.current_tab_mut().url = format!("{}?{}", base, qp.join("&"));
-        }
+        self.current_tab_mut().url = url.to_string();
     }
 
     fn parse_url_query(&mut self) {
@@ -1429,14 +1652,17 @@ impl CrabiPie {
     }
 
     fn send_request(&mut self) -> iced::Task<Message> {
-        let url = self.current_tab().url.clone();
+        let mut url = self.current_tab().url.clone();
         let method = self.current_tab().method.clone();
         let body = self.current_tab().body_content.text();
-        let headers_text = self.current_tab().headers_content.text();
+        let headers = self.current_tab().headers.clone();
         let auth_type = self.current_tab().auth_type.clone();
         let bearer_token = self.current_tab().bearer_token.clone();
         let content_type = self.current_tab().content_type.clone();
         let form_data = self.current_tab().form_data.clone();
+        let api_key = self.current_tab().api_key.clone();
+        let api_key_name = self.current_tab().api_key_name.clone();
+        let api_key_position = self.current_tab().api_key_position;
 
         // Reset cancel flag, start timer, and clear previous response time
         self.current_tab()
@@ -1461,27 +1687,19 @@ impl CrabiPie {
                         accepts_range: false,
                     };
                 }
+
                 // Parse headers
-                let mut header_map = reqwest::header::HeaderMap::new();
+                let mut header_map: reqwest::header::HeaderMap = headers
+                    .iter()
+                    .filter(|h| h.enabled)
+                    .filter_map(|h| {
+                        let name = reqwest::header::HeaderName::from_bytes(h.key.trim().as_bytes())
+                            .ok()?;
+                        let value = reqwest::header::HeaderValue::from_str(h.value.trim()).ok()?;
+                        Some((name, value))
+                    })
+                    .collect();
 
-                for line in headers_text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-
-                    if let Some((key, value)) = line.split_once(':') {
-                        let key = key.trim();
-                        let value = value.trim();
-
-                        if let (Ok(header_name), Ok(header_value)) = (
-                            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                            reqwest::header::HeaderValue::from_str(value),
-                        ) {
-                            header_map.insert(header_name, header_value);
-                        }
-                    }
-                }
                 // Add auth header
                 if auth_type == AuthType::Bearer && !bearer_token.is_empty() {
                     if let Ok(hv) =
@@ -1489,7 +1707,28 @@ impl CrabiPie {
                     {
                         header_map.insert(reqwest::header::AUTHORIZATION, hv);
                     }
+                } else if auth_type == AuthType::ApiKey
+                    && !api_key.is_empty()
+                    && !api_key_name.is_empty()
+                {
+                    if api_key_position == ApiKeyPosition::Header {
+                        if let Ok(hv) = reqwest::header::HeaderValue::from_str(api_key.as_str()) {
+                            if let Ok(hn) = reqwest::header::HeaderName::try_from(&api_key_name) {
+                                header_map.insert(hn, hv);
+                            }
+                        }
+                    } else {
+                        if let Ok(mut parsed) = url::Url::parse(&url) {
+                            parsed
+                                .query_pairs_mut()
+                                .append_pair(&api_key_name, &api_key);
+
+                            url = parsed.to_string();
+                        }
+                    }
                 }
+
+                println!("{url}");
 
                 // let client = reqwest::Client::new();
                 let client = &HTTP_CLIENT;
@@ -1611,6 +1850,8 @@ impl CrabiPie {
                             || ct.starts_with("video/")
                             || ct.starts_with("audio/");
 
+                        println!("is_binary: {is_binary}");
+
                         let filename = hm
                             .get("content-disposition")
                             .and_then(|v| v.to_str().ok())
@@ -1628,7 +1869,7 @@ impl CrabiPie {
                             .and_then(|h| h.to_str().ok())
                             .is_some();
 
-                        if accepts_ranges {
+                        if is_binary && accepts_ranges && ct.starts_with("video/") {
                             return HttpResponse {
                                 status,
                                 headers,
@@ -1767,7 +2008,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::MethodSelected(method) => {
             app.current_tab_mut().method = method;
             iced::Task::none()
@@ -1784,10 +2024,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             } else {
                 iced::Task::none()
             }
-        }
-        Message::HeadersAction(action) => {
-            app.current_tab_mut().headers_content.perform(action);
-            iced::Task::none()
         }
         Message::BodyAction(action) => {
             app.current_tab_mut().body_content.perform(action);
@@ -1910,9 +2146,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::ResponseReceived(resp) => {
+            println!("resp is {:?}", resp);
             app.current_tab_mut().loading = false;
             app.current_tab_mut().active_response_tab = ResponseTab::Body;
             app.current_tab_mut().is_response_binary = resp.is_binary;
+
+            app.current_tab_mut().response_status = resp.status;
+            app.current_tab_mut().response_content_type = resp.content_type.clone();
+            app.current_tab_mut().response_time = resp.response_time;
+            app.current_tab_mut().response_bytes = resp.bytes;
 
             if resp.content_type.starts_with("video/") && resp.accepts_range {
                 let url = url::Url::parse(&app.current_tab().url).unwrap();
@@ -1936,16 +2178,13 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 }
             } else {
                 app.current_tab_mut().video_player = None;
+                app.current_tab_mut().video_state = None;
+
                 app.current_tab_mut().response_headers_content =
                     text_editor::Content::with_text(&resp.headers);
                 app.current_tab_mut().response_body_content =
                     text_editor::Content::with_text(&resp.body);
-                app.current_tab_mut().response_bytes = resp.bytes;
             }
-
-            app.current_tab_mut().response_status = resp.status;
-            app.current_tab_mut().response_content_type = resp.content_type.clone();
-            app.current_tab_mut().response_time = resp.response_time;
 
             iced::Task::none()
         }
@@ -1976,18 +2215,35 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::PrettifyJson => {
             let body_text = app.current_tab().body_content.text();
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
-                if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-                    app.current_tab_mut()
-                        .body_content
-                        .perform(text_editor::Action::SelectAll);
-                    app.current_tab_mut()
-                        .body_content
-                        .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                            std::sync::Arc::new(pretty),
-                        )));
-                }
-            }
+
+            iced::Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let json: serde_json::Value =
+                            serde_json::from_str(&body_text).map_err(|e| e.to_string())?;
+
+                        serde_json::to_string_pretty(&json).map_err(|e| e.to_string())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                },
+                Message::JsonPrettified,
+            )
+        }
+        Message::JsonPrettified(Ok(pretty)) => {
+            let tab = app.current_tab_mut();
+
+            tab.body_content.perform(text_editor::Action::SelectAll);
+
+            tab.body_content
+                .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                    std::sync::Arc::new(pretty),
+                )));
+
+            iced::Task::none()
+        }
+        Message::JsonPrettified(Err(err)) => {
+            eprintln!("Prettify failed: {err}");
             iced::Task::none()
         }
         Message::CopyToClipboard => {
@@ -2198,15 +2454,30 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::CloseFindDialog => {
             app.find_dialog_open = false;
+
+            // Clear search highlights
+            app.search_match_positions = Vec::new();
+            app.current_match_line_col = None;
+            app.search_match_length = 0;
+            app.current_match = 0;
+            app.total_matches = 0;
+
             iced::Task::none()
         }
         Message::FindTextChanged(find_text) => {
             app.current_match = 0;
             app.total_matches = 0;
             app.current_match_pos = None;
+            app.search_match_positions = Vec::new();
+            app.current_match_line_col = None;
+            app.search_match_length = 0;
             app.find_text = find_text;
 
-            app.find_next();
+            // Automatically find first match when text changes
+            if !app.find_text.is_empty() {
+                app.find_next();
+            }
+
             iced::Task::none()
         }
         Message::ReplaceTextChanged(replace_text) => {
@@ -2215,20 +2486,32 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::ToggleCaseSensitive => {
             app.case_sensitive = !app.case_sensitive;
+
+            // Re-search with new settings
+            if !app.find_text.is_empty() {
+                app.current_match = 0;
+                app.find_next();
+            }
+
             iced::Task::none()
         }
         Message::ToggleWholeWord => {
             app.whole_word = !app.whole_word;
+
+            // Re-search with new settings
+            if !app.find_text.is_empty() {
+                app.current_match = 0;
+                app.find_next();
+            }
+
             iced::Task::none()
         }
         Message::FindNext => {
             app.find_next();
+
             iced::Task::none()
         }
-        Message::FindPrevious => {
-            println!("Event fired");
-            iced::Task::none()
-        }
+        Message::FindPrevious => iced::Task::none(),
         Message::Replace => {
             println!("Event fired");
             iced::Task::none()
@@ -2324,6 +2607,46 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::RequestTabSelected(request_tab) => {
             app.current_tab_mut().active_request_tab = request_tab;
+            iced::Task::none()
+        }
+        Message::ApiKeyPositionChanged(position) => {
+            app.current_tab_mut().api_key_position = position;
+            iced::Task::none()
+        }
+        Message::ApiKeyNameChanged(key) => {
+            app.current_tab_mut().api_key_name = key;
+            iced::Task::none()
+        }
+        Message::ApiKeyChanged(key) => {
+            app.current_tab_mut().api_key = key;
+            iced::Task::none()
+        }
+        Message::HeaderAdd => {
+            app.current_tab_mut().headers.push(RequestHeaders::new());
+            iced::Task::none()
+        }
+        Message::HeaderRemove(id) => {
+            if id < app.current_tab().headers.len() {
+                app.current_tab_mut().headers.remove(id);
+            }
+            iced::Task::none()
+        }
+        Message::HeaderKeyChanged(id, key) => {
+            if let Some(header) = app.current_tab_mut().headers.get_mut(id) {
+                header.key = key;
+            }
+            iced::Task::none()
+        }
+        Message::HeaderValueChanged(id, value) => {
+            if let Some(header) = app.current_tab_mut().headers.get_mut(id) {
+                header.value = value;
+            }
+            iced::Task::none()
+        }
+        Message::HeaderToggled(id) => {
+            if let Some(header) = app.current_tab_mut().headers.get_mut(id) {
+                header.enabled = !header.enabled;
+            }
             iced::Task::none()
         }
     }
@@ -2470,6 +2793,7 @@ impl FormField {
 enum AuthType {
     None,
     Bearer,
+    ApiKey,
 }
 
 impl std::fmt::Display for AuthType {
@@ -2477,12 +2801,32 @@ impl std::fmt::Display for AuthType {
         match self {
             AuthType::None => write!(f, "No Auth"),
             AuthType::Bearer => write!(f, "Bearer Token"),
+            AuthType::ApiKey => write!(f, "Api Key"),
         }
     }
 }
 
 impl AuthType {
-    const ALL: [AuthType; 2] = [AuthType::None, AuthType::Bearer];
+    const ALL: [AuthType; 3] = [AuthType::None, AuthType::Bearer, AuthType::ApiKey];
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+enum ApiKeyPosition {
+    Header,
+    QueryParams,
+}
+
+impl std::fmt::Display for ApiKeyPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiKeyPosition::Header => write!(f, "Header"),
+            ApiKeyPosition::QueryParams => write!(f, "Query Params"),
+        }
+    }
+}
+
+impl ApiKeyPosition {
+    const ALL: [ApiKeyPosition; 2] = [ApiKeyPosition::Header, ApiKeyPosition::QueryParams];
 }
 
 #[derive(Debug, Clone)]
@@ -2522,6 +2866,43 @@ impl QueryParam {
             value: String::new(),
             enabled: true,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestHeaders {
+    key: String,
+    value: String,
+    enabled: bool,
+}
+
+impl RequestHeaders {
+    fn new() -> Self {
+        Self {
+            key: String::new(),
+            value: String::new(),
+            enabled: true,
+        }
+    }
+
+    fn default() -> Vec<RequestHeaders> {
+        vec![
+            Self {
+                key: "User-Agent".to_string(),
+                value: "CrabIce".to_string(),
+                enabled: true,
+            },
+            Self {
+                key: "Connection".to_string(),
+                value: "keep-alive".to_string(),
+                enabled: true,
+            },
+            Self {
+                key: "Accept-Encoding".to_string(),
+                value: "gzip, deflate, br".to_string(),
+                enabled: true,
+            },
+        ]
     }
 }
 

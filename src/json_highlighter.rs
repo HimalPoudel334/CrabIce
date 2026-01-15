@@ -13,22 +13,288 @@ pub enum JsonToken {
     Whitespace,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum HighlightType {
+    Syntax(Color),
+    SearchMatch,
+    CurrentMatch,
+}
+
+// Settings that include both theme and search information
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonHighlighterSettings {
+    pub theme: JsonThemeWrapper,
+    pub search_matches: Vec<(usize, usize)>,
+    pub current_match: Option<(usize, usize)>,
+    pub match_length: usize,
+}
+
+impl JsonHighlighterSettings {
+    pub fn new(theme: JsonThemeWrapper) -> Self {
+        Self {
+            theme,
+            search_matches: Vec::new(),
+            current_match: None,
+            match_length: 0,
+        }
+    }
+
+    pub fn with_search(
+        mut self,
+        matches: Vec<(usize, usize)>,
+        current: Option<(usize, usize)>,
+        length: usize,
+    ) -> Self {
+        self.search_matches = matches;
+        self.current_match = current;
+        self.match_length = length;
+        self
+    }
+}
+
 pub struct JsonHighlighter {
     current_line_number: usize,
-    settings: JsonThemeWrapper,
+    settings: JsonHighlighterSettings,
+    lines_highlighted: usize,
 }
 
 impl JsonHighlighter {
     fn token_color(&self, token: JsonToken) -> Color {
         match token {
-            JsonToken::Key => self.settings.key_color(),
-            JsonToken::String => self.settings.string_color(),
-            JsonToken::Number => self.settings.number_color(),
-            JsonToken::Boolean => self.settings.boolean_color(),
-            JsonToken::Null => self.settings.null_color(),
-            JsonToken::Punctuation => self.settings.punctuation_color(),
-            JsonToken::Whitespace => self.settings.text_color(),
+            JsonToken::Key => self.settings.theme.key_color(),
+            JsonToken::String => self.settings.theme.string_color(),
+            JsonToken::Number => self.settings.theme.number_color(),
+            JsonToken::Boolean => self.settings.theme.boolean_color(),
+            JsonToken::Null => self.settings.theme.null_color(),
+            JsonToken::Punctuation => self.settings.theme.punctuation_color(),
+            JsonToken::Whitespace => self.settings.theme.text_color(),
         }
+    }
+
+    fn apply_search_highlight(
+        &self,
+        highlights: &mut Vec<(Range<usize>, HighlightType)>,
+        range: Range<usize>,
+        highlight_type: HighlightType,
+    ) {
+        let mut new_highlights: Vec<(Range<usize>, HighlightType)> = Vec::new();
+        let mut covered = false;
+
+        for (existing_range, existing_type) in highlights.drain(..) {
+            if existing_range.end <= range.start || existing_range.start >= range.end {
+                // No overlap - keep existing highlight
+                new_highlights.push((existing_range, existing_type));
+            } else {
+                // There's overlap
+                covered = true;
+
+                // Part before overlap (keep original syntax highlighting)
+                if existing_range.start < range.start {
+                    new_highlights.push((existing_range.start..range.start, existing_type));
+                }
+
+                // Overlapping part gets search highlight
+                let overlap_start = existing_range.start.max(range.start);
+                let overlap_end = existing_range.end.min(range.end);
+                new_highlights.push((overlap_start..overlap_end, highlight_type));
+
+                // Part after overlap (keep original syntax highlighting)
+                if existing_range.end > range.end {
+                    new_highlights.push((range.end..existing_range.end, existing_type));
+                }
+            }
+        }
+
+        // If no existing highlight covered this range, add it with default color
+        if !covered {
+            new_highlights.push((range, highlight_type));
+        }
+
+        *highlights = new_highlights;
+    }
+}
+
+impl text::Highlighter for JsonHighlighter {
+    type Settings = JsonHighlighterSettings;
+    type Highlight = HighlightType;
+    type Iterator<'a> = Box<dyn Iterator<Item = (Range<usize>, Self::Highlight)> + 'a>;
+
+    fn new(settings: &Self::Settings) -> Self {
+        Self {
+            current_line_number: 0,
+            settings: settings.clone(),
+            lines_highlighted: 0,
+        }
+    }
+
+    fn update(&mut self, new_settings: &Self::Settings) {
+        self.settings = new_settings.clone();
+        self.lines_highlighted = 0; // Reset counter on update
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.current_line_number = line;
+        self.lines_highlighted = line; // Sync both
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        // Use lines_highlighted as the actual line number
+        let actual_line = self.lines_highlighted;
+        self.lines_highlighted += 1; // Increment for next call
+
+        if line.is_empty() {
+            return Box::new(std::iter::empty());
+        }
+
+        // Check if we should have matches on this line
+        let should_highlight = self
+            .settings
+            .search_matches
+            .iter()
+            .any(|&(line_num, _)| line_num == actual_line);
+
+        if should_highlight {
+            println!(
+                "!!! Line {} SHOULD have search highlighting !!!",
+                actual_line
+            );
+            println!("Line content: {:?}", line);
+            println!("Match length: {}", self.settings.match_length);
+        }
+
+        let mut highlights: Vec<(Range<usize>, HighlightType)> =
+            Vec::with_capacity(line.len() / 10);
+        let chars: Vec<char> = line.chars().collect();
+        let len = chars.len();
+        let mut i = 0;
+        let mut current_context_is_key = true;
+
+        if should_highlight {
+            println!("    Line length in chars: {}", len);
+        }
+
+        // Second pass: overlay search highlights
+        for &(line_num, col_start) in &self.settings.search_matches {
+            if line_num == actual_line {
+                // Use actual_line instead of current_line_number
+                let col_end = col_start + self.settings.match_length;
+
+                if col_end <= len {
+                    self.apply_search_highlight(
+                        &mut highlights,
+                        col_start..col_end,
+                        HighlightType::SearchMatch,
+                    );
+                }
+            }
+        }
+
+        // Highlight current match differently
+        if let Some((line_num, col_start)) = self.settings.current_match {
+            if line_num == actual_line {
+                // Use actual_line
+                let col_end = col_start + self.settings.match_length;
+
+                if col_end <= len {
+                    self.apply_search_highlight(
+                        &mut highlights,
+                        col_start..col_end,
+                        HighlightType::CurrentMatch,
+                    );
+                }
+            }
+        }
+
+        // First pass: syntax highlighting
+        while i < len {
+            let ch = chars[i];
+            let start = i;
+
+            match ch {
+                '"' => {
+                    i += 1;
+                    while i < len {
+                        if chars[i] == '\\' && i + 1 < len {
+                            i += 2;
+                            continue;
+                        }
+                        if chars[i] == '"' {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+
+                    let token = if current_context_is_key {
+                        JsonToken::Key
+                    } else {
+                        JsonToken::String
+                    };
+                    highlights.push((start..i, HighlightType::Syntax(self.token_color(token))));
+                }
+                ':' => {
+                    highlights.push((
+                        start..i + 1,
+                        HighlightType::Syntax(self.token_color(JsonToken::Punctuation)),
+                    ));
+                    current_context_is_key = false;
+                    i += 1;
+                }
+                ',' | '{' | '}' | '[' | ']' => {
+                    highlights.push((
+                        start..i + 1,
+                        HighlightType::Syntax(self.token_color(JsonToken::Punctuation)),
+                    ));
+                    if ch == ',' {
+                        current_context_is_key = true;
+                    }
+                    i += 1;
+                }
+                c if c.is_ascii_digit() || c == '-' => {
+                    while i < len && matches!(chars[i], '0'..='9' | '.' | '-' | 'e' | 'E' | '+') {
+                        i += 1;
+                    }
+                    highlights.push((
+                        start..i,
+                        HighlightType::Syntax(self.token_color(JsonToken::Number)),
+                    ));
+                }
+                't' if line[start..].starts_with("true") => {
+                    highlights.push((
+                        start..i + 4,
+                        HighlightType::Syntax(self.token_color(JsonToken::Boolean)),
+                    ));
+                    i += 4;
+                }
+                'f' if line[start..].starts_with("false") => {
+                    highlights.push((
+                        start..i + 5,
+                        HighlightType::Syntax(self.token_color(JsonToken::Boolean)),
+                    ));
+                    i += 5;
+                }
+                'n' if line[start..].starts_with("null") => {
+                    highlights.push((
+                        start..i + 4,
+                        HighlightType::Syntax(self.token_color(JsonToken::Null)),
+                    ));
+                    i += 4;
+                }
+                c if c.is_whitespace() => {
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
+        Box::new(highlights.into_iter())
+    }
+
+    fn current_line(&self) -> usize {
+        self.current_line_number
     }
 }
 
@@ -105,31 +371,30 @@ impl JsonThemeWrapper {
 
     // Map built-in theme colors (approximate mapping to JSON syntax)
     fn builtin_key_color(theme: iced::highlighter::Theme) -> Color {
-        // Keys are like function names in code
         match theme {
             iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.51, 0.58, 0.0),
-            _ => Color::from_rgb(0.4, 0.76, 0.94), // Default blue
+            _ => Color::from_rgb(0.4, 0.76, 0.94),
         }
     }
 
     fn builtin_string_color(theme: iced::highlighter::Theme) -> Color {
         match theme {
             iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.16, 0.63, 0.6),
-            _ => Color::from_rgb(0.73, 0.87, 0.53), // Default green
+            _ => Color::from_rgb(0.73, 0.87, 0.53),
         }
     }
 
     fn builtin_number_color(theme: iced::highlighter::Theme) -> Color {
         match theme {
             iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.8, 0.29, 0.09),
-            _ => Color::from_rgb(0.88, 0.73, 0.53), // Default orange
+            _ => Color::from_rgb(0.88, 0.73, 0.53),
         }
     }
 
     fn builtin_boolean_color(theme: iced::highlighter::Theme) -> Color {
         match theme {
             iced::highlighter::Theme::SolarizedDark => Color::from_rgb(0.83, 0.21, 0.51),
-            _ => Color::from_rgb(0.86, 0.47, 0.65), // Default pink
+            _ => Color::from_rgb(0.86, 0.47, 0.65),
         }
     }
 
@@ -216,112 +481,5 @@ impl std::fmt::Display for CustomJsonTheme {
         } else {
             write!(f, "Custom")
         }
-    }
-}
-
-impl text::Highlighter for JsonHighlighter {
-    type Settings = JsonThemeWrapper;
-    type Highlight = Color;
-    type Iterator<'a> = Box<dyn Iterator<Item = (Range<usize>, Self::Highlight)> + 'a>;
-
-    fn new(settings: &Self::Settings) -> Self {
-        Self {
-            current_line_number: 0,
-            settings: *settings,
-        }
-    }
-
-    fn update(&mut self, new_settings: &Self::Settings) {
-        self.settings = *new_settings;
-    }
-
-    fn change_line(&mut self, line: usize) {
-        self.current_line_number = line;
-    }
-
-    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
-        // Early return for empty lines
-        if line.is_empty() {
-            return Box::new(std::iter::empty());
-        }
-
-        let mut highlights = Vec::with_capacity(line.len() / 10); // Pre-allocate
-        let chars: Vec<char> = line.chars().collect();
-        let len = chars.len();
-        let mut i = 0;
-        let mut current_context_is_key = true;
-
-        while i < len {
-            let ch = chars[i];
-            let start = i;
-
-            match ch {
-                '"' => {
-                    i += 1;
-                    while i < len {
-                        if chars[i] == '\\' && i + 1 < len {
-                            i += 2;
-                            continue;
-                        }
-                        if chars[i] == '"' {
-                            i += 1;
-                            break;
-                        }
-                        i += 1;
-                    }
-
-                    let token = if current_context_is_key {
-                        JsonToken::Key
-                    } else {
-                        JsonToken::String
-                    };
-                    highlights.push((start..i, self.token_color(token)));
-                }
-                ':' => {
-                    highlights.push((start..i + 1, self.token_color(JsonToken::Punctuation)));
-                    current_context_is_key = false;
-                    i += 1;
-                }
-                ',' | '{' | '}' | '[' | ']' => {
-                    highlights.push((start..i + 1, self.token_color(JsonToken::Punctuation)));
-                    if ch == ',' {
-                        current_context_is_key = true;
-                    }
-                    i += 1;
-                }
-                c if c.is_ascii_digit() || c == '-' => {
-                    while i < len && matches!(chars[i], '0'..='9' | '.' | '-' | 'e' | 'E' | '+') {
-                        i += 1;
-                    }
-                    highlights.push((start..i, self.token_color(JsonToken::Number)));
-                }
-                't' if line[start..].starts_with("true") => {
-                    highlights.push((start..i + 4, self.token_color(JsonToken::Boolean)));
-                    i += 4;
-                }
-                'f' if line[start..].starts_with("false") => {
-                    highlights.push((start..i + 5, self.token_color(JsonToken::Boolean)));
-                    i += 5;
-                }
-                'n' if line[start..].starts_with("null") => {
-                    highlights.push((start..i + 4, self.token_color(JsonToken::Null)));
-                    i += 4;
-                }
-                // Skip whitespace without highlighting
-                c if c.is_whitespace() => {
-                    i += 1;
-                    continue;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-
-        Box::new(highlights.into_iter())
-    }
-
-    fn current_line(&self) -> usize {
-        self.current_line_number
     }
 }
