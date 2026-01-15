@@ -161,6 +161,9 @@ struct TabState {
     form_data: Vec<FormField>,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
+    //image handle
+    image_handle: Option<iced::widget::image::Handle>,
+
     // Video response
     video_player: Option<iced_video_player::Video>,
     video_state: Option<VideoState>,
@@ -202,6 +205,7 @@ impl TabState {
             content_type: ContentType::Json,
             query_params: vec![QueryParam::new()],
             form_data: vec![FormField::new()],
+            image_handle: None,
             video_player: None,
             video_state: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -238,6 +242,7 @@ impl TabState {
             content_type: saved.content_type,
             query_params: saved.query_params,
             form_data: saved.form_data,
+            image_handle: None,
             video_player: None,
             video_state: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1374,21 +1379,22 @@ impl CrabiPie {
                         ..Default::default()
                     }),
             );
+
             if self
                 .current_tab()
                 .response_content_type
                 .starts_with("image/")
             {
-                body_column = body_column.push(
-                    scrollable(
-                        iced::widget::image(iced::advanced::image::Handle::from_bytes(
-                            self.current_tab().response_bytes.clone(),
-                        ))
-                        .content_fit(iced::ContentFit::Contain),
-                    )
-                    .height(Length::Fill)
-                    .width(Length::Fill),
-                );
+                if let Some(handle) = &self.current_tab().image_handle {
+                    body_column = body_column.push(
+                        scrollable(
+                            iced::widget::image(handle.clone())
+                                .content_fit(iced::ContentFit::Contain),
+                        )
+                        .height(Length::Fill)
+                        .width(Length::Fill),
+                    );
+                }
             } else if self
                 .current_tab()
                 .response_content_type
@@ -1850,8 +1856,6 @@ impl CrabiPie {
                             || ct.starts_with("video/")
                             || ct.starts_with("audio/");
 
-                        println!("is_binary: {is_binary}");
-
                         let filename = hm
                             .get("content-disposition")
                             .and_then(|v| v.to_str().ok())
@@ -2146,7 +2150,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::ResponseReceived(resp) => {
-            println!("resp is {:?}", resp);
             app.current_tab_mut().loading = false;
             app.current_tab_mut().active_response_tab = ResponseTab::Body;
             app.current_tab_mut().is_response_binary = resp.is_binary;
@@ -2154,9 +2157,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.current_tab_mut().response_status = resp.status;
             app.current_tab_mut().response_content_type = resp.content_type.clone();
             app.current_tab_mut().response_time = resp.response_time;
-            app.current_tab_mut().response_bytes = resp.bytes;
+            // app.current_tab_mut().response_bytes = resp.bytes;
 
-            if resp.content_type.starts_with("video/") && resp.accepts_range {
+            if resp.is_binary && resp.content_type.starts_with("video/") && resp.accepts_range {
                 let url = url::Url::parse(&app.current_tab().url).unwrap();
 
                 match iced_video_player::Video::new(&url) {
@@ -2176,6 +2179,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         app.current_tab_mut().video_player = None;
                     }
                 }
+            } else if resp.is_binary && resp.content_type.starts_with("image/") {
+                // Create handle directly from the incoming bytes
+                app.current_tab_mut().image_handle =
+                    Some(iced::widget::image::Handle::from_bytes(resp.bytes.clone()));
             } else {
                 app.current_tab_mut().video_player = None;
                 app.current_tab_mut().video_state = None;
