@@ -176,7 +176,7 @@ struct TabState {
 
     // WebSocket-specific fields
     ws_connected: bool,
-    ws_messages: Vec<WsMessage>,
+    ws_messages: Vec<WsMessageDisplay>,
     ws_input: String,
     ws_auto_scroll: bool,
     ws_command_tx: Option<mpsc::UnboundedSender<WsCommand>>,
@@ -242,6 +242,11 @@ impl TabState {
             active_request_tab: RequestTab::Query,
             active_response_tab: ResponseTab::Body,
             copied: false,
+            ws_connected: false,
+            ws_messages: Vec::new(),
+            ws_input: String::new(),
+            ws_auto_scroll: true,
+            ws_command_tx: None,
         }
     }
 
@@ -284,6 +289,11 @@ impl TabState {
             active_request_tab: RequestTab::Query,
             active_response_tab: ResponseTab::Body,
             copied: false,
+            ws_connected: false,
+            ws_messages: Vec::new(),
+            ws_input: String::new(),
+            ws_auto_scroll: true,
+            ws_command_tx: None,
         }
     }
 
@@ -717,6 +727,160 @@ impl CrabiPie {
             self.current_match_pos = Some(match_pos);
             self.current_match_line_col = Some(self.search_match_positions[self.current_match - 1]);
         }
+    }
+
+    fn render_websocket_panel(&self) -> Element<'_, Message> {
+        let tab = self.current_tab();
+        let is_connected = tab.ws_connected;
+
+        // Connection controls
+        let url_input = text_input("wss://echo.websocket.org", &tab.url)
+            .on_input(Message::UrlChanged)
+            .padding(10)
+            .width(Length::Fill);
+
+        let connect_button = if is_connected {
+            button(text("Disconnect").size(14))
+                .on_press(Message::WsDisconnect)
+                .padding(10)
+                .style(button::danger)
+        } else if tab.loading {
+            button(text("Connecting...").size(14)).padding(10)
+        } else {
+            button(text("Connect").size(14))
+                .on_press(Message::WsConnect)
+                .padding(10)
+                .style(button::primary)
+        };
+
+        let clear_button = button(text("Clear").size(14))
+            .on_press(Message::WsClearMessages)
+            .padding(10);
+
+        let status_text = if is_connected {
+            text("🟢 Connected").color(iced::Color::from_rgb(0.0, 0.8, 0.0))
+        } else {
+            text("🔴 Disconnected").color(iced::Color::from_rgb(0.8, 0.0, 0.0))
+        };
+
+        let connection_row = row![url_input, connect_button, clear_button, status_text,]
+            .spacing(10)
+            .padding(10)
+            .align_y(Alignment::Center);
+
+        // Message display area
+        let messages_list =
+            tab.ws_messages
+                .iter()
+                .fold(column![].spacing(8).padding(10), |col, msg| {
+                    let (prefix, color) = match msg.direction {
+                        MessageDirection::Sent => ("→", iced::Color::from_rgb(0.2, 0.6, 1.0)),
+                        MessageDirection::Received => ("←", iced::Color::from_rgb(0.0, 0.8, 0.0)),
+                        MessageDirection::System => ("•", iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                    };
+
+                    let message_row = row![
+                        text(&msg.timestamp)
+                            .size(11)
+                            .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                        text(prefix).size(14).color(color),
+                        text(&msg.content).size(13),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center);
+
+                    col.push(message_row)
+                });
+
+        let messages_scroll = scrollable(messages_list).height(Length::Fill);
+
+        // Message input area
+        let message_input = text_input("Type message...", &tab.ws_input)
+            .on_input(Message::WsMessageInputChanged)
+            .on_submit(Message::WsSendMessage)
+            .padding(10)
+            .width(Length::Fill);
+
+        let send_button = button(text("Send").size(14))
+            .on_press_maybe(if is_connected && !tab.ws_input.is_empty() {
+                Some(Message::WsSendMessage)
+            } else {
+                None
+            })
+            .padding(10)
+            .style(button::primary);
+
+        let input_row = row![message_input, send_button].spacing(10).padding(10);
+
+        // Stats
+        let stats = text(format!(
+            "Messages: {} | Sent: {} | Received: {}",
+            tab.ws_messages.len(),
+            tab.ws_messages
+                .iter()
+                .filter(|m| m.direction == MessageDirection::Sent)
+                .count(),
+            tab.ws_messages
+                .iter()
+                .filter(|m| m.direction == MessageDirection::Received)
+                .count(),
+        ))
+        .size(11)
+        .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
+
+        let stats_row = container(stats).padding(5).center_x(Length::Fill);
+
+        // Combine everything
+        column![
+            connection_row,
+            container(messages_scroll)
+                .height(Length::Fill)
+                .padding(10)
+                .style(container::bordered_box),
+            stats_row,
+            input_row,
+        ]
+        .spacing(0)
+        .into()
+    }
+
+    // Helper function to connect
+    async fn connect_websocket(
+        url: &str,
+    ) -> Result<reqwest_websocket::WebSocket, Box<dyn std::error::Error + Send + Sync>> {
+        use reqwest_websocket::RequestBuilderExt;
+        let response = reqwest::Client::new().get(url).upgrade().send().await?;
+
+        let websocket = response.into_websocket().await?;
+
+        Ok(websocket)
+    }
+
+    fn add_ws_system_message(&mut self, content: &str) {
+        let msg = WsMessageDisplay {
+            timestamp: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
+            direction: MessageDirection::System,
+            content: content.to_string(),
+        };
+        self.current_tab_mut().ws_messages.push(msg);
+    }
+
+    fn add_ws_sent_message(&mut self, content: &str) {
+        let msg = WsMessageDisplay {
+            timestamp: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
+            direction: MessageDirection::Sent,
+            content: content.to_string(),
+        };
+        self.current_tab_mut().ws_messages.push(msg);
+    }
+
+    fn add_ws_received_message(&mut self, content: &str) {
+        let msg = WsMessageDisplay {
+            timestamp: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
+            direction: MessageDirection::Received,
+            content: content.to_string(),
+        };
+        self.current_tab_mut().ws_messages.push(msg);
     }
 }
 
@@ -2006,9 +2170,30 @@ impl CrabiPie {
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
-        iced::Subscription::batch([self.svg_rotation_subscription(), self.event_subscription()])
+        let mut subscriptions = vec![self.svg_rotation_subscription(), self.event_subscription()];
+        // Add WebSocket subscription for the active tab
+        if self.current_tab().request_type == RequestType::WebSocket
+            && self.current_tab().ws_connected
+        {
+            let url = self.current_tab().url.clone();
+
+            subscriptions.push(iced::advanced::subscription::from_recipe(WebSocketRecipe {
+                url,
+            }));
+        }
+
+        iced::Subscription::batch(subscriptions)
     }
 
+    fn websocket_subscription(&self) -> iced::Subscription<Message> {
+        iced::Subscription::run(|| {
+            futures::stream::unfold((), |_| async {
+                // Placeholder
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                Some((Message::Tick, ()))
+            })
+        })
+    }
     fn svg_rotation_subscription(&self) -> iced::Subscription<Message> {
         if self.current_tab().loading {
             iced::time::every(std::time::Duration::from_millis(5)).map(|_| Message::Tick)
@@ -2049,6 +2234,14 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             match req_type {
                 RequestType::HTTP => {
                     app.current_tab_mut().request_type = req_type;
+                }
+                RequestType::WebSocket => {
+                    app.current_tab_mut().request_type = req_type;
+                    // Initialize WebSocket state
+                    app.current_tab_mut().ws_connected = false;
+                    app.current_tab_mut().ws_messages = Vec::new();
+                    app.current_tab_mut().ws_input = String::new();
+                    app.current_tab_mut().ws_auto_scroll = true;
                 }
                 _ => {
                     app.current_tab_mut().response_body_content =
@@ -2701,6 +2894,80 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
+        Message::WsConnect => {
+            let url = app.current_tab().url.clone();
+
+            // Validate URL
+            if !url.starts_with("ws://") && !url.starts_with("wss://") {
+                app.add_ws_system_message("Error: WebSocket URL must start with ws:// or wss://");
+                return iced::Task::none();
+            }
+
+            app.current_tab_mut().loading = true;
+            app.current_tab_mut().ws_connected = true;
+            app.add_ws_system_message(&format!("Connecting to {}...", url));
+
+            iced::Task::none()
+        }
+
+        Message::WsDisconnect => {
+            app.current_tab_mut().ws_connected = false;
+            app.current_tab_mut().loading = false;
+            app.add_ws_system_message("Disconnected");
+            iced::Task::none()
+        }
+
+        Message::WsEvent(event) => {
+            match event {
+                WsEvent::Connected => {
+                    app.current_tab_mut().loading = false;
+                    app.add_ws_system_message("Connected successfully");
+                }
+                WsEvent::Disconnected(reason) => {
+                    app.current_tab_mut().loading = false;
+                    app.current_tab_mut().ws_connected = false;
+                    app.add_ws_system_message(&format!("Disconnected: {}", reason));
+                }
+                WsEvent::MessageReceived(content) => {
+                    app.add_ws_received_message(&content);
+                }
+                WsEvent::Error(error) => {
+                    app.current_tab_mut().loading = false;
+                    app.add_ws_system_message(&format!("Error: {}", error));
+                }
+            }
+            iced::Task::none()
+        }
+
+        Message::WsMessageInputChanged(text) => {
+            app.current_tab_mut().ws_input = text;
+            iced::Task::none()
+        }
+
+        Message::WsSendMessage => {
+            // Note: Sending requires a different approach - see next section
+            let message = app.current_tab().ws_input.clone();
+
+            if !message.is_empty() {
+                app.add_ws_sent_message(&message);
+                app.current_tab_mut().ws_input.clear();
+
+                // TODO: We need to send this to the WebSocket
+                // This requires a channel from UI to subscription
+            }
+
+            iced::Task::none()
+        }
+
+        Message::WsClearMessages => {
+            app.current_tab_mut().ws_messages.clear();
+            iced::Task::none()
+        }
+
+        Message::WsToggleAutoScroll => {
+            app.current_tab_mut().ws_auto_scroll = !app.current_tab().ws_auto_scroll;
+            iced::Task::none()
+        }
     }
 }
 
@@ -2747,6 +3014,111 @@ const BODY_DEFAULT: &str = r#"{
   "userId": 1,
   "foo": "bar"
 }"#;
+
+#[derive(Debug, Hash, Clone)]
+struct WebSocketRecipe {
+    url: String,
+}
+
+impl iced::advanced::subscription::Recipe for WebSocketRecipe {
+    type Output = Message;
+
+    fn hash(&self, state: &mut iced::advanced::subscription::Hasher) {
+        use std::hash::Hash;
+        self.url.hash(state);
+    }
+
+    fn stream(
+        self: Box<Self>,
+        _input: std::pin::Pin<
+            Box<dyn futures::Stream<Item = iced::advanced::subscription::Event> + Send>,
+        >,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Self::Output> + Send>> {
+        use futures::TryStreamExt;
+        use futures::stream::StreamExt;
+
+        let url = self.url.clone();
+
+        Box::pin(futures::stream::unfold(
+            None,
+            move |state: Option<reqwest_websocket::WebSocket>| {
+                let url = url.clone();
+
+                async move {
+                    // If we don't have a connection, create one
+                    if state.is_none() {
+                        match CrabiPie::connect_websocket(&url).await {
+                            Ok(websocket) => {
+                                return Some((
+                                    Message::WsEvent(WsEvent::Connected),
+                                    Some(websocket),
+                                ));
+                            }
+                            Err(e) => {
+                                // Wait before retry
+                                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                                return Some((
+                                    Message::WsEvent(WsEvent::Error(format!(
+                                        "Connection failed: {}",
+                                        e
+                                    ))),
+                                    None,
+                                ));
+                            }
+                        }
+                    }
+
+                    // We have a connection, read from it
+                    if let Some(mut ws) = state {
+                        match ws.try_next().await {
+                            Ok(Some(reqwest_websocket::Message::Text(text))) => {
+                                return Some((
+                                    Message::WsEvent(WsEvent::MessageReceived(text)),
+                                    Some(ws),
+                                ));
+                            }
+                            Ok(Some(reqwest_websocket::Message::Binary(_data))) => {
+                                // Ignore binary messages for now
+                                return Some((
+                                    Message::WsEvent(WsEvent::MessageReceived(
+                                        "[Binary data]".to_string(),
+                                    )),
+                                    Some(ws),
+                                ));
+                            }
+                            Ok(None) => {
+                                // Connection closed
+                                return Some((
+                                    Message::WsEvent(WsEvent::Disconnected(
+                                        "Connection closed".to_string(),
+                                    )),
+                                    None,
+                                ));
+                            }
+                            Err(e) => {
+                                return Some((
+                                    Message::WsEvent(WsEvent::Error(format!("Read error: {}", e))),
+                                    None,
+                                ));
+                            }
+                            _ => {
+                                // Other message types (Ping, Pong, Close)
+                                return Some((
+                                    Message::WsEvent(WsEvent::MessageReceived(
+                                        "[Control frame]".to_string(),
+                                    )),
+                                    Some(ws),
+                                ));
+                            }
+                        }
+                    }
+
+                    None
+                }
+            },
+        ))
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum RequestType {
@@ -3077,4 +3449,11 @@ enum MessageDirection {
     Sent,
     Received,
     System,
+}
+
+#[derive(Debug, Clone)]
+struct WsMessageDisplay {
+    timestamp: String,
+    direction: MessageDirection,
+    content: String,
 }
