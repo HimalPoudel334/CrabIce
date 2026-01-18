@@ -55,7 +55,6 @@ impl JsonHighlighterSettings {
 pub struct JsonHighlighter {
     current_line_number: usize,
     settings: JsonHighlighterSettings,
-    lines_highlighted: usize,
 }
 
 impl JsonHighlighter {
@@ -123,89 +122,32 @@ impl text::Highlighter for JsonHighlighter {
         Self {
             current_line_number: 0,
             settings: settings.clone(),
-            lines_highlighted: 0,
         }
     }
 
     fn update(&mut self, new_settings: &Self::Settings) {
         self.settings = new_settings.clone();
-        self.lines_highlighted = 0; // Reset counter on update
     }
 
     fn change_line(&mut self, line: usize) {
+        println!("Changed line called with line number {line}");
         self.current_line_number = line;
-        self.lines_highlighted = line; // Sync both
     }
 
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
-        // Use lines_highlighted as the actual line number
-        let actual_line = self.lines_highlighted;
-        self.lines_highlighted += 1; // Increment for next call
+        let actual_line = self.current_line_number;
 
         if line.is_empty() {
             return Box::new(std::iter::empty());
         }
 
-        // Check if we should have matches on this line
-        let should_highlight = self
-            .settings
-            .search_matches
-            .iter()
-            .any(|&(line_num, _)| line_num == actual_line);
-
-        if should_highlight {
-            println!(
-                "!!! Line {} SHOULD have search highlighting !!!",
-                actual_line
-            );
-            println!("Line content: {:?}", line);
-            println!("Match length: {}", self.settings.match_length);
-        }
-
-        let mut highlights: Vec<(Range<usize>, HighlightType)> =
-            Vec::with_capacity(line.len() / 10);
+        let mut highlights: Vec<(Range<usize>, HighlightType)> = Vec::new();
         let chars: Vec<char> = line.chars().collect();
         let len = chars.len();
         let mut i = 0;
         let mut current_context_is_key = true;
 
-        if should_highlight {
-            println!("    Line length in chars: {}", len);
-        }
-
-        // Second pass: overlay search highlights
-        for &(line_num, col_start) in &self.settings.search_matches {
-            if line_num == actual_line {
-                // Use actual_line instead of current_line_number
-                let col_end = col_start + self.settings.match_length;
-
-                if col_end <= len {
-                    self.apply_search_highlight(
-                        &mut highlights,
-                        col_start..col_end,
-                        HighlightType::SearchMatch,
-                    );
-                }
-            }
-        }
-
-        // Highlight current match differently
-        if let Some((line_num, col_start)) = self.settings.current_match {
-            if line_num == actual_line {
-                // Use actual_line
-                let col_end = col_start + self.settings.match_length;
-
-                if col_end <= len {
-                    self.apply_search_highlight(
-                        &mut highlights,
-                        col_start..col_end,
-                        HighlightType::CurrentMatch,
-                    );
-                }
-            }
-        }
-
-        // First pass: syntax highlighting
+        // --- STEP 1: Syntax Highlighting First ---
         while i < len {
             let ch = chars[i];
             let start = i;
@@ -224,7 +166,6 @@ impl text::Highlighter for JsonHighlighter {
                         }
                         i += 1;
                     }
-
                     let token = if current_context_is_key {
                         JsonToken::Key
                     } else {
@@ -250,45 +191,43 @@ impl text::Highlighter for JsonHighlighter {
                     }
                     i += 1;
                 }
-                c if c.is_ascii_digit() || c == '-' => {
-                    while i < len && matches!(chars[i], '0'..='9' | '.' | '-' | 'e' | 'E' | '+') {
-                        i += 1;
-                    }
-                    highlights.push((
-                        start..i,
-                        HighlightType::Syntax(self.token_color(JsonToken::Number)),
-                    ));
-                }
-                't' if line[start..].starts_with("true") => {
-                    highlights.push((
-                        start..i + 4,
-                        HighlightType::Syntax(self.token_color(JsonToken::Boolean)),
-                    ));
-                    i += 4;
-                }
-                'f' if line[start..].starts_with("false") => {
-                    highlights.push((
-                        start..i + 5,
-                        HighlightType::Syntax(self.token_color(JsonToken::Boolean)),
-                    ));
-                    i += 5;
-                }
-                'n' if line[start..].starts_with("null") => {
-                    highlights.push((
-                        start..i + 4,
-                        HighlightType::Syntax(self.token_color(JsonToken::Null)),
-                    ));
-                    i += 4;
-                }
+                // ... (rest of your number/bool/null logic) ...
                 c if c.is_whitespace() => {
                     i += 1;
-                    continue;
                 }
                 _ => {
                     i += 1;
                 }
             }
         }
+
+        for &(line_num, col_start) in &self.settings.search_matches {
+            if line_num == actual_line {
+                let col_end = col_start + self.settings.match_length;
+                if col_end <= len {
+                    self.apply_search_highlight(
+                        &mut highlights,
+                        col_start..col_end,
+                        HighlightType::SearchMatch,
+                    );
+                }
+            }
+        }
+
+        if let Some((line_num, col_start)) = self.settings.current_match {
+            if line_num == actual_line {
+                let col_end = col_start + self.settings.match_length;
+                if col_end <= len {
+                    self.apply_search_highlight(
+                        &mut highlights,
+                        col_start..col_end,
+                        HighlightType::CurrentMatch,
+                    );
+                }
+            }
+        }
+
+        highlights.sort_by_key(|(range, _)| range.start);
 
         Box::new(highlights.into_iter())
     }
@@ -298,7 +237,6 @@ impl text::Highlighter for JsonHighlighter {
     }
 }
 
-// Wrapper enum that combines built-in and custom themes
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JsonThemeWrapper {
     Builtin(iced::highlighter::Theme),

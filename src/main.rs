@@ -2,7 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use core::net;
-use std::{str::FromStr, sync::atomic::Ordering};
+use futures::{SinkExt, StreamExt};
+use std::{fmt::write, str::FromStr, sync::atomic::Ordering};
+use tokio::sync::mpsc;
 
 use iced::{
     Alignment, Border, Element, Event, Length, Padding, alignment,
@@ -30,6 +32,7 @@ enum Message {
     CloseTab(usize),
 
     UrlChanged(String),
+    RequestTypeSelected(RequestType),
     MethodSelected(HttpMethod),
 
     //headers actions
@@ -73,6 +76,15 @@ enum Message {
     QueryParamKeyChanged(usize, String),
     QueryParamValueChanged(usize, String),
     QueryParamToggled(usize),
+
+    // WebSocket messages
+    WsConnect,
+    WsDisconnect,
+    WsEvent(WsEvent),
+    WsMessageInputChanged(String),
+    WsSendMessage,
+    WsClearMessages,
+    WsToggleAutoScroll,
 
     //Subscription
     Tick,
@@ -148,6 +160,7 @@ struct TabState {
     url_id: iced::widget::Id,
     base_url: String,
     url: String,
+    request_type: RequestType,
     method: HttpMethod,
     headers: Vec<RequestHeaders>,
     body_content: text_editor::Content,
@@ -160,6 +173,13 @@ struct TabState {
     query_params: Vec<QueryParam>,
     form_data: Vec<FormField>,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    // WebSocket-specific fields
+    ws_connected: bool,
+    ws_messages: Vec<WsMessage>,
+    ws_input: String,
+    ws_auto_scroll: bool,
+    ws_command_tx: Option<mpsc::UnboundedSender<WsCommand>>,
 
     //image handle
     image_handle: Option<iced::widget::image::Handle>,
@@ -194,6 +214,7 @@ impl TabState {
             url_id: iced::widget::Id::unique(),
             base_url: base.clone(),
             url: base,
+            request_type: RequestType::HTTP,
             method: HttpMethod::GET,
             headers: RequestHeaders::default(),
             body_content: text_editor::Content::with_text(BODY_DEFAULT),
@@ -231,6 +252,7 @@ impl TabState {
             url_id: iced::widget::Id::unique(),
             base_url: saved.base_url,
             url: saved.url,
+            request_type: saved.request_type,
             method: saved.method,
             headers: saved.headers,
             body_content: text_editor::Content::with_text(&saved.body),
@@ -271,6 +293,7 @@ impl TabState {
             title: self.title.clone(),
             base_url: self.base_url.clone(),
             url: self.url.clone(),
+            request_type: self.request_type.clone(),
             method: self.method.clone(),
             headers: self.headers.clone(),
             body: self.body_content.text(),
@@ -502,27 +525,27 @@ impl CrabiPie {
             .into()
     }
 
-    fn position_to_line_col(text: &str, pos: usize) -> (usize, usize) {
-        let mut line = 0;
-        let mut col = 0;
-        let mut char_count = 0;
+    fn position_to_line_col(text: &str, byte_pos: usize) -> (usize, usize) {
+        let mut line_idx = 0;
+        let mut line_start_byte = 0;
 
-        for ch in text.chars() {
-            if char_count >= pos {
-                break;
+        for line in text.split_inclusive('\n') {
+            let line_end_byte = line_start_byte + line.len();
+
+            if byte_pos >= line_start_byte && byte_pos < line_end_byte {
+                let byte_offset_in_line = byte_pos - line_start_byte;
+
+                // Convert byte offset → char offset
+                let char_offset = line[..byte_offset_in_line].chars().count();
+
+                return (line_idx, char_offset);
             }
 
-            if ch == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-
-            char_count += 1;
+            line_start_byte = line_end_byte;
+            line_idx += 1;
         }
 
-        (line, col)
+        (0, 0)
     }
 
     fn find_matches(&self, text: &str, pattern: &str) -> Vec<usize> {
@@ -703,6 +726,7 @@ struct SavedState {
     title: String,
     base_url: String,
     url: String,
+    request_type: RequestType,
     method: HttpMethod,
     headers: Vec<RequestHeaders>,
     body: String,
@@ -731,6 +755,7 @@ impl Default for SavedState {
             title: "Request-1".into(),
             url: base.clone(),
             base_url: base,
+            request_type: RequestType::HTTP,
             method: HttpMethod::GET,
             headers: vec![RequestHeaders::new()],
             body: String::new(),
@@ -829,6 +854,14 @@ impl CrabiPie {
     }
 
     fn render_request_row(&self) -> Element<'_, Message> {
+        let req_type = pick_list(
+            &RequestType::ALL[..],
+            Some(self.current_tab().request_type.clone()),
+            Message::RequestTypeSelected,
+        )
+        .width(110)
+        .padding(10);
+
         let method_picker = pick_list(
             &HttpMethod::ALL[..],
             Some(self.current_tab().method.clone()),
@@ -870,7 +903,7 @@ impl CrabiPie {
             .width(100)
         };
 
-        container(row![method_picker, url_input, send_button].spacing(10))
+        container(row![req_type, method_picker, url_input, send_button].spacing(10))
             // .style(|theme: &iced::Theme| container::Style {
             //     border: Border {
             //         width: 0.5,
@@ -2012,6 +2045,18 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
+        Message::RequestTypeSelected(req_type) => {
+            match req_type {
+                RequestType::HTTP => {
+                    app.current_tab_mut().request_type = req_type;
+                }
+                _ => {
+                    app.current_tab_mut().response_body_content =
+                        text_editor::Content::with_text("Ops! Sorry. Not implemented yet!");
+                }
+            }
+            iced::Task::none()
+        }
         Message::MethodSelected(method) => {
             app.current_tab_mut().method = method;
             iced::Task::none()
@@ -2696,15 +2741,35 @@ fn main() -> iced::Result {
         .run()
 }
 
-const HEADERS_DEFAULT: &str =
-    "# Add headers as key: value pairs\n# Example:\n# X-Custom-Header: value";
-
 const BODY_DEFAULT: &str = r#"{
   "title": "foo",
   "body": "bar",
   "userId": 1,
   "foo": "bar"
 }"#;
+
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+enum RequestType {
+    HTTP,
+    WebSocket,
+    GraphQL,
+    GRPC,
+}
+
+impl RequestType {
+    const ALL: [RequestType; 4] = [
+        RequestType::HTTP,
+        RequestType::WebSocket,
+        RequestType::GraphQL,
+        RequestType::GRPC,
+    ];
+}
+
+impl std::fmt::Display for RequestType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum HttpMethod {
@@ -2980,3 +3045,36 @@ impl From<Icon> for char {
 
 const HEADER_SIZE: u32 = 32;
 const TAB_PADDING: u16 = 16;
+
+#[derive(Debug, Clone)]
+pub enum WsEvent {
+    Connected,
+    Disconnected(String),
+    MessageReceived(String),
+    Error(String),
+}
+
+pub enum WsCommand {
+    Connect(String), // URL
+    Disconnect,
+    SendMessage(String),
+}
+
+struct WebSocketState {
+    sender: mpsc::UnboundedSender<WsCommand>,
+    receiver: mpsc::UnboundedReceiver<WsEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct WsMessage {
+    timestamp: String,
+    direction: MessageDirection,
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum MessageDirection {
+    Sent,
+    Received,
+    System,
+}
