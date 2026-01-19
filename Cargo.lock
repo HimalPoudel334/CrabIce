@@ -6,6 +6,7 @@ version = 4
 name = "CrabIce"
 version = "0.1.0"
 dependencies = [
+ "async-tungstenite 0.32.1",
  "chrono",
  "futures",
  "gstreamer",
@@ -407,7 +408,23 @@ dependencies = [
  "futures-util",
  "log",
  "pin-project-lite",
- "tungstenite",
+ "tungstenite 0.27.0",
+]
+
+[[package]]
+name = "async-tungstenite"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8acc405d38be14342132609f06f02acaf825ddccfe76c4824a69281e0458ebd4"
+dependencies = [
+ "atomic-waker",
+ "futures-core",
+ "futures-io",
+ "futures-task",
+ "futures-util",
+ "log",
+ "pin-project-lite",
+ "tungstenite 0.28.0",
 ]
 
 [[package]]
@@ -2293,6 +2310,7 @@ dependencies = [
  "iced_core",
  "iced_futures",
  "raw-window-handle",
+ "sipper",
  "thiserror 2.0.17",
 ]
 
@@ -4171,7 +4189,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd5f79b25f7f17a62cc9337108974431a66ae5a723ac0d9fe78ac1cce2027720"
 dependencies = [
- "async-tungstenite",
+ "async-tungstenite 0.31.0",
  "bytes",
  "futures-util",
  "reqwest",
@@ -4179,7 +4197,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tungstenite",
+ "tungstenite 0.27.0",
  "web-sys",
 ]
 
@@ -4556,6 +4574,16 @@ name = "siphasher"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
+
+[[package]]
+name = "sipper"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bccb4192828b3d9a08e0b5a73f17795080dfb278b50190216e3ae2132cf4f95"
+dependencies = [
+ "futures",
+ "pin-project-lite",
+]
 
 [[package]]
 name = "skrifa"
@@ -5249,6 +5277,23 @@ name = "tungstenite"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand",
+ "sha1",
+ "thiserror 2.0.17",
+ "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
 dependencies = [
  "bytes",
  "data-encoding",

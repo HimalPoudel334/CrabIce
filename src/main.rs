@@ -1,22 +1,18 @@
 #![allow(unused)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use core::net;
-use futures::{SinkExt, StreamExt};
-use std::{fmt::write, str::FromStr, sync::atomic::Ordering};
-use tokio::sync::mpsc;
+use futures::channel::mpsc;
+use reqwest_websocket::RequestBuilderExt;
+use std::sync::atomic::Ordering;
 
 use iced::{
     Alignment, Border, Element, Event, Length, Padding, alignment,
-    border::width,
-    highlighter,
     widget::{
         Column, Space, button, checkbox, column, container, pick_list, row, rule, scrollable,
         space, text, text_editor, text_input, tooltip,
     },
 };
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
 
 mod json_highlighter;
 
@@ -176,10 +172,10 @@ struct TabState {
 
     // WebSocket-specific fields
     ws_connected: bool,
+    ws_connection: Option<WsConnection>,
     ws_messages: Vec<WsMessageDisplay>,
-    ws_input: String,
     ws_auto_scroll: bool,
-    ws_command_tx: Option<mpsc::UnboundedSender<WsCommand>>,
+    ws_input: String,
 
     //image handle
     image_handle: Option<iced::widget::image::Handle>,
@@ -246,7 +242,7 @@ impl TabState {
             ws_messages: Vec::new(),
             ws_input: String::new(),
             ws_auto_scroll: true,
-            ws_command_tx: None,
+            ws_connection: None,
         }
     }
 
@@ -293,7 +289,7 @@ impl TabState {
             ws_messages: Vec::new(),
             ws_input: String::new(),
             ws_auto_scroll: true,
-            ws_command_tx: None,
+            ws_connection: None,
         }
     }
 
@@ -845,15 +841,16 @@ impl CrabiPie {
     }
 
     // Helper function to connect
-    async fn connect_websocket(
+    async fn connect_ws(
         url: &str,
-    ) -> Result<reqwest_websocket::WebSocket, Box<dyn std::error::Error + Send + Sync>> {
-        use reqwest_websocket::RequestBuilderExt;
+    ) -> Result<(reqwest_websocket::WebSocket, mpsc::Receiver<String>), Box<dyn std::error::Error>>
+    {
         let response = reqwest::Client::new().get(url).upgrade().send().await?;
 
         let websocket = response.into_websocket().await?;
+        let (sender, receiver) = mpsc::channel(100);
 
-        Ok(websocket)
+        Ok((websocket, receiver))
     }
 
     fn add_ws_system_message(&mut self, content: &str) {
@@ -2171,29 +2168,21 @@ impl CrabiPie {
 
     fn subscription(&self) -> iced::Subscription<Message> {
         let mut subscriptions = vec![self.svg_rotation_subscription(), self.event_subscription()];
-        // Add WebSocket subscription for the active tab
         if self.current_tab().request_type == RequestType::WebSocket
-            && self.current_tab().ws_connected
+            && self.current_tab().ws_connection.is_some()
         {
             let url = self.current_tab().url.clone();
 
-            subscriptions.push(iced::advanced::subscription::from_recipe(WebSocketRecipe {
-                url,
-            }));
+            subscriptions.push(Self::websocket_subscription(url));
         }
-
         iced::Subscription::batch(subscriptions)
     }
 
-    fn websocket_subscription(&self) -> iced::Subscription<Message> {
-        iced::Subscription::run(|| {
-            futures::stream::unfold((), |_| async {
-                // Placeholder
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                Some((Message::Tick, ()))
-            })
-        })
+    fn websocket_subscription(url: String) -> iced::Subscription<Message> {
+        iced::advanced::subscription::from_recipe(WebSocketRecipe { url })
+            .map(|event| Message::WsEvent(event))
     }
+
     fn svg_rotation_subscription(&self) -> iced::Subscription<Message> {
         if self.current_tab().loading {
             iced::time::every(std::time::Duration::from_millis(5)).map(|_| Message::Tick)
@@ -2905,6 +2894,8 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
             app.current_tab_mut().loading = true;
             app.current_tab_mut().ws_connected = true;
+            let (tx, _rx) = mpsc::channel(100);
+            app.current_tab_mut().ws_connection = Some(WsConnection(tx));
             app.add_ws_system_message(&format!("Connecting to {}...", url));
 
             iced::Task::none()
@@ -2919,8 +2910,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
         Message::WsEvent(event) => {
             match event {
-                WsEvent::Connected => {
+                WsEvent::Connected(connection) => {
                     app.current_tab_mut().loading = false;
+                    app.current_tab_mut().ws_connection = Some(connection);
                     app.add_ws_system_message("Connected successfully");
                 }
                 WsEvent::Disconnected(reason) => {
@@ -2976,7 +2968,11 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
         app.render_title_row(),
         app.render_tabs(),
         rule::horizontal(1.0),
-        app.render_active_tab_content()
+        if app.current_tab().request_type == RequestType::WebSocket {
+            app.render_websocket_panel()
+        } else {
+            app.render_active_tab_content()
+        }
     ];
 
     let main_content: Element<'_, Message> = if app.find_dialog_open {
@@ -3021,7 +3017,7 @@ struct WebSocketRecipe {
 }
 
 impl iced::advanced::subscription::Recipe for WebSocketRecipe {
-    type Output = Message;
+    type Output = WsEvent;
 
     fn hash(&self, state: &mut iced::advanced::subscription::Hasher) {
         use std::hash::Hash;
@@ -3034,90 +3030,114 @@ impl iced::advanced::subscription::Recipe for WebSocketRecipe {
             Box<dyn futures::Stream<Item = iced::advanced::subscription::Event> + Send>,
         >,
     ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Self::Output> + Send>> {
-        use futures::TryStreamExt;
         use futures::stream::StreamExt;
 
         let url = self.url.clone();
 
-        Box::pin(futures::stream::unfold(
-            None,
-            move |state: Option<reqwest_websocket::WebSocket>| {
-                let url = url.clone();
-
-                async move {
-                    // If we don't have a connection, create one
-                    if state.is_none() {
-                        match CrabiPie::connect_websocket(&url).await {
-                            Ok(websocket) => {
-                                return Some((
-                                    Message::WsEvent(WsEvent::Connected),
-                                    Some(websocket),
-                                ));
-                            }
-                            Err(e) => {
-                                // Wait before retry
-                                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                return Some((
-                                    Message::WsEvent(WsEvent::Error(format!(
-                                        "Connection failed: {}",
-                                        e
-                                    ))),
-                                    None,
-                                ));
-                            }
-                        }
-                    }
-
-                    // We have a connection, read from it
-                    if let Some(mut ws) = state {
-                        match ws.try_next().await {
-                            Ok(Some(reqwest_websocket::Message::Text(text))) => {
-                                return Some((
-                                    Message::WsEvent(WsEvent::MessageReceived(text)),
-                                    Some(ws),
-                                ));
-                            }
-                            Ok(Some(reqwest_websocket::Message::Binary(_data))) => {
-                                // Ignore binary messages for now
-                                return Some((
-                                    Message::WsEvent(WsEvent::MessageReceived(
-                                        "[Binary data]".to_string(),
-                                    )),
-                                    Some(ws),
-                                ));
-                            }
-                            Ok(None) => {
-                                // Connection closed
-                                return Some((
-                                    Message::WsEvent(WsEvent::Disconnected(
-                                        "Connection closed".to_string(),
-                                    )),
-                                    None,
-                                ));
-                            }
-                            Err(e) => {
-                                return Some((
-                                    Message::WsEvent(WsEvent::Error(format!("Read error: {}", e))),
-                                    None,
-                                ));
-                            }
-                            _ => {
-                                // Other message types (Ping, Pong, Close)
-                                return Some((
-                                    Message::WsEvent(WsEvent::MessageReceived(
-                                        "[Control frame]".to_string(),
-                                    )),
-                                    Some(ws),
-                                ));
-                            }
-                        }
-                    }
-
-                    None
-                }
-            },
-        ))
+        Box::pin(websocket_stream(url))
     }
+}
+
+// Create the actual stream function
+fn websocket_stream(url: String) -> impl futures::Stream<Item = WsEvent> {
+    use futures::sink::SinkExt;
+    use futures::stream::StreamExt;
+
+    futures::stream::unfold(WebSocketState::Disconnected, move |state| {
+        let url = url.clone();
+        async move {
+            match state {
+                WebSocketState::Disconnected => {
+                    // Try to connect
+                    match CrabiPie::connect_ws(&url).await {
+                        Ok((websocket, _)) => {
+                            let (sender, receiver) = mpsc::channel(100);
+                            let connection = WsConnection(sender);
+
+                            Some((
+                                WsEvent::Connected(connection),
+                                WebSocketState::Connected {
+                                    websocket,
+                                    receiver,
+                                },
+                            ))
+                        }
+                        Err(e) => {
+                            // tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            Some((
+                                WsEvent::Disconnected(format!("Connection failed: {}", e)),
+                                WebSocketState::Disconnected,
+                            ))
+                        }
+                    }
+                }
+                WebSocketState::Connected {
+                    mut websocket,
+                    mut receiver,
+                } => {
+                    // Use tokio::select! instead of futures::select!
+                    tokio::select! {
+                        // Receive from server
+                        result = websocket.next() => {
+                            match result {
+                                Some(Ok(reqwest_websocket::Message::Text(text))) => {
+                                    Some((
+                                        WsEvent::MessageReceived(text),
+                                        WebSocketState::Connected { websocket, receiver }
+                                    ))
+                                }
+                                Some(Err(e)) => {
+                                    Some((
+                                        WsEvent::Disconnected(format!("{}", e)),
+                                        WebSocketState::Disconnected
+                                    ))
+                                }
+                                None => {
+                                    Some((
+                                        WsEvent::Disconnected("Connection closed".to_string()),
+                                        WebSocketState::Disconnected
+                                    ))
+                                }
+                                _ => {
+                                    Some((
+                                        WsEvent::MessageReceived("[Other]".to_string()),
+                                        WebSocketState::Connected { websocket, receiver }
+                                    ))
+                                }
+                            }
+                        }
+
+                        // Send to server (from UI)
+                        Some(message) = receiver.next() => {
+                            match websocket.send(reqwest_websocket::Message::Text(message)).await {
+                                Ok(_) => {
+                                    Some((
+                                        WsEvent::MessageReceived("[Sent]".to_string()),
+                                        WebSocketState::Connected { websocket, receiver }
+                                    ))
+                                }
+                                Err(e) => {
+                                    Some((
+                                        WsEvent::Disconnected(format!("Send error: {}", e)),
+                                        WebSocketState::Disconnected
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+// State enum for the stream
+enum WebSocketState {
+    Disconnected,
+    Connected {
+        websocket: reqwest_websocket::WebSocket,
+        receiver: mpsc::Receiver<String>,
+    },
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
@@ -3357,32 +3377,6 @@ static HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::La
         .expect("failed to build http client")
 });
 
-trait Tab {
-    type Message;
-
-    fn title(&self) -> String;
-
-    fn tab_label(&self) -> iced_aw::TabLabel;
-
-    fn view(&self) -> Element<'_, Self::Message> {
-        let column = Column::new()
-            .spacing(20)
-            .push(iced::widget::Text::new(self.title()).size(HEADER_SIZE))
-            .push(self.content())
-            .align_x(iced::Alignment::Center);
-
-        iced::widget::container::Container::new(column)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(alignment::Horizontal::Center)
-            .align_y(alignment::Vertical::Center)
-            .padding(TAB_PADDING)
-            .into()
-    }
-
-    fn content(&self) -> Element<'_, Self::Message>;
-}
-
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 enum RequestTab {
     Body,
@@ -3397,30 +3391,9 @@ enum ResponseTab {
     Headers,
 }
 
-enum Icon {
-    User,
-    Heart,
-    Calc,
-    CogAlt,
-}
-
-impl From<Icon> for char {
-    fn from(icon: Icon) -> Self {
-        match icon {
-            Icon::User => '\u{E800}',
-            Icon::Heart => '\u{E801}',
-            Icon::Calc => '\u{F1EC}',
-            Icon::CogAlt => '\u{E802}',
-        }
-    }
-}
-
-const HEADER_SIZE: u32 = 32;
-const TAB_PADDING: u16 = 16;
-
 #[derive(Debug, Clone)]
 pub enum WsEvent {
-    Connected,
+    Connected(WsConnection),
     Disconnected(String),
     MessageReceived(String),
     Error(String),
@@ -3430,11 +3403,6 @@ pub enum WsCommand {
     Connect(String), // URL
     Disconnect,
     SendMessage(String),
-}
-
-struct WebSocketState {
-    sender: mpsc::UnboundedSender<WsCommand>,
-    receiver: mpsc::UnboundedReceiver<WsEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -3456,4 +3424,15 @@ struct WsMessageDisplay {
     timestamp: String,
     direction: MessageDirection,
     content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WsConnection(mpsc::Sender<String>);
+
+impl WsConnection {
+    pub fn send(&mut self, message: String) {
+        self.0
+            .try_send(message)
+            .expect("Send message through WebSocket");
+    }
 }
