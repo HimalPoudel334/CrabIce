@@ -788,7 +788,9 @@ impl CrabiPie {
                     col.push(message_row)
                 });
 
-        let messages_scroll = scrollable(messages_list).height(Length::Fill);
+        let messages_scroll = scrollable(messages_list)
+            .height(Length::Fill)
+            .width(Length::Fill);
 
         // Message input area
         let message_input = text_input("Type message...", &tab.ws_input)
@@ -843,8 +845,10 @@ impl CrabiPie {
     // Helper function to connect
     async fn connect_ws(
         url: &str,
-    ) -> Result<(reqwest_websocket::WebSocket, mpsc::Receiver<String>), Box<dyn std::error::Error>>
-    {
+    ) -> Result<
+        (reqwest_websocket::WebSocket, mpsc::Receiver<String>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let response = reqwest::Client::new().get(url).upgrade().send().await?;
 
         let websocket = response.into_websocket().await?;
@@ -2180,7 +2184,6 @@ impl CrabiPie {
 
     fn websocket_subscription(url: String) -> iced::Subscription<Message> {
         iced::advanced::subscription::from_recipe(WebSocketRecipe { url })
-            .map(|event| Message::WsEvent(event))
     }
 
     fn svg_rotation_subscription(&self) -> iced::Subscription<Message> {
@@ -2231,6 +2234,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     app.current_tab_mut().ws_messages = Vec::new();
                     app.current_tab_mut().ws_input = String::new();
                     app.current_tab_mut().ws_auto_scroll = true;
+                    app.current_tab_mut().url = "wss://echo.websocket.org".to_string()
                 }
                 _ => {
                     app.current_tab_mut().response_body_content =
@@ -2304,7 +2308,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         None => Message::FileSaved(Err("Save dialog cancelled".to_string())),
                     }
                 },
-                |message| message, // Pass through the message
+                |message| message,
             )
         }
         Message::FileSaved(result) => {
@@ -2424,14 +2428,14 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::ResponseBodyAction(action) => {
             match action {
-                text_editor::Action::Edit(edit) => {}
+                text_editor::Action::Edit(_) => {}
                 _ => app.current_tab_mut().response_body_content.perform(action),
             };
             iced::Task::none()
         }
         Message::ResponseHeadersAction(action) => {
             match action {
-                text_editor::Action::Edit(edit) => {}
+                text_editor::Action::Edit(_) => {}
                 _ => app
                     .current_tab_mut()
                     .response_headers_content
@@ -2893,15 +2897,16 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
 
             app.current_tab_mut().loading = true;
-            app.current_tab_mut().ws_connected = true;
             let (tx, _rx) = mpsc::channel(100);
             app.current_tab_mut().ws_connection = Some(WsConnection(tx));
             app.add_ws_system_message(&format!("Connecting to {}...", url));
+            app.current_tab_mut().ws_connected = true;
 
             iced::Task::none()
         }
 
         Message::WsDisconnect => {
+            app.current_tab_mut().ws_connection = None;
             app.current_tab_mut().ws_connected = false;
             app.current_tab_mut().loading = false;
             app.add_ws_system_message("Disconnected");
@@ -2916,6 +2921,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     app.add_ws_system_message("Connected successfully");
                 }
                 WsEvent::Disconnected(reason) => {
+                    app.current_tab_mut().ws_connection = None;
                     app.current_tab_mut().loading = false;
                     app.current_tab_mut().ws_connected = false;
                     app.add_ws_system_message(&format!("Disconnected: {}", reason));
@@ -2946,6 +2952,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
                 // TODO: We need to send this to the WebSocket
                 // This requires a channel from UI to subscription
+                if let Some(conn) = app.current_tab_mut().ws_connection.as_mut() {
+                    conn.send(message);
+                }
             }
 
             iced::Task::none()
@@ -3017,7 +3026,7 @@ struct WebSocketRecipe {
 }
 
 impl iced::advanced::subscription::Recipe for WebSocketRecipe {
-    type Output = WsEvent;
+    type Output = Message;
 
     fn hash(&self, state: &mut iced::advanced::subscription::Hasher) {
         use std::hash::Hash;
@@ -3030,8 +3039,6 @@ impl iced::advanced::subscription::Recipe for WebSocketRecipe {
             Box<dyn futures::Stream<Item = iced::advanced::subscription::Event> + Send>,
         >,
     ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Self::Output> + Send>> {
-        use futures::stream::StreamExt;
-
         let url = self.url.clone();
 
         Box::pin(websocket_stream(url))
@@ -3039,15 +3046,25 @@ impl iced::advanced::subscription::Recipe for WebSocketRecipe {
 }
 
 // Create the actual stream function
-fn websocket_stream(url: String) -> impl futures::Stream<Item = WsEvent> {
+fn websocket_stream(url: String) -> impl futures::Stream<Item = Message> {
     use futures::sink::SinkExt;
     use futures::stream::StreamExt;
 
-    futures::stream::unfold(WebSocketState::Disconnected, move |state| {
+    futures::stream::unfold((WebSocketState::Disconnected, 0), move |state| {
         let url = url.clone();
         async move {
             match state {
-                WebSocketState::Disconnected => {
+                (WebSocketState::Disconnected, retry_count) => {
+                    // Stop retrying after 3 attempts
+                    if retry_count >= 3 {
+                        return Some((
+                                Message::WsEvent(WsEvent::Error(
+                                    "Failed to connect after 3 attempts. Please check the URL and try again.".to_string()
+                                )),
+                                (WebSocketState::Failed, retry_count)
+                            ));
+                    }
+
                     // Try to connect
                     match CrabiPie::connect_ws(&url).await {
                         Ok((websocket, _)) => {
@@ -3055,71 +3072,82 @@ fn websocket_stream(url: String) -> impl futures::Stream<Item = WsEvent> {
                             let connection = WsConnection(sender);
 
                             Some((
-                                WsEvent::Connected(connection),
-                                WebSocketState::Connected {
-                                    websocket,
-                                    receiver,
-                                },
+                                Message::WsEvent(WsEvent::Connected(connection)),
+                                (
+                                    WebSocketState::Connected {
+                                        websocket,
+                                        receiver,
+                                    },
+                                    0,
+                                ),
                             ))
                         }
                         Err(e) => {
-                            // tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                             Some((
-                                WsEvent::Disconnected(format!("Connection failed: {}", e)),
-                                WebSocketState::Disconnected,
+                                Message::WsEvent(WsEvent::Error(format!(
+                                    "Connection attempt {} failed: {}",
+                                    retry_count + 1,
+                                    e
+                                ))),
+                                (WebSocketState::Disconnected, retry_count + 1),
                             ))
                         }
                     }
                 }
-                WebSocketState::Connected {
-                    mut websocket,
-                    mut receiver,
-                } => {
-                    // Use tokio::select! instead of futures::select!
+                (WebSocketState::Failed, retry_count) => {
+                    // Stop the stream - no more retries
+                    None
+                }
+                (
+                    WebSocketState::Connected {
+                        mut websocket,
+                        mut receiver,
+                    },
+                    _,
+                ) => {
                     tokio::select! {
-                        // Receive from server
                         result = websocket.next() => {
                             match result {
                                 Some(Ok(reqwest_websocket::Message::Text(text))) => {
                                     Some((
-                                        WsEvent::MessageReceived(text),
-                                        WebSocketState::Connected { websocket, receiver }
+                                        Message::WsEvent(WsEvent::MessageReceived(text)),
+                                        (WebSocketState::Connected { websocket, receiver }, 0)
                                     ))
                                 }
                                 Some(Err(e)) => {
                                     Some((
-                                        WsEvent::Disconnected(format!("{}", e)),
-                                        WebSocketState::Disconnected
+                                        Message::WsEvent(WsEvent::Disconnected(format!("{}", e))),
+                                        (WebSocketState::Failed, 0) // Don't retry on disconnection
                                     ))
                                 }
                                 None => {
                                     Some((
-                                        WsEvent::Disconnected("Connection closed".to_string()),
-                                        WebSocketState::Disconnected
+                                        Message::WsEvent(WsEvent::Disconnected("Connection closed".to_string())),
+                                        (WebSocketState::Failed, 0)
                                     ))
                                 }
                                 _ => {
                                     Some((
-                                        WsEvent::MessageReceived("[Other]".to_string()),
-                                        WebSocketState::Connected { websocket, receiver }
+                                        Message::WsEvent(WsEvent::MessageReceived("[Other]".to_string())),
+                                        (WebSocketState::Connected { websocket, receiver }, 0)
                                     ))
                                 }
                             }
                         }
 
-                        // Send to server (from UI)
                         Some(message) = receiver.next() => {
                             match websocket.send(reqwest_websocket::Message::Text(message)).await {
                                 Ok(_) => {
                                     Some((
-                                        WsEvent::MessageReceived("[Sent]".to_string()),
-                                        WebSocketState::Connected { websocket, receiver }
+                                        Message::WsEvent(WsEvent::MessageReceived("[Sent]".to_string())),
+                                        (WebSocketState::Connected { websocket, receiver }, 0)
                                     ))
                                 }
                                 Err(e) => {
                                     Some((
-                                        WsEvent::Disconnected(format!("Send error: {}", e)),
-                                        WebSocketState::Disconnected
+                                        Message::WsEvent(WsEvent::Disconnected(format!("Send error: {}", e))),
+                                        (WebSocketState::Failed, 0)
                                     ))
                                 }
                             }
@@ -3138,6 +3166,7 @@ enum WebSocketState {
         websocket: reqwest_websocket::WebSocket,
         receiver: mpsc::Receiver<String>,
     },
+    Failed,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
