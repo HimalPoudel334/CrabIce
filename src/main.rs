@@ -22,6 +22,7 @@ mod json_highlighter;
 
 #[derive(Debug, Clone)]
 enum Message {
+    NoOp,
     //Tabs
     AddNewTab,
     TabSelected(usize),
@@ -199,6 +200,7 @@ struct TabState {
     active_request_tab: RequestTab,
     active_response_tab: ResponseTab,
     copied: bool,
+    ws_connection_id: usize,
 }
 
 impl TabState {
@@ -243,6 +245,7 @@ impl TabState {
             ws_input: String::new(),
             ws_auto_scroll: true,
             ws_connection: None,
+            ws_connection_id: 0,
         }
     }
 
@@ -290,6 +293,7 @@ impl TabState {
             ws_input: String::new(),
             ws_auto_scroll: true,
             ws_connection: None,
+            ws_connection_id: 0,
         }
     }
 
@@ -845,16 +849,10 @@ impl CrabiPie {
     // Helper function to connect
     async fn connect_ws(
         url: &str,
-    ) -> Result<
-        (reqwest_websocket::WebSocket, mpsc::Receiver<String>),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<reqwest_websocket::WebSocket, Box<dyn std::error::Error + Send + Sync>> {
         let response = reqwest::Client::new().get(url).upgrade().send().await?;
-
         let websocket = response.into_websocket().await?;
-        let (sender, receiver) = mpsc::channel(100);
-
-        Ok((websocket, receiver))
+        Ok(websocket)
     }
 
     fn add_ws_system_message(&mut self, content: &str) {
@@ -2173,17 +2171,23 @@ impl CrabiPie {
     fn subscription(&self) -> iced::Subscription<Message> {
         let mut subscriptions = vec![self.svg_rotation_subscription(), self.event_subscription()];
         if self.current_tab().request_type == RequestType::WebSocket
-            && self.current_tab().ws_connection.is_some()
+            && self.current_tab().ws_connection_id > 0
         {
             let url = self.current_tab().url.clone();
-
-            subscriptions.push(Self::websocket_subscription(url));
+            subscriptions.push(Self::websocket_subscription(
+                self.current_tab().ws_connection_id,
+                url,
+            ));
         }
+
         iced::Subscription::batch(subscriptions)
     }
 
-    fn websocket_subscription(url: String) -> iced::Subscription<Message> {
-        iced::advanced::subscription::from_recipe(WebSocketRecipe { url })
+    fn websocket_subscription(ws_connection_id: usize, url: String) -> iced::Subscription<Message> {
+        iced::advanced::subscription::from_recipe(WebSocketRecipe {
+            ws_connection_id,
+            url,
+        })
     }
 
     fn svg_rotation_subscription(&self) -> iced::Subscription<Message> {
@@ -2201,6 +2205,7 @@ impl CrabiPie {
 
 fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
     match message {
+        Message::NoOp => iced::Task::none(),
         Message::TabSelected(index) => {
             app.active_tab = index;
             iced::Task::none()
@@ -2897,15 +2902,14 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
 
             app.current_tab_mut().loading = true;
-            let (tx, _rx) = mpsc::channel(100);
-            app.current_tab_mut().ws_connection = Some(WsConnection(tx));
+            app.current_tab_mut().ws_connection_id += 1;
             app.add_ws_system_message(&format!("Connecting to {}...", url));
-            app.current_tab_mut().ws_connected = true;
 
             iced::Task::none()
         }
 
         Message::WsDisconnect => {
+            app.current_tab_mut().ws_connection_id = 0;
             app.current_tab_mut().ws_connection = None;
             app.current_tab_mut().ws_connected = false;
             app.current_tab_mut().loading = false;
@@ -2917,6 +2921,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             match event {
                 WsEvent::Connected(connection) => {
                     app.current_tab_mut().loading = false;
+                    app.current_tab_mut().ws_connected = true;
                     app.current_tab_mut().ws_connection = Some(connection);
                     app.add_ws_system_message("Connected successfully");
                 }
@@ -2950,8 +2955,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 app.add_ws_sent_message(&message);
                 app.current_tab_mut().ws_input.clear();
 
-                // TODO: We need to send this to the WebSocket
-                // This requires a channel from UI to subscription
                 if let Some(conn) = app.current_tab_mut().ws_connection.as_mut() {
                     conn.send(message);
                 }
@@ -3022,6 +3025,7 @@ const BODY_DEFAULT: &str = r#"{
 
 #[derive(Debug, Hash, Clone)]
 struct WebSocketRecipe {
+    ws_connection_id: usize,
     url: String,
 }
 
@@ -3030,7 +3034,7 @@ impl iced::advanced::subscription::Recipe for WebSocketRecipe {
 
     fn hash(&self, state: &mut iced::advanced::subscription::Hasher) {
         use std::hash::Hash;
-        self.url.hash(state);
+        self.ws_connection_id.hash(state);
     }
 
     fn stream(
@@ -3067,7 +3071,7 @@ fn websocket_stream(url: String) -> impl futures::Stream<Item = Message> {
 
                     // Try to connect
                     match CrabiPie::connect_ws(&url).await {
-                        Ok((websocket, _)) => {
+                        Ok(websocket) => {
                             let (sender, receiver) = mpsc::channel(100);
                             let connection = WsConnection(sender);
 
@@ -3136,14 +3140,12 @@ fn websocket_stream(url: String) -> impl futures::Stream<Item = Message> {
                             }
                         }
 
-                        Some(message) = receiver.next() => {
+                        Some(message) = receiver.next() => { //ui related
                             match websocket.send(reqwest_websocket::Message::Text(message)).await {
-                                Ok(_) => {
-                                    Some((
-                                        Message::WsEvent(WsEvent::MessageReceived("[Sent]".to_string())),
-                                        (WebSocketState::Connected { websocket, receiver }, 0)
-                                    ))
-                                }
+                                Ok(_) => Some((
+                                    Message::NoOp,
+                                    (WebSocketState::Connected { websocket, receiver }, 0)
+                                )),
                                 Err(e) => {
                                     Some((
                                         Message::WsEvent(WsEvent::Disconnected(format!("Send error: {}", e))),
