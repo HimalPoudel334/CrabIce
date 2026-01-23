@@ -122,7 +122,7 @@ enum Message {
 }
 
 struct CrabiPie {
-    // Tab management
+    // Tab managemen
     tabs: Vec<TabState>,
     active_tab: usize,
     next_tab_id: usize,
@@ -144,9 +144,9 @@ struct CrabiPie {
     total_matches: usize,
 
     // For highlighter
-    search_match_positions: Vec<(usize, usize)>, // All matches as (line, col)
-    current_match_line_col: Option<(usize, usize)>, // Current match as (line, col)
-    search_match_length: usize,                  // Length of search term in characters
+    search_match_positions: Vec<(usize, usize)>,
+    current_match_line_col: Option<(usize, usize)>,
+    search_match_length: usize,
 }
 
 struct TabState {
@@ -363,6 +363,10 @@ impl CrabiPie {
             },
             iced::Task::none(),
         )
+    }
+
+    fn title(&self) -> String {
+        "CrabIce".to_string()
     }
 
     fn current_tab(&self) -> &TabState {
@@ -3009,10 +3013,17 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
 }
 
 fn main() -> iced::Result {
+    let icon_bytes = include_bytes!("../CrabIce.ico");
     iced::application(CrabiPie::new, update, view)
         .theme(|app: &CrabiPie| app.app_theme.clone())
         .subscription(|app| app.subscription())
-        .window_size(iced::Size::new(1500.0, 800.0))
+        .title(|app: &CrabiPie| app.title())
+        .window(iced::window::Settings {
+            size: iced::Size::new(1500.0, 800.0),
+            icon: iced::window::icon::from_file_data(icon_bytes, None).ok(), //rather than adding
+            //iamge dependency , just let the function determine the file type in runtime
+            ..Default::default()
+        })
         .run()
 }
 
