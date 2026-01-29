@@ -769,7 +769,7 @@ impl CrabiPie {
 
         let connection_row = row![url_input, connect_button, clear_button, status_text,]
             .spacing(10)
-            .padding(10)
+            .padding(Padding::new(0.0).top(10.0))
             .align_y(Alignment::Center);
 
         // Message display area
@@ -788,7 +788,16 @@ impl CrabiPie {
                             .size(11)
                             .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
                         text(prefix).size(14).color(color),
-                        text(&msg.content).size(13),
+                        text_input("", &msg.content)
+                            .size(13)
+                            .style(|t: &iced::Theme, s| text_input::Style {
+                                border: Border {
+                                    width: 0.0,
+                                    ..Default::default()
+                                },
+                                background: iced::Background::Color(t.palette().background),
+                                ..text_input::default(t, s)
+                            }),
                     ]
                     .spacing(10)
                     .align_y(Alignment::Center);
@@ -797,14 +806,16 @@ impl CrabiPie {
                 });
 
         let messages_scroll = scrollable(messages_list)
+            .id("messages")
             .height(Length::Fill)
-            .width(Length::Fill);
+            .width(Length::Fill)
+            .anchor_bottom();
 
         // Message input area
         let message_input = text_input("Type message...", &tab.ws_input)
             .on_input(Message::WsMessageInputChanged)
             .on_submit(Message::WsSendMessage)
-            .padding(10)
+            .padding(8)
             .width(Length::Fill);
 
         let send_button = button(text("Send").size(14))
@@ -816,7 +827,7 @@ impl CrabiPie {
             .padding(10)
             .style(button::primary);
 
-        let input_row = row![message_input, send_button].spacing(10).padding(10);
+        let input_row = row![message_input, send_button].spacing(10);
 
         // Stats
         let stats = text(format!(
@@ -842,11 +853,19 @@ impl CrabiPie {
             container(messages_scroll)
                 .height(Length::Fill)
                 .padding(10)
-                .style(container::bordered_box),
+                .style(|th| container::Style {
+                    background: Some(iced::Background::Color(th.palette().background)),
+                    border: Border {
+                        width: 1.0,
+                        color: th.extended_palette().background.weak.color,
+                        radius: 5.0.into()
+                    },
+                    ..Default::default()
+                }),
             stats_row,
             input_row,
         ]
-        .spacing(0)
+        .spacing(10)
         .into()
     }
 
@@ -1704,31 +1723,34 @@ impl CrabiPie {
             }
             body_column.into()
         } else {
-            text_editor(&self.current_tab().response_body_content)
-                .on_action(Message::ResponseBodyAction)
-                .highlight_with::<json_highlighter::JsonHighlighter>(
-                    self.get_highlighter_settings(),
-                    |highlight, _theme| {
-                        let color = match highlight {
-                            json_highlighter::HighlightType::Syntax(color) => *color,
-                            json_highlighter::HighlightType::SearchMatch => {
-                                println!("Rendering SearchMatch!");
-                                iced::Color::from_rgb(1.0, 1.0, 0.0) // Yellow
-                            }
-                            json_highlighter::HighlightType::CurrentMatch => {
-                                println!("Rendering CurrentMatch!");
-                                iced::Color::from_rgb(1.0, 0.0, 1.0) // Bright magneta - very obvious!
-                            }
-                        };
+            let content: Element<Message> = if self.current_tab().response_body_content.is_empty() {
+                space().into()
+            } else {
+                text_editor(&self.current_tab().response_body_content)
+                    .on_action(Message::ResponseBodyAction)
+                    .highlight_with::<json_highlighter::JsonHighlighter>(
+                        self.get_highlighter_settings(),
+                        |highlight, _theme| {
+                            let color = match highlight {
+                                json_highlighter::HighlightType::Syntax(color) => *color,
+                                json_highlighter::HighlightType::SearchMatch => {
+                                    iced::Color::from_rgb(1.0, 1.0, 0.0)
+                                }
+                                json_highlighter::HighlightType::CurrentMatch => {
+                                    iced::Color::from_rgb(1.0, 0.0, 1.0)
+                                }
+                            };
 
-                        iced::advanced::text::highlighter::Format {
-                            color: Some(color),
-                            font: None,
-                        }
-                    },
-                )
-                .height(Length::Fill)
-                .into()
+                            iced::advanced::text::highlighter::Format {
+                                color: Some(color),
+                                font: None,
+                            }
+                        },
+                    )
+                    .min_height(0)
+                    .into()
+            };
+            scrollable(content).into()
         }
     }
 
@@ -3065,7 +3087,7 @@ fn websocket_stream(url: String) -> impl futures::Stream<Item = Message> {
     use futures::sink::SinkExt;
     use futures::stream::StreamExt;
 
-    futures::stream::unfold((WebSocketState::Disconnected, 0), move |state| {
+    futures::stream::unfold((WebSocketState::Disconnected, 0 as u8), move |state| {
         let url = url.clone();
         async move {
             match state {
