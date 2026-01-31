@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use futures::channel::mpsc;
+use iced_aw::iced_aw_font::down_open;
 use reqwest_websocket::RequestBuilderExt;
 use std::sync::atomic::Ordering;
 
@@ -1190,29 +1191,32 @@ impl CrabiPie {
         .align_y(Alignment::Center);
 
         let editor_content = match self.current_tab().content_type {
-            ContentType::Json => text_editor(&self.current_tab().body_content)
-                .on_action(Message::BodyAction)
-                .highlight_with::<json_highlighter::JsonHighlighter>(
-                    self.get_highlighter_settings(),
-                    |highlight, _theme| {
-                        let color = match highlight {
-                            json_highlighter::HighlightType::Syntax(color) => *color,
-                            json_highlighter::HighlightType::SearchMatch => {
-                                iced::Color::from_rgb(1.0, 1.0, 0.0)
-                            }
-                            json_highlighter::HighlightType::CurrentMatch => {
-                                iced::Color::from_rgb(1.0, 0.5, 0.0)
-                            }
-                        };
+            ContentType::Json => scrollable(
+                text_editor(&self.current_tab().body_content)
+                    .on_action(Message::BodyAction)
+                    .highlight_with::<json_highlighter::JsonHighlighter>(
+                        self.get_highlighter_settings(),
+                        |highlight, _theme| {
+                            let color = match highlight {
+                                json_highlighter::HighlightType::Syntax(color) => *color,
+                                json_highlighter::HighlightType::SearchMatch => {
+                                    iced::Color::from_rgb(1.0, 1.0, 0.0)
+                                }
+                                json_highlighter::HighlightType::CurrentMatch => {
+                                    iced::Color::from_rgb(1.0, 0.5, 0.0)
+                                }
+                            };
 
-                        iced::advanced::text::highlighter::Format {
-                            color: Some(color),
-                            font: None,
-                        }
-                    },
-                )
-                .height(Length::Fill)
-                .into(),
+                            iced::advanced::text::highlighter::Format {
+                                color: Some(color),
+                                font: None,
+                            }
+                        },
+                    )
+                    .style(|theme, status| Self::get_editor_style(theme, status)),
+            )
+            .height(Length::Fill)
+            .into(),
             _ => self.render_form_data(),
         };
 
@@ -1531,24 +1535,28 @@ impl CrabiPie {
             Some(&self.json_theme),
             Message::JsonThemeChanged,
         ));
-        header_row = header_row.push(tooltip(
-            button(
-                text(if self.current_tab().copied {
-                    "✅"
+        if !self.current_tab().response_body_content.is_empty()
+            || !self.current_tab().response_headers_content.is_empty()
+        {
+            header_row = header_row.push(tooltip(
+                button(
+                    text(if self.current_tab().copied {
+                        "✅"
+                    } else {
+                        "📋"
+                    })
+                    .shaping(text::Shaping::Advanced),
+                )
+                .on_press(Message::CopyToClipboard)
+                .style(button::text),
+                if self.current_tab().copied {
+                    "Copied"
                 } else {
-                    "📋"
-                })
-                .shaping(text::Shaping::Advanced),
-            )
-            .on_press(Message::CopyToClipboard)
-            .style(button::text),
-            if self.current_tab().copied {
-                "Copied"
-            } else {
-                "Copy to Clipboard"
-            },
-            tooltip::Position::Bottom,
-        ));
+                    "Copy to Clipboard"
+                },
+                tooltip::Position::Bottom,
+            ));
+        }
 
         let res_tabs: iced_aw::Tabs<Message, ResponseTab, iced::Theme, iced::Renderer> =
             iced_aw::Tabs::new(Message::ResponseTabSelected)
@@ -1582,6 +1590,7 @@ impl CrabiPie {
                 },
                 ..Default::default()
             })
+            .height(Length::Fill)
             .padding(5.0)
             .into()
     }
@@ -1723,11 +1732,58 @@ impl CrabiPie {
             }
             body_column.into()
         } else {
-            let content: Element<Message> = if self.current_tab().response_body_content.is_empty() {
+            let content: Element<'_, Message> =
+                if self.current_tab().response_body_content.is_empty() {
+                    space().into()
+                } else {
+                    text_editor(&self.current_tab().response_body_content)
+                        .on_action(Message::ResponseBodyAction)
+                        .highlight_with::<json_highlighter::JsonHighlighter>(
+                            self.get_highlighter_settings(),
+                            |highlight, _theme| {
+                                let color = match highlight {
+                                    json_highlighter::HighlightType::Syntax(color) => *color,
+                                    json_highlighter::HighlightType::SearchMatch => {
+                                        iced::Color::from_rgb(1.0, 1.0, 0.0)
+                                    }
+                                    json_highlighter::HighlightType::CurrentMatch => {
+                                        iced::Color::from_rgb(1.0, 0.0, 1.0)
+                                    }
+                                };
+
+                                iced::advanced::text::highlighter::Format {
+                                    color: Some(color),
+                                    font: None,
+                                }
+                            },
+                        )
+                        .style(|theme: &iced::Theme, status| Self::get_editor_style(theme, status))
+                        .into()
+                };
+            scrollable(content).height(Length::FillPortion(1)).into()
+        }
+    }
+
+    fn get_editor_style(theme: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
+        let mut style = text_editor::Catalog::style(
+            theme,
+            &<iced::Theme as text_editor::Catalog>::default(),
+            status,
+        );
+        style.border = Border {
+            width: 0.0,
+            ..style.border
+        };
+        style
+    }
+
+    fn render_response_headers(&self) -> Element<'_, Message> {
+        let content: Element<'_, Message> =
+            if self.current_tab().response_headers_content.is_empty() {
                 space().into()
             } else {
-                text_editor(&self.current_tab().response_body_content)
-                    .on_action(Message::ResponseBodyAction)
+                text_editor(&self.current_tab().response_headers_content)
+                    .on_action(Message::ResponseHeadersAction)
                     .highlight_with::<json_highlighter::JsonHighlighter>(
                         self.get_highlighter_settings(),
                         |highlight, _theme| {
@@ -1737,7 +1793,7 @@ impl CrabiPie {
                                     iced::Color::from_rgb(1.0, 1.0, 0.0)
                                 }
                                 json_highlighter::HighlightType::CurrentMatch => {
-                                    iced::Color::from_rgb(1.0, 0.0, 1.0)
+                                    iced::Color::from_rgb(1.0, 0.5, 0.0)
                                 }
                             };
 
@@ -1747,37 +1803,11 @@ impl CrabiPie {
                             }
                         },
                     )
-                    .min_height(0)
+                    .style(|theme: &iced::Theme, status| Self::get_editor_style(theme, status))
                     .into()
             };
-            scrollable(content).into()
-        }
-    }
 
-    fn render_response_headers(&self) -> Element<'_, Message> {
-        text_editor(&self.current_tab().response_headers_content)
-            .on_action(Message::ResponseHeadersAction)
-            .highlight_with::<json_highlighter::JsonHighlighter>(
-                self.get_highlighter_settings(),
-                |highlight, _theme| {
-                    let color = match highlight {
-                        json_highlighter::HighlightType::Syntax(color) => *color,
-                        json_highlighter::HighlightType::SearchMatch => {
-                            iced::Color::from_rgb(1.0, 1.0, 0.0)
-                        }
-                        json_highlighter::HighlightType::CurrentMatch => {
-                            iced::Color::from_rgb(1.0, 0.5, 0.0)
-                        }
-                    };
-
-                    iced::advanced::text::highlighter::Format {
-                        color: Some(color),
-                        font: None,
-                    }
-                },
-            )
-            .height(Length::Fill)
-            .into()
+        scrollable(content).height(Length::FillPortion(1)).into()
     }
 
     fn loading_overlay(&self) -> Option<Element<'_, Message>> {
@@ -1819,9 +1849,7 @@ impl CrabiPie {
     ) -> Element<'a, Message> {
         let content = content.into();
         if let Some(overlay) = self.loading_overlay() {
-            iced::widget::stack![content, overlay]
-                .height(Length::Fill)
-                .into()
+            iced::widget::stack![content, overlay].into()
         } else {
             content
         }
@@ -3011,7 +3039,8 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
         } else {
             app.render_active_tab_content()
         }
-    ];
+    ]
+    .height(Length::Fill);
 
     let main_content: Element<'_, Message> = if app.find_dialog_open {
         let overlay = container(app.view_find_replace())
@@ -3031,7 +3060,10 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
         main_content.into()
     };
 
-    container(main_content).padding(10).into()
+    container(main_content)
+        .padding(10)
+        .height(Length::Fill)
+        .into()
 }
 
 fn main() -> iced::Result {
