@@ -83,6 +83,7 @@ enum Message {
     WsSendMessage,
     WsClearMessages,
     WsToggleAutoScroll,
+    WsMessageEditorAction(text_editor::Action),
 
     //Subscription
     Tick,
@@ -175,9 +176,11 @@ struct TabState {
     // WebSocket-specific fields
     ws_connected: bool,
     ws_connection: Option<WsConnection>,
-    ws_messages: Vec<WsMessageDisplay>,
     ws_auto_scroll: bool,
     ws_input: String,
+    ws_messages_content: text_editor::Content,
+    ws_count_sent: usize,
+    ws_count_received: usize,
 
     //image handle
     image_handle: Option<iced::widget::image::Handle>,
@@ -242,11 +245,13 @@ impl TabState {
             active_response_tab: ResponseTab::Body,
             copied: false,
             ws_connected: false,
-            ws_messages: Vec::new(),
             ws_input: String::new(),
             ws_auto_scroll: true,
             ws_connection: None,
             ws_connection_id: 0,
+            ws_messages_content: text_editor::Content::new(),
+            ws_count_sent: 0,
+            ws_count_received: 0,
         }
     }
 
@@ -290,11 +295,13 @@ impl TabState {
             active_response_tab: ResponseTab::Body,
             copied: false,
             ws_connected: false,
-            ws_messages: Vec::new(),
             ws_input: String::new(),
             ws_auto_scroll: true,
             ws_connection: None,
             ws_connection_id: 0,
+            ws_messages_content: text_editor::Content::new(),
+            ws_count_sent: 0,
+            ws_count_received: 0,
         }
     }
 
@@ -773,44 +780,38 @@ impl CrabiPie {
             .padding(Padding::new(0.0).top(10.0))
             .align_y(Alignment::Center);
 
-        // Message display area
-        let messages_list =
-            tab.ws_messages
-                .iter()
-                .fold(column![].spacing(8).padding(10), |col, msg| {
-                    let (prefix, color) = match msg.direction {
-                        MessageDirection::Sent => ("→", iced::Color::from_rgb(0.2, 0.6, 1.0)),
-                        MessageDirection::Received => ("←", iced::Color::from_rgb(0.0, 0.8, 0.0)),
-                        MessageDirection::System => ("•", iced::Color::from_rgb(0.6, 0.6, 0.6)),
-                    };
-
-                    let message_row = row![
-                        text(&msg.timestamp)
-                            .size(11)
-                            .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
-                        text(prefix).size(14).color(color),
-                        text_input("", &msg.content)
-                            .size(13)
-                            .style(|t: &iced::Theme, s| text_input::Style {
-                                border: Border {
-                                    width: 0.0,
-                                    ..Default::default()
-                                },
-                                background: iced::Background::Color(t.palette().background),
-                                ..text_input::default(t, s)
-                            }),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center);
-
-                    col.push(message_row)
-                });
-
-        let messages_scroll = scrollable(messages_list)
-            .id("messages")
+        let editor = text_editor(&tab.ws_messages_content)
+            .on_action(Message::WsMessageEditorAction)
+            .highlight_with::<json_highlighter::LogHighlighter>((), |color, _theme| {
+                iced::advanced::text::highlighter::Format {
+                    color: Some(*color),
+                    font: None, // Use default font
+                }
+            })
             .height(Length::Fill)
-            .width(Length::Fill)
-            .anchor_bottom();
+            .style(|theme: &iced::Theme, status| {
+                let mut style = text_editor::Catalog::style(
+                    theme,
+                    &<iced::Theme as text_editor::Catalog>::default(),
+                    status,
+                );
+                style.border.width = 0.0;
+                // style.background = iced::Background::Color(iced::Color::TRANSPARENT);
+                style
+            });
+
+        let messages_area = container(editor)
+            .height(Length::Fill)
+            .padding(10)
+            .style(|th| container::Style {
+                background: Some(iced::Background::Color(th.palette().background)),
+                border: Border {
+                    width: 1.0,
+                    color: th.extended_palette().background.weak.color,
+                    radius: 5.0.into(),
+                },
+                ..Default::default()
+            });
 
         // Message input area
         let message_input = text_input("Type message...", &tab.ws_input)
@@ -830,40 +831,18 @@ impl CrabiPie {
 
         let input_row = row![message_input, send_button].spacing(10);
 
-        // Stats
+        // Update stats to use the counters
         let stats = text(format!(
-            "Messages: {} | Sent: {} | Received: {}",
-            tab.ws_messages.len(),
-            tab.ws_messages
-                .iter()
-                .filter(|m| m.direction == MessageDirection::Sent)
-                .count(),
-            tab.ws_messages
-                .iter()
-                .filter(|m| m.direction == MessageDirection::Received)
-                .count(),
+            "Sent: {} | Received: {}",
+            tab.ws_count_sent, tab.ws_count_received
         ))
         .size(11)
         .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
-        let stats_row = container(stats).padding(5).center_x(Length::Fill);
-
-        // Combine everything
         column![
             connection_row,
-            container(messages_scroll)
-                .height(Length::Fill)
-                .padding(10)
-                .style(|th| container::Style {
-                    background: Some(iced::Background::Color(th.palette().background)),
-                    border: Border {
-                        width: 1.0,
-                        color: th.extended_palette().background.weak.color,
-                        radius: 5.0.into()
-                    },
-                    ..Default::default()
-                }),
-            stats_row,
+            messages_area,
+            container(stats).padding(5).center_x(Length::Fill),
             input_row,
         ]
         .spacing(10)
@@ -879,31 +858,33 @@ impl CrabiPie {
         Ok(websocket)
     }
 
-    fn add_ws_system_message(&mut self, content: &str) {
-        let msg = WsMessageDisplay {
-            timestamp: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
-            direction: MessageDirection::System,
-            content: content.to_string(),
-        };
-        self.current_tab_mut().ws_messages.push(msg);
+    fn add_to_log(&mut self, prefix: &str, message: &str) {
+        let tab = self.current_tab_mut();
+        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+        let formatted = format!("[{}] {} {}\n", timestamp, prefix, message);
+
+        tab.ws_messages_content
+            .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+
+        tab.ws_messages_content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new(formatted),
+            )));
     }
 
-    fn add_ws_sent_message(&mut self, content: &str) {
-        let msg = WsMessageDisplay {
-            timestamp: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
-            direction: MessageDirection::Sent,
-            content: content.to_string(),
-        };
-        self.current_tab_mut().ws_messages.push(msg);
+    pub fn add_ws_received_message(&mut self, content: &str) {
+        self.add_to_log("←", content);
+        self.current_tab_mut().ws_count_received += 1;
     }
 
-    fn add_ws_received_message(&mut self, content: &str) {
-        let msg = WsMessageDisplay {
-            timestamp: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
-            direction: MessageDirection::Received,
-            content: content.to_string(),
-        };
-        self.current_tab_mut().ws_messages.push(msg);
+    pub fn add_ws_system_message(&mut self, content: &str) {
+        self.add_to_log("•", content);
+    }
+
+    // Call this in your WsSendMessage logic
+    pub fn add_ws_sent_message(&mut self, content: &str) {
+        self.add_to_log("→", content);
+        self.current_tab_mut().ws_count_sent += 1;
     }
 }
 
@@ -1770,10 +1751,9 @@ impl CrabiPie {
             &<iced::Theme as text_editor::Catalog>::default(),
             status,
         );
-        style.border = Border {
-            width: 0.0,
-            ..style.border
-        };
+
+        style.border.width = 0.0;
+
         style
     }
 
@@ -2290,7 +2270,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     app.current_tab_mut().request_type = req_type;
                     // Initialize WebSocket state
                     app.current_tab_mut().ws_connected = false;
-                    app.current_tab_mut().ws_messages = Vec::new();
                     app.current_tab_mut().ws_input = String::new();
                     app.current_tab_mut().ws_auto_scroll = true;
                     app.current_tab_mut().url = "wss://echo.websocket.org".to_string()
@@ -3018,12 +2997,20 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
 
         Message::WsClearMessages => {
-            app.current_tab_mut().ws_messages.clear();
+            app.current_tab_mut().ws_messages_content = text_editor::Content::new();
+            app.current_tab_mut().ws_count_sent = 0;
+            app.current_tab_mut().ws_count_received = 0;
+
             iced::Task::none()
         }
 
         Message::WsToggleAutoScroll => {
             app.current_tab_mut().ws_auto_scroll = !app.current_tab().ws_auto_scroll;
+            iced::Task::none()
+        }
+
+        Message::WsMessageEditorAction(action) => {
+            app.current_tab_mut().ws_messages_content.perform(action);
             iced::Task::none()
         }
     }

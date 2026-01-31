@@ -421,3 +421,61 @@ impl std::fmt::Display for CustomJsonTheme {
         }
     }
 }
+
+pub struct LogHighlighter {
+    current_line: usize,
+}
+
+impl text::Highlighter for LogHighlighter {
+    type Settings = ();
+    type Highlight = Color;
+    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Self::Highlight)>;
+
+    fn new(_settings: &Self::Settings) -> Self {
+        Self { current_line: 0 }
+    }
+
+    fn update(&mut self, _new_settings: &Self::Settings) {
+        // No settings to update for this simple highlighter
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.current_line = line;
+    }
+
+    fn highlight_line<'a>(&mut self, line: &'a str) -> Self::Iterator<'a> {
+        let mut highlights = Vec::new();
+
+        if let Some(end_bracket) = line.find(']') {
+            highlights.push((0..end_bracket + 1, Color::from_rgb(0.5, 0.5, 0.5)));
+
+            let search_area = &line[end_bracket + 1..];
+            if let Some(relative_start) = search_area.find(|c: char| !c.is_whitespace()) {
+                let start = end_bracket + 1 + relative_start;
+
+                if let Some(prefix_char) = line[start..].chars().next() {
+                    let end = start + prefix_char.len_utf8();
+
+                    let prefix_color = match prefix_char {
+                        '→' => Color::from_rgb(0.2, 0.6, 1.0), // Blue
+                        '←' => Color::from_rgb(0.0, 0.8, 0.0), // Green
+                        '•' => Color::from_rgb(0.8, 0.8, 0.2),
+                        _ => Color::WHITE,
+                    };
+
+                    highlights.push((start..end, prefix_color));
+
+                    if end < line.len() {
+                        highlights.push((end..line.len(), Color::from_rgb(0.9, 0.9, 0.9)));
+                    }
+                }
+            }
+        }
+
+        highlights.into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.current_line
+    }
+}
