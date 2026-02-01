@@ -10,7 +10,7 @@ use iced::{
     Alignment, Border, Element, Event, Length, Padding, alignment,
     widget::{
         Column, Space, button, checkbox, column, container, pick_list, row, rule, scrollable,
-        space, text, text_editor, text_input, tooltip,
+        space, text, text_editor, text_editor::Content, text_input, tooltip,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -106,6 +106,9 @@ enum Message {
     FormFieldRemove(usize),
     FormFieldAdd,
     FormFieldToggled(usize),
+    ViewRawForm,
+    ViewFormattedForm,
+    FormRawAction(text_editor::Action),
 
     // Find/Replace messages
     ToggleFindDialog,
@@ -163,6 +166,7 @@ struct TabState {
     method: HttpMethod,
     headers: Vec<RequestHeaders>,
     body_content: text_editor::Content,
+    form_view_type: FormViewType,
     auth_type: AuthType,
     bearer_token: String,
     api_key_name: String,
@@ -171,6 +175,7 @@ struct TabState {
     content_type: ContentType,
     query_params: Vec<QueryParam>,
     form_data: Vec<FormField>,
+    raw_form_content: text_editor::Content,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     // WebSocket-specific fields
@@ -220,6 +225,7 @@ impl TabState {
             method: HttpMethod::GET,
             headers: RequestHeaders::default(),
             body_content: text_editor::Content::with_text(BODY_DEFAULT),
+            form_view_type: FormViewType::Formatted,
             auth_type: AuthType::None,
             bearer_token: String::new(),
             api_key_name: String::new(),
@@ -228,6 +234,7 @@ impl TabState {
             content_type: ContentType::Json,
             query_params: vec![QueryParam::new()],
             form_data: vec![FormField::new()],
+            raw_form_content: text_editor::Content::with_text(""),
             image_handle: None,
             video_player: None,
             video_state: None,
@@ -266,6 +273,7 @@ impl TabState {
             method: saved.method,
             headers: saved.headers,
             body_content: text_editor::Content::with_text(&saved.body),
+            form_view_type: saved.form_view_type,
             auth_type: saved.auth_type,
             bearer_token: saved.bearer_token,
             api_key_name: saved.api_key_name,
@@ -274,6 +282,7 @@ impl TabState {
             content_type: saved.content_type,
             query_params: saved.query_params,
             form_data: saved.form_data,
+            raw_form_content: text_editor::Content::with_text(&saved.raw_form_content),
             image_handle: None,
             video_player: None,
             video_state: None,
@@ -315,6 +324,7 @@ impl TabState {
             method: self.method.clone(),
             headers: self.headers.clone(),
             body: self.body_content.text(),
+            form_view_type: self.form_view_type,
             auth_type: self.auth_type.clone(),
             bearer_token: self.bearer_token.clone(),
             api_key_name: self.api_key_name.clone(),
@@ -323,6 +333,7 @@ impl TabState {
             content_type: self.content_type.clone(),
             query_params: self.query_params.clone(),
             form_data: self.form_data.clone(),
+            raw_form_content: self.raw_form_content.text(),
             json_theme: json_theme.to_string(),
             app_theme: app_theme.to_string(),
             response_status: if self.response_status.is_empty() {
@@ -341,6 +352,51 @@ impl TabState {
                 Some(self.response_body_content.text())
             },
         }
+    }
+
+    fn form_data_to_raw(form_data: &[FormField]) -> String {
+        form_data
+            .iter()
+            .filter_map(|f| {
+                if f.key.is_empty() && f.value.is_empty() {
+                    None
+                } else {
+                    let mut line = format!("{}: {}", f.key, f.value);
+                    if !f.enabled {
+                        line = format!("# {}", line);
+                    }
+                    Some(line)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn raw_to_form_data(raw: &str) -> Vec<FormField> {
+        raw.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+
+                let (enabled, content) = if let Some(rest) = line.strip_prefix('#') {
+                    (false, rest)
+                } else {
+                    (true, line)
+                };
+
+                let (key, value) = content.split_once(':')?;
+
+                Some(FormField {
+                    key: key.trim().to_string(),
+                    value: value.trim().to_string(),
+                    enabled,
+                    field_type: FormFieldType::Text,
+                    files: vec![],
+                })
+            })
+            .collect()
     }
 }
 
@@ -898,6 +954,7 @@ struct SavedState {
     method: HttpMethod,
     headers: Vec<RequestHeaders>,
     body: String,
+    form_view_type: FormViewType,
     auth_type: AuthType,
     bearer_token: String,
     api_key_name: String,
@@ -906,6 +963,7 @@ struct SavedState {
     content_type: ContentType,
     query_params: Vec<QueryParam>,
     form_data: Vec<FormField>,
+    raw_form_content: String,
     json_theme: String,
     app_theme: String,
 
@@ -927,6 +985,7 @@ impl Default for SavedState {
             method: HttpMethod::GET,
             headers: vec![RequestHeaders::new()],
             body: String::new(),
+            form_view_type: FormViewType::Formatted,
             auth_type: AuthType::None,
             api_key_position: ApiKeyPosition::Header,
             bearer_token: String::new(),
@@ -935,6 +994,7 @@ impl Default for SavedState {
             content_type: ContentType::Json,
             query_params: vec![QueryParam::new()],
             form_data: vec![FormField::new()],
+            raw_form_content: String::new(),
             json_theme: String::new(),
             app_theme: String::new(),
             response_status: None,
@@ -1028,7 +1088,7 @@ impl CrabiPie {
             Message::RequestTypeSelected,
         )
         .width(110)
-        .padding(10);
+        .padding(8);
 
         let method_picker = pick_list(
             &HttpMethod::ALL[..],
@@ -1036,12 +1096,12 @@ impl CrabiPie {
             Message::MethodSelected,
         )
         .width(100)
-        .padding(10);
+        .padding(8);
 
         let url_input = text_input("https://api.example.com/endpoint", &self.current_tab().url)
             .id(self.current_tab().url_id.clone())
             .on_input(Message::UrlChanged)
-            .size(20)
+            .size(16)
             .padding(8)
             .width(Length::Fill);
 
@@ -1053,7 +1113,7 @@ impl CrabiPie {
                     .width(Length::Fill),
             )
             .on_press(Message::CancelRequest)
-            .padding(10)
+            .padding(8)
             .width(100)
         } else {
             button(
@@ -1067,7 +1127,7 @@ impl CrabiPie {
             } else {
                 None
             })
-            .padding(10)
+            .padding(8)
             .width(100)
         };
 
@@ -1147,15 +1207,23 @@ impl CrabiPie {
             return text("Select POST, PUT, or PATCH to edit body.").into();
         }
 
-        let prettify_button: Element<'_, Message> =
+        let toggle_format_or_prettify_btn = button(text(
             if self.current_tab().content_type == ContentType::Json {
-                button(text("✨ Prettify").shaping(text::Shaping::Advanced))
-                    .on_press(Message::PrettifyJson)
-                    .style(button::text)
-                    .into()
+                "✨ Prettify"
+            } else if self.current_tab().form_view_type == FormViewType::Formatted {
+                "View raw"
             } else {
-                Space::new().into()
-            };
+                "View Formatted"
+            },
+        ))
+        .style(button::text)
+        .on_press(if self.current_tab().content_type == ContentType::Json {
+            Message::PrettifyJson
+        } else if self.current_tab().form_view_type == FormViewType::Formatted {
+            Message::ViewRawForm
+        } else {
+            Message::ViewFormattedForm
+        });
 
         let type_selector = row![
             text("Type:"),
@@ -1165,7 +1233,7 @@ impl CrabiPie {
                 Message::ContentTypeSelected
             ),
             space::horizontal(),
-            prettify_button,
+            toggle_format_or_prettify_btn,
         ]
         .height(20)
         .spacing(10)
@@ -1194,11 +1262,23 @@ impl CrabiPie {
                             }
                         },
                     )
-                    .style(|theme, status| Self::get_editor_style(theme, status)),
+                    .style(Self::get_editor_style),
             )
             .height(Length::Fill)
             .into(),
-            _ => self.render_form_data(),
+            ContentType::FormData | ContentType::XWWWFormUrlEncoded => {
+                match self.current_tab().form_view_type {
+                    FormViewType::Formatted => self.render_form_data(),
+                    FormViewType::Raw => scrollable(
+                        text_editor(&self.current_tab().raw_form_content)
+                            .placeholder(RAW_FORM_PLACEHOLDER)
+                            .on_action(Message::FormRawAction)
+                            .style(Self::get_editor_style)
+                            .min_height(200.0),
+                    )
+                    .into(),
+                }
+            }
         };
 
         column![type_selector, editor_content]
@@ -1738,7 +1818,8 @@ impl CrabiPie {
                                 }
                             },
                         )
-                        .style(|theme: &iced::Theme, status| Self::get_editor_style(theme, status))
+                        .wrapping(iced::advanced::text::Wrapping::Glyph)
+                        .style(Self::get_editor_style)
                         .into()
                 };
             scrollable(content).height(Length::FillPortion(1)).into()
@@ -2716,6 +2797,40 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.current_tab_mut().form_data.push(FormField::new());
             iced::Task::none()
         }
+        Message::ViewRawForm => {
+            let tab = app.current_tab_mut();
+
+            if matches!(
+                tab.content_type,
+                ContentType::FormData | ContentType::XWWWFormUrlEncoded
+            ) {
+                let raw = TabState::form_data_to_raw(&tab.form_data);
+                tab.raw_form_content = text_editor::Content::with_text(&raw);
+                tab.form_view_type = FormViewType::Raw;
+            }
+
+            iced::Task::none()
+        }
+        Message::ViewFormattedForm => {
+            let tab = app.current_tab_mut();
+
+            if matches!(
+                tab.content_type,
+                ContentType::FormData | ContentType::XWWWFormUrlEncoded
+            ) {
+                let raw = tab.raw_form_content.text();
+
+                tab.form_data = TabState::raw_to_form_data(&raw);
+                tab.form_view_type = FormViewType::Formatted;
+            }
+
+            iced::Task::none()
+        }
+        Message::FormRawAction(action) => {
+            app.current_tab_mut().raw_form_content.perform(action);
+
+            iced::Task::none()
+        }
         Message::ToggleFindDialog => {
             app.find_dialog_open = !app.find_dialog_open;
             iced::widget::operation::focus("find_input")
@@ -2940,7 +3055,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
             iced::Task::none()
         }
-
         Message::WsDisconnect => {
             app.current_tab_mut().ws_connection_id = 0;
             app.current_tab_mut().ws_connection = None;
@@ -2949,7 +3063,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.add_ws_system_message("Disconnected");
             iced::Task::none()
         }
-
         Message::WsEvent(event) => {
             match event {
                 WsEvent::Connected(connection) => {
@@ -2974,12 +3087,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::WsMessageInputChanged(text) => {
             app.current_tab_mut().ws_input = text;
             iced::Task::none()
         }
-
         Message::WsSendMessage => {
             // Note: Sending requires a different approach - see next section
             let message = app.current_tab().ws_input.clone();
@@ -2995,7 +3106,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
             iced::Task::none()
         }
-
         Message::WsClearMessages => {
             app.current_tab_mut().ws_messages_content = text_editor::Content::new();
             app.current_tab_mut().ws_count_sent = 0;
@@ -3003,12 +3113,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
             iced::Task::none()
         }
-
         Message::WsToggleAutoScroll => {
             app.current_tab_mut().ws_auto_scroll = !app.current_tab().ws_auto_scroll;
             iced::Task::none()
         }
-
         Message::WsMessageEditorAction(action) => {
             app.current_tab_mut().ws_messages_content.perform(action);
             iced::Task::none()
@@ -3074,6 +3182,11 @@ const BODY_DEFAULT: &str = r#"{
   "userId": 1,
   "foo": "bar"
 }"#;
+
+const RAW_FORM_PLACEHOLDER: &str = r#"Rows are separated by newline.
+Keys and values are separated by :
+Prepend # to the rows that you want to add but keep it disabled.
+"#;
 
 #[derive(Debug, Hash, Clone)]
 struct WebSocketRecipe {
@@ -3297,6 +3410,18 @@ impl ContentType {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+enum FormViewType {
+    Raw,
+    Formatted,
+}
+
+impl std::fmt::Display for FormViewType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "View {:?}", self)
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum FormFieldType {
     Text,
     File,
@@ -3304,10 +3429,7 @@ enum FormFieldType {
 
 impl std::fmt::Display for FormFieldType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FormFieldType::Text => write!(f, "Text"),
-            FormFieldType::File => write!(f, "File"),
-        }
+        write!(f, "{:?}", self)
     }
 }
 
