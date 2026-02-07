@@ -84,6 +84,8 @@ enum Message {
     WsClearMessages,
     WsToggleAutoScroll,
     WsMessageEditorAction(text_editor::Action),
+    WsMessageTypeSelected(WsMessageType),
+    WsBinaryMessageTypeSelected(WsBinaryMessageType),
 
     //Subscription
     Tick,
@@ -160,7 +162,6 @@ struct TabState {
 
     // Request configuration
     url_id: iced::widget::Id,
-    base_url: String,
     url: String,
     request_type: RequestType,
     method: HttpMethod,
@@ -186,6 +187,8 @@ struct TabState {
     ws_messages_content: text_editor::Content,
     ws_count_sent: usize,
     ws_count_received: usize,
+    ws_message_type: WsMessageType,
+    ws_binary_message_type: WsBinaryMessageType,
 
     //image handle
     image_handle: Option<iced::widget::image::Handle>,
@@ -214,13 +217,11 @@ struct TabState {
 
 impl TabState {
     fn new(id: usize) -> Self {
-        let base = "https://jsonplaceholder.typicode.com/posts".to_string();
         Self {
             id,
             title: format!("Request {}", id + 1),
             url_id: iced::widget::Id::unique(),
-            base_url: base.clone(),
-            url: base,
+            url: "https://jsonplaceholder.typicode.com/posts".to_string(),
             request_type: RequestType::HTTP,
             method: HttpMethod::GET,
             headers: RequestHeaders::default(),
@@ -259,6 +260,8 @@ impl TabState {
             ws_messages_content: text_editor::Content::new(),
             ws_count_sent: 0,
             ws_count_received: 0,
+            ws_message_type: WsMessageType::Text,
+            ws_binary_message_type: WsBinaryMessageType::Base64,
         }
     }
 
@@ -267,7 +270,6 @@ impl TabState {
             id: saved.id,
             title: saved.title,
             url_id: iced::widget::Id::unique(),
-            base_url: saved.base_url,
             url: saved.url,
             request_type: saved.request_type,
             method: saved.method,
@@ -311,6 +313,8 @@ impl TabState {
             ws_messages_content: text_editor::Content::new(),
             ws_count_sent: 0,
             ws_count_received: 0,
+            ws_message_type: saved.ws_message_type,
+            ws_binary_message_type: saved.ws_binary_message_type,
         }
     }
 
@@ -318,7 +322,6 @@ impl TabState {
         SavedState {
             id: self.id,
             title: self.title.clone(),
-            base_url: self.base_url.clone(),
             url: self.url.clone(),
             request_type: self.request_type.clone(),
             method: self.method.clone(),
@@ -351,6 +354,8 @@ impl TabState {
             } else {
                 Some(self.response_body_content.text())
             },
+            ws_message_type: self.ws_message_type,
+            ws_binary_message_type: self.ws_binary_message_type,
         }
     }
 
@@ -841,7 +846,7 @@ impl CrabiPie {
             .highlight_with::<json_highlighter::LogHighlighter>((), |color, _theme| {
                 iced::advanced::text::highlighter::Format {
                     color: Some(*color),
-                    font: None, // Use default font
+                    font: None,
                 }
             })
             .height(Length::Fill)
@@ -869,23 +874,47 @@ impl CrabiPie {
                 ..Default::default()
             });
 
+        let mut input_row = iced::widget::Row::new().spacing(10);
+
+        input_row = input_row.push(
+            pick_list(
+                &WsMessageType::ALL[..],
+                Some(self.current_tab().ws_message_type),
+                Message::WsMessageTypeSelected,
+            )
+            .padding(8),
+        );
+
+        if self.current_tab().ws_message_type == WsMessageType::Binary {
+            input_row = input_row.push(
+                pick_list(
+                    &WsBinaryMessageType::ALL[..],
+                    Some(self.current_tab().ws_binary_message_type),
+                    Message::WsBinaryMessageTypeSelected,
+                )
+                .padding(8),
+            );
+        }
+
         // Message input area
-        let message_input = text_input("Type message...", &tab.ws_input)
-            .on_input(Message::WsMessageInputChanged)
-            .on_submit(Message::WsSendMessage)
-            .padding(8)
-            .width(Length::Fill);
+        input_row = input_row.push(
+            text_input("Type message...", &tab.ws_input)
+                .on_input(Message::WsMessageInputChanged)
+                .on_submit(Message::WsSendMessage)
+                .padding(8)
+                .width(Length::Fill),
+        );
 
-        let send_button = button(text("Send").size(14))
-            .on_press_maybe(if is_connected && !tab.ws_input.is_empty() {
-                Some(Message::WsSendMessage)
-            } else {
-                None
-            })
-            .padding(10)
-            .style(button::primary);
-
-        let input_row = row![message_input, send_button].spacing(10);
+        input_row = input_row.push(
+            button(text("Send").size(14))
+                .on_press_maybe(if is_connected && !tab.ws_input.is_empty() {
+                    Some(Message::WsSendMessage)
+                } else {
+                    None
+                })
+                .padding(10)
+                .style(button::primary),
+        );
 
         // Update stats to use the counters
         let stats = text(format!(
@@ -948,7 +977,6 @@ impl CrabiPie {
 struct SavedState {
     id: usize,
     title: String,
-    base_url: String,
     url: String,
     request_type: RequestType,
     method: HttpMethod,
@@ -967,6 +995,9 @@ struct SavedState {
     json_theme: String,
     app_theme: String,
 
+    ws_message_type: WsMessageType,
+    ws_binary_message_type: WsBinaryMessageType,
+
     // Response (only when NOT binary)
     response_status: Option<String>,
     response_headers: Option<String>,
@@ -980,7 +1011,6 @@ impl Default for SavedState {
             id: 0,
             title: "Request-1".into(),
             url: base.clone(),
-            base_url: base,
             request_type: RequestType::HTTP,
             method: HttpMethod::GET,
             headers: vec![RequestHeaders::new()],
@@ -1000,6 +1030,8 @@ impl Default for SavedState {
             response_status: None,
             response_headers: None,
             response_body: None,
+            ws_message_type: WsMessageType::Text,
+            ws_binary_message_type: WsBinaryMessageType::Base64,
         }
     }
 }
@@ -1926,9 +1958,11 @@ impl CrabiPie {
     fn rebuild_url(&mut self) {
         use reqwest::Url;
 
-        let base = self.current_tab().base_url.trim_end_matches('?');
+        let current = self.current_tab().url.clone();
+        let mut url = Url::parse(&current).expect("invalid URL");
 
-        let mut url = Url::parse(base).expect("invalid base URL");
+        // wipe existing query completely
+        url.set_query(None);
 
         {
             let mut pairs = url.query_pairs_mut();
@@ -1944,7 +1978,6 @@ impl CrabiPie {
 
     fn parse_url_query(&mut self) {
         let tab = self.current_tab_mut();
-
         tab.query_params.clear();
 
         if let Some(q_index) = tab.url.find('?') {
@@ -2643,14 +2676,17 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::QueryParamKeyChanged(idx, key) => {
             app.update_query(idx, |p| p.key = key);
+            app.rebuild_url();
             iced::Task::none()
         }
         Message::QueryParamValueChanged(idx, value) => {
             app.update_query(idx, |p| p.value = value);
+            app.rebuild_url();
             iced::Task::none()
         }
         Message::QueryParamToggled(idx) => {
             app.update_query(idx, |p| p.enabled = !p.enabled);
+            app.rebuild_url();
             iced::Task::none()
         }
         Message::FormFieldKeyChanged(index, key) => {
@@ -3119,6 +3155,14 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::WsMessageEditorAction(action) => {
             app.current_tab_mut().ws_messages_content.perform(action);
+            iced::Task::none()
+        }
+        Message::WsMessageTypeSelected(msg_type) => {
+            app.current_tab_mut().ws_message_type = msg_type;
+            iced::Task::none()
+        }
+        Message::WsBinaryMessageTypeSelected(msg_type) => {
+            app.current_tab_mut().ws_binary_message_type = msg_type;
             iced::Task::none()
         }
     }
@@ -3640,4 +3684,46 @@ impl WsConnection {
             .try_send(message)
             .expect("Send message through WebSocket");
     }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+enum WsMessageType {
+    Text,
+    Json,
+    Binary,
+    HTML,
+}
+
+impl std::fmt::Display for WsMessageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl WsMessageType {
+    const ALL: [WsMessageType; 4] = [
+        WsMessageType::Text,
+        WsMessageType::Json,
+        WsMessageType::Binary,
+        WsMessageType::HTML,
+    ];
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+enum WsBinaryMessageType {
+    Base64,
+    HexaDecimal,
+}
+
+impl std::fmt::Display for WsBinaryMessageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl WsBinaryMessageType {
+    const ALL: [WsBinaryMessageType; 2] = [
+        WsBinaryMessageType::Base64,
+        WsBinaryMessageType::HexaDecimal,
+    ];
 }
