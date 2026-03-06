@@ -125,6 +125,10 @@ enum Message {
     Replace,
     ReplaceAll,
 
+    // Saving state
+    StateLoaded(Option<AppPersistedState>),
+    SaveComplete,
+
     EventOccurred(Event),
 }
 
@@ -407,31 +411,31 @@ impl TabState {
 
 impl CrabiPie {
     fn new() -> (Self, iced::Task<Message>) {
-        (
-            Self {
-                tabs: vec![TabState::new(0)],
-                active_tab: 0,
-                next_tab_id: 1,
-                json_theme: json_highlighter::JsonThemeWrapper::Custom(
-                    json_highlighter::CustomJsonTheme::VSCODE_DARK,
-                ),
-                app_theme: iced::Theme::CatppuccinMocha,
-                svg_rotation: 0.0,
-                find_dialog_open: false,
-                find_replace_mode: false,
-                find_text: String::new(),
-                replace_text: String::new(),
-                case_sensitive: false,
-                whole_word: false,
-                current_match: 0,
-                current_match_pos: None,
-                total_matches: 0,
-                search_match_positions: Vec::new(),
-                current_match_line_col: None,
-                search_match_length: 0,
-            },
-            iced::Task::none(),
-        )
+        let app = Self {
+            tabs: vec![TabState::new(0)],
+            active_tab: 0,
+            next_tab_id: 1,
+            json_theme: json_highlighter::JsonThemeWrapper::Custom(
+                json_highlighter::CustomJsonTheme::VSCODE_DARK,
+            ),
+            app_theme: iced::Theme::CatppuccinMocha,
+            svg_rotation: 0.0,
+            find_dialog_open: false,
+            find_replace_mode: false,
+            find_text: String::new(),
+            replace_text: String::new(),
+            case_sensitive: false,
+            whole_word: false,
+            current_match: 0,
+            current_match_pos: None,
+            total_matches: 0,
+            search_match_positions: Vec::new(),
+            current_match_line_col: None,
+            search_match_length: 0,
+        };
+
+        let task = iced::Task::perform(load_app_state(), Message::StateLoaded);
+        (app, task)
     }
 
     fn title(&self) -> String {
@@ -970,6 +974,25 @@ impl CrabiPie {
     pub fn add_ws_sent_message(&mut self, content: &str) {
         self.add_to_log("→", content);
         self.current_tab_mut().ws_count_sent += 1;
+    }
+
+    fn save_task(&self) -> iced::Task<Message> {
+        let json_theme_str = self.json_theme.to_string();
+        let app_theme_str = self.app_theme.to_string();
+
+        let state = AppPersistedState {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|t| t.to_saved(&json_theme_str, &app_theme_str))
+                .collect(),
+            active_tab: self.active_tab,
+            json_theme: json_theme_str,
+            app_theme: app_theme_str,
+            next_tab_id: self.next_tab_id,
+        };
+
+        iced::Task::perform(save_app_state(state), |_| Message::SaveComplete)
     }
 }
 
@@ -2951,6 +2974,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             use iced::keyboard::{Event as KeyEvent, Key, Modifiers};
             if let Event::Window(window_event) = &event {
                 match window_event {
+                    iced::window::Event::CloseRequested => {
+                        // Save first, then close
+                        return app.save_task().chain(iced::exit());
+                    }
                     iced::window::Event::Unfocused => {
                         println!("window was unfocused");
                         return iced::Task::none();
@@ -3165,6 +3192,19 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.current_tab_mut().ws_binary_message_type = msg_type;
             iced::Task::none()
         }
+
+        Message::StateLoaded(maybe_state) => {
+            if let Some(saved) = maybe_state {
+                app.json_theme = json_theme_from_str(&saved.json_theme);
+                app.app_theme = theme_from_str(&saved.app_theme);
+                app.tabs = saved.tabs.into_iter().map(TabState::from_saved).collect();
+                app.next_tab_id = saved.next_tab_id;
+                app.active_tab = saved.active_tab.min(app.tabs.len().saturating_sub(1));
+            }
+            iced::Task::none()
+        }
+
+        Message::SaveComplete => iced::Task::none(),
     }
 }
 
@@ -3217,6 +3257,7 @@ fn main() -> iced::Result {
             //iamge dependency , just let the function determine the file type in runtime
             ..Default::default()
         })
+        .exit_on_close_request(false)
         .run()
 }
 
@@ -3726,4 +3767,95 @@ impl WsBinaryMessageType {
         WsBinaryMessageType::Base64,
         WsBinaryMessageType::HexaDecimal,
     ];
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppPersistedState {
+    tabs: Vec<SavedState>,
+    active_tab: usize,
+    json_theme: String,
+    app_theme: String,
+    next_tab_id: usize,
+}
+
+fn state_file_path() -> std::path::PathBuf {
+    let base = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE")) // Windows fallback
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(".")); // last resort: current dir
+
+    let dir = base.join(".crabipie");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("session.json")
+}
+
+async fn save_app_state(state: AppPersistedState) {
+    if let Ok(json) = serde_json::to_string_pretty(&state) {
+        tokio::fs::write(state_file_path(), json).await.ok();
+    }
+}
+
+async fn load_app_state() -> Option<AppPersistedState> {
+    let bytes = tokio::fs::read(state_file_path()).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn theme_from_str(s: &str) -> iced::Theme {
+    match s {
+        "Light" => iced::Theme::Light,
+        "Dark" => iced::Theme::Dark,
+        "Dracula" => iced::Theme::Dracula,
+        "Nord" => iced::Theme::Nord,
+        "Solarized Light" => iced::Theme::SolarizedLight,
+        "Solarized Dark" => iced::Theme::SolarizedDark,
+        "Gruvbox Light" => iced::Theme::GruvboxLight,
+        "Gruvbox Dark" => iced::Theme::GruvboxDark,
+        "Catppuccin Latte" => iced::Theme::CatppuccinLatte,
+        "Catppuccin Frappe" => iced::Theme::CatppuccinFrappe,
+        "Catppuccin Macchiato" => iced::Theme::CatppuccinMacchiato,
+        "Catppuccin Mocha" => iced::Theme::CatppuccinMocha,
+        "Tokyo Night" => iced::Theme::TokyoNight,
+        "Tokyo Night Storm" => iced::Theme::TokyoNightStorm,
+        "Tokyo Night Light" => iced::Theme::TokyoNightLight,
+        "Kanagawa Wave" => iced::Theme::KanagawaWave,
+        "Kanagawa Dragon" => iced::Theme::KanagawaDragon,
+        "Kanagawa Lotus" => iced::Theme::KanagawaLotus,
+        "Moonfly" => iced::Theme::Moonfly,
+        "Nightfly" => iced::Theme::Nightfly,
+        "Oxocarbon" => iced::Theme::Oxocarbon,
+        "Ferra" => iced::Theme::Ferra,
+        _ => iced::Theme::CatppuccinMocha, // default fallback
+    }
+}
+
+fn json_theme_from_str(s: &str) -> json_highlighter::JsonThemeWrapper {
+    match s {
+        "Base 16 Eighties" => {
+            json_highlighter::JsonThemeWrapper::Builtin(iced::highlighter::Theme::Base16Eighties)
+        }
+        "Base 16 Mocha" => {
+            json_highlighter::JsonThemeWrapper::Builtin(iced::highlighter::Theme::Base16Mocha)
+        }
+        "Base 16 Ocean" => {
+            json_highlighter::JsonThemeWrapper::Builtin(iced::highlighter::Theme::Base16Ocean)
+        }
+        "Solarized Dark" => {
+            json_highlighter::JsonThemeWrapper::Builtin(iced::highlighter::Theme::SolarizedDark)
+        }
+        "Inspired GitHub" => {
+            json_highlighter::JsonThemeWrapper::Builtin(iced::highlighter::Theme::InspiredGitHub)
+        }
+        "Default Dark" => json_highlighter::JsonThemeWrapper::Custom(
+            json_highlighter::CustomJsonTheme::DEFAULT_DARK,
+        ),
+        "Default Light" => json_highlighter::JsonThemeWrapper::Custom(
+            json_highlighter::CustomJsonTheme::DEFAULT_LIGHT,
+        ),
+        "VSCode Dark" => json_highlighter::JsonThemeWrapper::Custom(
+            json_highlighter::CustomJsonTheme::VSCODE_DARK,
+        ),
+        _ => json_highlighter::JsonThemeWrapper::Custom(
+            json_highlighter::CustomJsonTheme::VSCODE_DARK,
+        ),
+    }
 }
