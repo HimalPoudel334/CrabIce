@@ -53,7 +53,6 @@ enum Message {
     ResponseTabSelected(ResponseTab),
     ResponseBodyAction(text_editor::Action),
     ResponseHeadersAction(text_editor::Action),
-    ToggleLayout,
     PrettifyJson,
     JsonPrettified(Result<String, String>),
     CopyToClipboard,
@@ -129,6 +128,26 @@ enum Message {
     StateLoaded(Option<AppPersistedState>),
     SaveComplete,
 
+    // Sidebar
+    ToggleSidebar,
+    CollectionLoaded(Option<Collection>),
+    CollectionFolderAdd(Option<usize>), // parent id, None = root
+    CollectionItemToggleExpand(usize),
+    CollectionRequestOpen(usize),
+    CollectionItemRename(usize),
+    CollectionItemRenameInput(String),
+    CollectionItemRenameConfirm(usize),
+    CollectionItemRenameCancel,
+    CollectionItemDelete(usize),
+    CollectionItemDuplicate(usize),
+    // Save modal
+    OpenSaveModal,
+    SaveModalNameChanged(String),
+    SaveModalFolderSelected(Option<usize>),
+    SaveModalConfirm,
+    SaveModalCancel,
+    CollectionSaved,
+
     EventOccurred(Event),
 }
 
@@ -158,6 +177,17 @@ struct CrabiPie {
     search_match_positions: Vec<(usize, usize)>,
     current_match_line_col: Option<(usize, usize)>,
     search_match_length: usize,
+
+    // collection
+    sidebar_open: bool,
+    collection: Collection,
+    next_collection_id: usize,
+    sidebar_editing_id: Option<usize>,
+    sidebar_editing_name: String,
+    // Save to collection modal
+    save_modal_open: bool,
+    save_modal_name: String,
+    save_modal_folder_id: Option<usize>,
 }
 
 struct TabState {
@@ -432,9 +462,20 @@ impl CrabiPie {
             search_match_positions: Vec::new(),
             current_match_line_col: None,
             search_match_length: 0,
+            sidebar_open: false,
+            collection: Collection::new(),
+            next_collection_id: 1,
+            sidebar_editing_id: None,
+            sidebar_editing_name: String::new(),
+            save_modal_open: false,
+            save_modal_name: String::new(),
+            save_modal_folder_id: None,
         };
 
-        let task = iced::Task::perform(load_app_state(), Message::StateLoaded);
+        let task = iced::Task::batch([
+            iced::Task::perform(load_app_state(), Message::StateLoaded),
+            iced::Task::perform(load_collection(), Message::CollectionLoaded),
+        ]);
         (app, task)
     }
 
@@ -994,6 +1035,435 @@ impl CrabiPie {
 
         iced::Task::perform(save_app_state(state), |_| Message::SaveComplete)
     }
+
+    fn collection_save_task(&self) -> iced::Task<Message> {
+        let collection = self.collection.clone();
+        iced::Task::perform(save_collection(collection), |_| Message::CollectionSaved)
+    }
+
+    fn next_collection_id(&mut self) -> usize {
+        let id = self.next_collection_id;
+        self.next_collection_id += 1;
+        id
+    }
+
+    // Find and remove an item by id, returning it
+    fn collection_remove_item(
+        items: &mut Vec<CollectionItem>,
+        id: usize,
+    ) -> Option<CollectionItem> {
+        if let Some(pos) = items.iter().position(|i| i.id() == id) {
+            return Some(items.remove(pos));
+        }
+        for item in items.iter_mut() {
+            if let CollectionItem::Folder(f) = item {
+                if let Some(found) = Self::collection_remove_item(&mut f.children, id) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    // Find a request by id across all nested items
+    fn collection_find_request(items: &[CollectionItem], id: usize) -> Option<&CollectionRequest> {
+        for item in items {
+            match item {
+                CollectionItem::Request(r) if r.id == id => return Some(r),
+                CollectionItem::Folder(f) => {
+                    if let Some(found) = Self::collection_find_request(&f.children, id) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    // Insert item into a folder by id, or root if None
+    fn collection_insert_into(
+        items: &mut Vec<CollectionItem>,
+        target_folder_id: Option<usize>,
+        item: CollectionItem,
+    ) {
+        match target_folder_id {
+            None => items.push(item),
+            Some(folder_id) => {
+                for existing in items.iter_mut() {
+                    if let CollectionItem::Folder(f) = existing {
+                        if f.id == folder_id {
+                            f.children.push(item);
+                            return;
+                        }
+                        // recurse into subfolders
+                        Self::collection_insert_into(
+                            &mut f.children,
+                            Some(folder_id),
+                            item.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn collection_toggle_expand(items: &mut Vec<CollectionItem>, id: usize) {
+        for item in items.iter_mut() {
+            if let CollectionItem::Folder(f) = item {
+                if f.id == id {
+                    f.expanded = !f.expanded;
+                    return;
+                }
+                Self::collection_toggle_expand(&mut f.children, id);
+            }
+        }
+    }
+
+    fn collection_rename_item(items: &mut Vec<CollectionItem>, id: usize, new_name: String) {
+        for item in items.iter_mut() {
+            match item {
+                CollectionItem::Folder(f) if f.id == id => {
+                    f.name = new_name;
+                    return;
+                }
+                CollectionItem::Request(r) if r.id == id => {
+                    r.name = new_name;
+                    return;
+                }
+                CollectionItem::Folder(f) => {
+                    Self::collection_rename_item(&mut f.children, id, new_name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collection_duplicate_item(items: &mut Vec<CollectionItem>, id: usize, new_id: usize) {
+        // find position and parent
+        for i in 0..items.len() {
+            match &items[i] {
+                CollectionItem::Request(r) if r.id == id => {
+                    let mut cloned = r.clone();
+                    cloned.id = new_id;
+                    cloned.name = format!("{} (copy)", cloned.name);
+                    items.insert(i + 1, CollectionItem::Request(cloned));
+                    return;
+                }
+                CollectionItem::Folder(f) if f.id == id => {
+                    let mut cloned = f.clone();
+                    cloned.id = new_id;
+                    cloned.name = format!("{} (copy)", cloned.name);
+                    items.insert(i + 1, CollectionItem::Folder(cloned));
+                    return;
+                }
+                CollectionItem::Folder(_) => {
+                    if let CollectionItem::Folder(f) = &mut items[i] {
+                        Self::collection_duplicate_item(&mut f.children, id, new_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn render_sidebar(&self) -> Element<'_, Message> {
+        // Header
+        let header = row![
+            text("Collection").size(14),
+            space::horizontal(),
+            tooltip(
+                button(text("+📁").shaping(text::Shaping::Advanced).size(12))
+                    .style(button::text)
+                    .on_press(Message::CollectionFolderAdd(None)),
+                "New folder at root",
+                tooltip::Position::Bottom
+            ),
+            tooltip(
+                button(text("💾").shaping(text::Shaping::Advanced).size(12))
+                    .style(button::text)
+                    .on_press(Message::OpenSaveModal),
+                "Save current tab",
+                tooltip::Position::Bottom
+            ),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(4);
+
+        // Render items recursively
+        let items: Element<'_, Message> = if self.collection.items.is_empty() {
+            container(
+                text("No saved requests.\nClick 💾 to save current tab.")
+                    .size(12)
+                    .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+            )
+            .padding(10)
+            .into()
+        } else {
+            column(
+                self.collection
+                    .items
+                    .iter()
+                    .map(|item| self.render_collection_item(item, 0))
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(2)
+            .into()
+        };
+
+        let content = column![
+            header,
+            rule::horizontal(1.0),
+            scrollable(items).height(Length::Fill),
+        ]
+        .spacing(8);
+
+        container(content)
+            .width(Length::Fixed(240.0))
+            .height(Length::Fill)
+            .style(|theme: &iced::Theme| container::Style {
+                border: Border {
+                    width: 0.5,
+                    color: theme.extended_palette().background.weak.color,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .padding(8)
+            .into()
+    }
+
+    fn render_collection_item<'a>(
+        &'a self,
+        item: &'a CollectionItem,
+        depth: u16,
+    ) -> Element<'a, Message> {
+        let indent = depth as f32 * 14.0;
+
+        match item {
+            CollectionItem::Folder(folder) => {
+                let arrow = if folder.expanded { "▾" } else { "▸" };
+
+                let name_or_input: Element<'_, Message> =
+                    if self.sidebar_editing_id == Some(folder.id) {
+                        text_input("Folder name...", &self.sidebar_editing_name)
+                            .on_input(Message::CollectionItemRenameInput)
+                            .on_submit(Message::CollectionItemRenameConfirm(folder.id))
+                            .size(13)
+                            .into()
+                    } else {
+                        button(
+                            row![
+                                text(arrow).size(12),
+                                text("📁").shaping(text::Shaping::Advanced).size(12),
+                                text(&folder.name).size(13),
+                            ]
+                            .spacing(4)
+                            .align_y(Alignment::Center),
+                        )
+                        .style(button::text)
+                        .width(Length::Fill)
+                        .on_press(Message::CollectionItemToggleExpand(folder.id))
+                        .into()
+                    };
+
+                let action_buttons = row![
+                    tooltip(
+                        button(text("+📁").shaping(text::Shaping::Advanced).size(11))
+                            .style(button::text)
+                            .on_press(Message::CollectionFolderAdd(Some(folder.id))),
+                        "Add subfolder",
+                        tooltip::Position::Bottom
+                    ),
+                    tooltip(
+                        button(text("✏️").shaping(text::Shaping::Advanced).size(11))
+                            .style(button::text)
+                            .on_press(Message::CollectionItemRename(folder.id)),
+                        "Rename",
+                        tooltip::Position::Bottom
+                    ),
+                    tooltip(
+                        button(text("🗑").shaping(text::Shaping::Advanced).size(11))
+                            .style(button::text)
+                            .on_press(Message::CollectionItemDelete(folder.id)),
+                        "Delete",
+                        tooltip::Position::Bottom
+                    ),
+                ]
+                .spacing(0);
+
+                let row_content = row![
+                    space::horizontal().width(indent),
+                    name_or_input,
+                    action_buttons,
+                ]
+                .align_y(Alignment::Center);
+
+                if folder.expanded {
+                    let children: Vec<Element<'_, Message>> = folder
+                        .children
+                        .iter()
+                        .map(|child| self.render_collection_item(child, depth + 1))
+                        .collect();
+
+                    column![row_content, column(children).spacing(2)]
+                        .spacing(2)
+                        .into()
+                } else {
+                    row_content.into()
+                }
+            }
+
+            CollectionItem::Request(req) => {
+                let method_color = match req.method {
+                    HttpMethod::GET => iced::Color::from_rgb(0.27, 0.73, 0.27),
+                    HttpMethod::POST => iced::Color::from_rgb(0.98, 0.65, 0.14),
+                    HttpMethod::PUT => iced::Color::from_rgb(0.14, 0.59, 0.98),
+                    HttpMethod::DELETE => iced::Color::from_rgb(0.95, 0.26, 0.21),
+                    HttpMethod::PATCH => iced::Color::from_rgb(0.61, 0.15, 0.69),
+                    _ => iced::Color::from_rgb(0.5, 0.5, 0.5),
+                };
+
+                let name_or_input: Element<'_, Message> = if self.sidebar_editing_id == Some(req.id)
+                {
+                    text_input("Request name...", &self.sidebar_editing_name)
+                        .on_input(Message::CollectionItemRenameInput)
+                        .on_submit(Message::CollectionItemRenameConfirm(req.id))
+                        .size(13)
+                        .into()
+                } else {
+                    button(
+                        row![
+                            text(req.method.to_string()).size(10).color(method_color),
+                            text(&req.name).size(13),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(button::text)
+                    .width(Length::Fill)
+                    .on_press(Message::CollectionRequestOpen(req.id))
+                    .into()
+                };
+
+                let action_buttons = row![
+                    tooltip(
+                        button(text("✏️").shaping(text::Shaping::Advanced).size(11))
+                            .style(button::text)
+                            .on_press(Message::CollectionItemRename(req.id)),
+                        "Rename",
+                        tooltip::Position::Bottom
+                    ),
+                    tooltip(
+                        button(text("⧉").shaping(text::Shaping::Advanced).size(11))
+                            .style(button::text)
+                            .on_press(Message::CollectionItemDuplicate(req.id)),
+                        "Duplicate",
+                        tooltip::Position::Bottom
+                    ),
+                    tooltip(
+                        button(text("🗑").shaping(text::Shaping::Advanced).size(11))
+                            .style(button::text)
+                            .on_press(Message::CollectionItemDelete(req.id)),
+                        "Delete",
+                        tooltip::Position::Bottom
+                    ),
+                ]
+                .spacing(0);
+
+                let row: iced::widget::Row<'_, Message> = row![
+                    space::horizontal().width(indent),
+                    name_or_input,
+                    action_buttons,
+                ]
+                .align_y(Alignment::Center);
+
+                row.into()
+            }
+        }
+    }
+
+    fn render_save_modal(&self) -> Element<'_, Message> {
+        // Build folder list for picker — flatten all folders
+        let mut folder_options: Vec<(Option<usize>, String)> = vec![(None, "Root".to_string())];
+
+        fn collect_folders(
+            items: &[CollectionItem],
+            depth: usize,
+            out: &mut Vec<(Option<usize>, String)>,
+        ) {
+            for item in items {
+                if let CollectionItem::Folder(f) = item {
+                    let indent = "  ".repeat(depth);
+                    out.push((Some(f.id), format!("{}📁 {}", indent, f.name)));
+                    collect_folders(&f.children, depth + 1, out);
+                }
+            }
+        }
+        collect_folders(&self.collection.items, 0, &mut folder_options);
+
+        let folder_labels: Vec<String> = folder_options.iter().map(|(_, l)| l.clone()).collect();
+
+        let selected_label = folder_options
+            .iter()
+            .find(|(id, _)| *id == self.save_modal_folder_id)
+            .map(|(_, l)| l.clone())
+            .unwrap_or("Root".to_string());
+
+        let modal_content = column![
+            text("Save to Collection").size(16),
+            rule::horizontal(1.0),
+            column![
+                text("Name").size(12),
+                text_input("Request name...", &self.save_modal_name)
+                    .on_input(Message::SaveModalNameChanged)
+                    .on_submit(Message::SaveModalConfirm)
+                    .padding(8),
+            ]
+            .spacing(4),
+            column![
+                text("Save into folder").size(12),
+                pick_list(folder_labels, Some(selected_label), move |selected| {
+                    let folder_id = folder_options
+                        .iter()
+                        .find(|(_, l)| l == &selected)
+                        .map(|(id, _)| *id)
+                        .unwrap_or(None);
+                    Message::SaveModalFolderSelected(folder_id)
+                },)
+                .padding(8)
+                .width(Length::Fill),
+            ]
+            .spacing(4),
+            row![
+                space::horizontal(),
+                button("Cancel")
+                    .style(button::secondary)
+                    .on_press(Message::SaveModalCancel)
+                    .padding(8),
+                button("Save")
+                    .style(button::primary)
+                    .on_press(Message::SaveModalConfirm)
+                    .padding(8),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12);
+
+        container(modal_content)
+            .width(Length::Fixed(340.0))
+            .padding(20)
+            .style(|theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme.palette().background)),
+                border: Border {
+                    width: 1.0,
+                    color: theme.palette().primary,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1121,6 +1591,9 @@ impl CrabiPie {
     }
     fn render_title_row(&self) -> Element<'_, Message> {
         row![
+            button(text(if self.sidebar_open { "◀" } else { "▶" }).size(14))
+                .style(button::text)
+                .on_press(Message::ToggleSidebar),
             text("CrabiPie HTTP Client").size(16),
             space::horizontal(),
             text("App theme"),
@@ -1129,8 +1602,12 @@ impl CrabiPie {
                 Some(&self.app_theme),
                 Message::AppThemeChanged,
             ),
-            button("Open").on_press(Message::LoadRequest),
-            button("Save").on_press(Message::SaveRequest)
+            button(text("📂").shaping(text::Shaping::Advanced).size(14))
+                .style(button::text)
+                .on_press(Message::LoadRequest),
+            button(text("💾").shaping(text::Shaping::Advanced).size(14))
+                .style(button::text)
+                .on_press(Message::SaveRequest)
         ]
         .spacing(10)
         .into()
@@ -1454,7 +1931,7 @@ impl CrabiPie {
                 .width(300);
 
             let remove_btn = button(text("❌").shaping(text::Shaping::Advanced))
-                .style(button::subtle)
+                .style(button::text)
                 .on_press(Message::QueryParamRemove(idx));
 
             let param_row = row![
@@ -1477,7 +1954,10 @@ impl CrabiPie {
                 .on_press(Message::QueryParamAdd),
         );
 
-        scrollable(params_col).height(Length::Fill).into()
+        scrollable(params_col)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
     }
 
     fn build_query_string(&self) -> String {
@@ -2375,6 +2855,24 @@ impl CrabiPie {
 }
 
 fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
+    if app.sidebar_editing_id.is_some() {
+        let is_rename_message = matches!(
+            &message,
+            Message::CollectionItemRenameInput(_)
+                | Message::CollectionItemRenameConfirm(_)
+                | Message::CollectionItemRenameCancel
+                | Message::EventOccurred(_)
+        );
+        if !is_rename_message {
+            let id = app.sidebar_editing_id.unwrap();
+            let new_name = app.sidebar_editing_name.trim().to_string();
+            if !new_name.is_empty() {
+                CrabiPie::collection_rename_item(&mut app.collection.items, id, new_name);
+            }
+            app.sidebar_editing_id = None;
+            app.sidebar_editing_name = String::new();
+        }
+    }
     match message {
         Message::NoOp => iced::Task::none(),
         Message::TabSelected(index) => {
@@ -2620,10 +3118,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::ResponseTabSelected(response_tab) => {
             app.current_tab_mut().active_response_tab = response_tab;
-            iced::Task::none()
-        }
-        Message::ToggleLayout => {
-            println!("Event fired");
             iced::Task::none()
         }
         Message::PrettifyJson => {
@@ -3054,6 +3548,22 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         println!("Key event: Tab");
                         return iced::widget::operation::focus_next();
                     }
+                    KeyEvent::KeyPressed {
+                        key: Key::Named(iced::keyboard::key::Named::Escape),
+                        ..
+                    } => {
+                        if app.sidebar_editing_id.is_some() {
+                            app.sidebar_editing_id = None;
+                            app.sidebar_editing_name = String::new();
+                            return iced::Task::none();
+                        }
+                        if app.save_modal_open {
+                            app.save_modal_open = false;
+                            app.save_modal_name = String::new();
+                            app.save_modal_folder_id = None;
+                            return iced::Task::none();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3205,6 +3715,147 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
 
         Message::SaveComplete => iced::Task::none(),
+        Message::CollectionLoaded(maybe_collection) => {
+            if let Some(collection) = maybe_collection {
+                app.collection = collection;
+            }
+            iced::Task::none()
+        }
+
+        Message::ToggleSidebar => {
+            app.sidebar_open = !app.sidebar_open;
+            iced::Task::none()
+        }
+
+        Message::CollectionFolderAdd(parent_id) => {
+            let id = app.next_collection_id();
+            let folder = CollectionItem::Folder(CollectionFolder {
+                id,
+                name: "New Folder".to_string(),
+                expanded: true,
+                children: Vec::new(),
+            });
+            CrabiPie::collection_insert_into(&mut app.collection.items, parent_id, folder);
+            // immediately enter rename mode
+            app.sidebar_editing_id = Some(id);
+            app.sidebar_editing_name = "New Folder".to_string();
+            app.collection_save_task()
+        }
+
+        Message::CollectionItemToggleExpand(id) => {
+            CrabiPie::collection_toggle_expand(&mut app.collection.items, id);
+            iced::Task::none()
+        }
+
+        Message::CollectionRequestOpen(id) => {
+            if let Some(req) = CrabiPie::collection_find_request(&app.collection.items, id) {
+                let saved = req.saved_state.clone();
+                let new_tab = TabState::from_saved(saved);
+                app.tabs.push(new_tab);
+                app.active_tab = app.tabs.len() - 1;
+            }
+            iced::Task::none()
+        }
+
+        Message::CollectionItemRename(id) => {
+            // find current name
+            fn find_name(items: &[CollectionItem], id: usize) -> Option<String> {
+                for item in items {
+                    if item.id() == id {
+                        return Some(item.name().to_string());
+                    }
+                    if let CollectionItem::Folder(f) = item {
+                        if let Some(n) = find_name(&f.children, id) {
+                            return Some(n);
+                        }
+                    }
+                }
+                None
+            }
+            if let Some(name) = find_name(&app.collection.items, id) {
+                app.sidebar_editing_id = Some(id);
+                app.sidebar_editing_name = name;
+            }
+            iced::Task::none()
+        }
+
+        Message::CollectionItemRenameInput(text) => {
+            app.sidebar_editing_name = text;
+            iced::Task::none()
+        }
+
+        Message::CollectionItemRenameConfirm(id) => {
+            let new_name = app.sidebar_editing_name.trim().to_string();
+            if !new_name.is_empty() {
+                CrabiPie::collection_rename_item(&mut app.collection.items, id, new_name);
+            }
+            app.sidebar_editing_id = None;
+            app.sidebar_editing_name = String::new();
+            app.collection_save_task()
+        }
+
+        Message::CollectionItemRenameCancel => {
+            app.sidebar_editing_id = None;
+            app.sidebar_editing_name = String::new();
+            iced::Task::none()
+        }
+
+        Message::CollectionItemDelete(id) => {
+            CrabiPie::collection_remove_item(&mut app.collection.items, id);
+            app.collection_save_task()
+        }
+
+        Message::CollectionItemDuplicate(id) => {
+            let new_id = app.next_collection_id();
+            CrabiPie::collection_duplicate_item(&mut app.collection.items, id, new_id);
+            app.collection_save_task()
+        }
+
+        // Save modal
+        Message::OpenSaveModal => {
+            app.save_modal_open = true;
+            app.save_modal_name = app.current_tab().title.clone();
+            app.save_modal_folder_id = None;
+            iced::Task::none()
+        }
+
+        Message::SaveModalNameChanged(name) => {
+            app.save_modal_name = name;
+            iced::Task::none()
+        }
+
+        Message::SaveModalFolderSelected(folder_id) => {
+            app.save_modal_folder_id = folder_id;
+            iced::Task::none()
+        }
+
+        Message::SaveModalConfirm => {
+            let id = app.next_collection_id();
+            let saved_state = app
+                .current_tab()
+                .to_saved(&app.json_theme.to_string(), &app.app_theme.to_string());
+            let req = CollectionItem::Request(CollectionRequest {
+                id,
+                name: app.save_modal_name.trim().to_string(),
+                method: app.current_tab().method.clone(),
+                saved_state,
+            });
+            let folder_id = app.save_modal_folder_id;
+            CrabiPie::collection_insert_into(&mut app.collection.items, folder_id, req);
+            app.save_modal_open = false;
+            app.save_modal_name = String::new();
+            app.save_modal_folder_id = None;
+            app.collection_save_task()
+        }
+
+        Message::SaveModalCancel => {
+            app.save_modal_open = false;
+            app.save_modal_name = String::new();
+            app.save_modal_folder_id = None;
+            iced::Task::none()
+        }
+
+        Message::CollectionSaved => iced::Task::none(),
     }
 }
 
@@ -3226,23 +3877,40 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
             .width(Length::Fill)
-            .height(Length::Fill)
-            .width(Length::Fill)
             .height(Length::Fill);
-        // .style(|_theme: &Theme| container::Appearance {
-        //     background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5).into()),
-        //     ..Default::default()
-        // });
-
         iced::widget::stack![main_content, overlay].into()
     } else {
         main_content.into()
     };
 
-    container(main_content)
-        .padding(10)
-        .height(Length::Fill)
-        .into()
+    // Wrap with sidebar if open
+    let body: Element<'_, Message> = if app.sidebar_open {
+        row![app.render_sidebar(), rule::vertical(1.0), main_content,]
+            .height(Length::Fill)
+            .into()
+    } else {
+        main_content
+    };
+
+    // Save modal overlay
+    let body: Element<'_, Message> = if app.save_modal_open {
+        let overlay = container(app.render_save_modal())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.0, 0.0, 0.0, 0.5,
+                ))),
+                ..Default::default()
+            });
+        iced::widget::stack![body, overlay].into()
+    } else {
+        body
+    };
+
+    container(body).padding(10).height(Length::Fill).into()
 }
 
 fn main() -> iced::Result {
@@ -3784,7 +4452,7 @@ fn state_file_path() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(".")); // last resort: current dir
 
-    let dir = base.join(".crabipie");
+    let dir = base.join(".crabice");
     std::fs::create_dir_all(&dir).ok();
     dir.join("session.json")
 }
@@ -3858,4 +4526,83 @@ fn json_theme_from_str(s: &str) -> json_highlighter::JsonThemeWrapper {
             json_highlighter::CustomJsonTheme::VSCODE_DARK,
         ),
     }
+}
+
+struct DragState {
+    dragging_id: usize,     // id of the item being dragged
+    hover_target_id: usize, // id of the item currently hovered over
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Collection {
+    name: String,
+    items: Vec<CollectionItem>, // top-level items
+}
+
+impl Collection {
+    fn new() -> Self {
+        Self {
+            name: "My Collection".to_string(),
+            items: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CollectionItem {
+    Folder(CollectionFolder),
+    Request(CollectionRequest),
+}
+
+impl CollectionItem {
+    fn id(&self) -> usize {
+        match self {
+            CollectionItem::Folder(f) => f.id,
+            CollectionItem::Request(r) => r.id,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            CollectionItem::Folder(f) => &f.name,
+            CollectionItem::Request(r) => &r.name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CollectionFolder {
+    id: usize,
+    name: String,
+    expanded: bool,
+    children: Vec<CollectionItem>, // enables infinite nesting
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CollectionRequest {
+    id: usize,
+    name: String,
+    method: HttpMethod,
+    saved_state: SavedState,
+}
+
+fn collection_file_path() -> std::path::PathBuf {
+    let base = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dir = base.join(".crabipie");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("collection.json")
+}
+
+async fn save_collection(collection: Collection) {
+    if let Ok(json) = serde_json::to_string_pretty(&collection) {
+        tokio::fs::write(collection_file_path(), json).await.ok();
+    }
+}
+
+async fn load_collection() -> Option<Collection> {
+    let bytes = tokio::fs::read(collection_file_path()).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
