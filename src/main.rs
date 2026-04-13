@@ -130,6 +130,7 @@ enum Message {
 
     // Sidebar
     ToggleSidebar,
+    SidebarItemSelected(usize),
     CollectionLoaded(Option<Collection>),
     CollectionFolderAdd(Option<usize>), // parent id, None = root
     CollectionItemToggleExpand(usize),
@@ -180,6 +181,7 @@ struct CrabiPie {
 
     // collection
     sidebar_open: bool,
+    sidebar_selected_id: Option<usize>,
     collection: Collection,
     next_collection_id: usize,
     sidebar_editing_id: Option<usize>,
@@ -397,7 +399,7 @@ impl TabState {
         form_data
             .iter()
             .filter_map(|f| {
-                if f.key.is_empty() && f.value.is_empty() {
+                if f.key.is_empty() && f.value.is_empty() || f.field_type == FormFieldType::File {
                     None
                 } else {
                     let mut line = format!("{}: {}", f.key, f.value);
@@ -463,6 +465,7 @@ impl CrabiPie {
             current_match_line_col: None,
             search_match_length: 0,
             sidebar_open: false,
+            sidebar_selected_id: None,
             collection: Collection::new(),
             next_collection_id: 1,
             sidebar_editing_id: None,
@@ -1086,24 +1089,30 @@ impl CrabiPie {
         items: &mut Vec<CollectionItem>,
         target_folder_id: Option<usize>,
         item: CollectionItem,
-    ) {
+    ) -> bool {
+        // return true if inserted
         match target_folder_id {
-            None => items.push(item),
+            None => {
+                items.push(item);
+                true
+            }
             Some(folder_id) => {
                 for existing in items.iter_mut() {
                     if let CollectionItem::Folder(f) = existing {
                         if f.id == folder_id {
                             f.children.push(item);
-                            return;
+                            return true;
                         }
-                        // recurse into subfolders
-                        Self::collection_insert_into(
+                        if Self::collection_insert_into(
                             &mut f.children,
                             Some(folder_id),
                             item.clone(),
-                        );
+                        ) {
+                            return true;
+                        }
                     }
                 }
+                false
             }
         }
     }
@@ -1239,6 +1248,7 @@ impl CrabiPie {
         depth: u16,
     ) -> Element<'a, Message> {
         let indent = depth as f32 * 14.0;
+        let is_selected = self.sidebar_selected_id == Some(item.id());
 
         match item {
             CollectionItem::Folder(folder) => {
@@ -1247,12 +1257,13 @@ impl CrabiPie {
                 let name_or_input: Element<'_, Message> =
                     if self.sidebar_editing_id == Some(folder.id) {
                         text_input("Folder name...", &self.sidebar_editing_name)
+                            .id("sidebar_rename")
                             .on_input(Message::CollectionItemRenameInput)
                             .on_submit(Message::CollectionItemRenameConfirm(folder.id))
                             .size(13)
                             .into()
                     } else {
-                        button(
+                        let row_btn = button(
                             row![
                                 text(arrow).size(12),
                                 text("📁").shaping(text::Shaping::Advanced).size(12),
@@ -1261,43 +1272,76 @@ impl CrabiPie {
                             .spacing(4)
                             .align_y(Alignment::Center),
                         )
-                        .style(button::text)
+                        .style(move |theme: &iced::Theme, status| {
+                            if is_selected {
+                                button::Style {
+                                    background: Some(iced::Background::Color(
+                                        theme.extended_palette().primary.weak.color,
+                                    )),
+                                    text_color: theme.extended_palette().primary.weak.text,
+                                    border: Border::default(),
+                                    shadow: iced::Shadow::default(),
+                                    snap: false,
+                                }
+                            } else {
+                                button::text(theme, status)
+                            }
+                        })
                         .width(Length::Fill)
-                        .on_press(Message::CollectionItemToggleExpand(folder.id))
+                        .on_press(Message::SidebarItemSelected(folder.id));
+
+                        iced_aw::ContextMenu::new(row_btn, move || {
+                            let context_items = column![
+                                button(
+                                    row![text("📁+").size(12), text(" Add Subfolder").size(13)]
+                                        .spacing(4)
+                                )
+                                .style(button::text)
+                                .width(Length::Fill)
+                                .on_press(Message::CollectionFolderAdd(Some(folder.id))),
+                                button(
+                                    row![
+                                        text("✏️").shaping(text::Shaping::Advanced).size(12),
+                                        text(" Rename").size(13)
+                                    ]
+                                    .spacing(4)
+                                )
+                                .style(button::text)
+                                .width(Length::Fill)
+                                .on_press(Message::CollectionItemRename(folder.id)),
+                                button(
+                                    row![
+                                        text("🗑").shaping(text::Shaping::Advanced).size(12),
+                                        text(" Delete").size(13)
+                                    ]
+                                    .spacing(4)
+                                )
+                                .style(button::text)
+                                .width(Length::Fill)
+                                .on_press(Message::CollectionItemDelete(folder.id)),
+                            ]
+                            .padding(4);
+
+                            container(context_items)
+                                .style(|theme: &iced::Theme| container::Style {
+                                    background: Some(iced::Background::Color(
+                                        theme.palette().background,
+                                    )),
+                                    border: Border {
+                                        width: 1.0,
+                                        color: theme.extended_palette().background.weak.color,
+                                        radius: 4.0.into(),
+                                    },
+                                    ..Default::default()
+                                })
+                                .width(Length::Fixed(160.0))
+                                .into()
+                        })
                         .into()
                     };
 
-                let action_buttons = row![
-                    tooltip(
-                        button(text("+📁").shaping(text::Shaping::Advanced).size(11))
-                            .style(button::text)
-                            .on_press(Message::CollectionFolderAdd(Some(folder.id))),
-                        "Add subfolder",
-                        tooltip::Position::Bottom
-                    ),
-                    tooltip(
-                        button(text("✏️").shaping(text::Shaping::Advanced).size(11))
-                            .style(button::text)
-                            .on_press(Message::CollectionItemRename(folder.id)),
-                        "Rename",
-                        tooltip::Position::Bottom
-                    ),
-                    tooltip(
-                        button(text("🗑").shaping(text::Shaping::Advanced).size(11))
-                            .style(button::text)
-                            .on_press(Message::CollectionItemDelete(folder.id)),
-                        "Delete",
-                        tooltip::Position::Bottom
-                    ),
-                ]
-                .spacing(0);
-
-                let row_content = row![
-                    space::horizontal().width(indent),
-                    name_or_input,
-                    action_buttons,
-                ]
-                .align_y(Alignment::Center);
+                let row_content = row![space::horizontal().width(indent), name_or_input,]
+                    .align_y(Alignment::Center);
 
                 if folder.expanded {
                     let children: Vec<Element<'_, Message>> = folder
@@ -1327,12 +1371,13 @@ impl CrabiPie {
                 let name_or_input: Element<'_, Message> = if self.sidebar_editing_id == Some(req.id)
                 {
                     text_input("Request name...", &self.sidebar_editing_name)
+                        .id("sidebar_rename")
                         .on_input(Message::CollectionItemRenameInput)
                         .on_submit(Message::CollectionItemRenameConfirm(req.id))
                         .size(13)
                         .into()
                 } else {
-                    button(
+                    let row_btn = button(
                         row![
                             text(req.method.to_string()).size(10).color(method_color),
                             text(&req.name).size(13),
@@ -1340,45 +1385,84 @@ impl CrabiPie {
                         .spacing(6)
                         .align_y(Alignment::Center),
                     )
-                    .style(button::text)
+                    .style(move |theme: &iced::Theme, status| {
+                        if is_selected {
+                            button::Style {
+                                background: Some(iced::Background::Color(
+                                    theme.extended_palette().primary.weak.color,
+                                )),
+                                text_color: theme.extended_palette().primary.weak.text,
+                                border: Border::default(),
+                                shadow: iced::Shadow::default(),
+                                snap: false,
+                            }
+                        } else {
+                            button::text(theme, status)
+                        }
+                    })
                     .width(Length::Fill)
-                    .on_press(Message::CollectionRequestOpen(req.id))
+                    .on_press(Message::SidebarItemSelected(req.id));
+
+                    let req_id = req.id;
+                    iced_aw::ContextMenu::new(row_btn, move || {
+                        let context_items = column![
+                            button(
+                                row![text("↗").size(12), text(" Open in new tab").size(13)]
+                                    .spacing(4)
+                            )
+                            .style(button::text)
+                            .width(Length::Fill)
+                            .on_press(Message::CollectionRequestOpen(req_id)),
+                            button(
+                                row![
+                                    text("✏️").shaping(text::Shaping::Advanced).size(12),
+                                    text(" Rename").size(13)
+                                ]
+                                .spacing(4)
+                            )
+                            .style(button::text)
+                            .width(Length::Fill)
+                            .on_press(Message::CollectionItemRename(req_id)),
+                            button(
+                                row![text("⧉").size(12), text(" Duplicate").size(13)].spacing(4)
+                            )
+                            .style(button::text)
+                            .width(Length::Fill)
+                            .on_press(Message::CollectionItemDuplicate(req_id)),
+                            button(
+                                row![
+                                    text("🗑").shaping(text::Shaping::Advanced).size(12),
+                                    text(" Delete").size(13)
+                                ]
+                                .spacing(4)
+                            )
+                            .style(button::text)
+                            .width(Length::Fill)
+                            .on_press(Message::CollectionItemDelete(req_id)),
+                        ]
+                        .padding(4);
+
+                        container(context_items)
+                            .style(|theme: &iced::Theme| container::Style {
+                                background: Some(iced::Background::Color(
+                                    theme.palette().background,
+                                )),
+                                border: Border {
+                                    width: 1.0,
+                                    color: theme.extended_palette().background.weak.color,
+                                    radius: 4.0.into(),
+                                },
+                                ..Default::default()
+                            })
+                            .width(Length::Fixed(160.0))
+                            .into()
+                    })
                     .into()
                 };
 
-                let action_buttons = row![
-                    tooltip(
-                        button(text("✏️").shaping(text::Shaping::Advanced).size(11))
-                            .style(button::text)
-                            .on_press(Message::CollectionItemRename(req.id)),
-                        "Rename",
-                        tooltip::Position::Bottom
-                    ),
-                    tooltip(
-                        button(text("⧉").shaping(text::Shaping::Advanced).size(11))
-                            .style(button::text)
-                            .on_press(Message::CollectionItemDuplicate(req.id)),
-                        "Duplicate",
-                        tooltip::Position::Bottom
-                    ),
-                    tooltip(
-                        button(text("🗑").shaping(text::Shaping::Advanced).size(11))
-                            .style(button::text)
-                            .on_press(Message::CollectionItemDelete(req.id)),
-                        "Delete",
-                        tooltip::Position::Bottom
-                    ),
-                ]
-                .spacing(0);
-
-                let row: iced::widget::Row<'_, Message> = row![
-                    space::horizontal().width(indent),
-                    name_or_input,
-                    action_buttons,
-                ]
-                .align_y(Alignment::Center);
-
-                row.into()
+                row![space::horizontal().width(indent), name_or_input,]
+                    .align_y(Alignment::Center)
+                    .into()
             }
         }
     }
@@ -3479,6 +3563,22 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     _ => {}
                 }
             }
+            if let Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left | iced::mouse::Button::Right,
+            )) = &event
+            {
+                if let Some(editing_id) = app.sidebar_editing_id {
+                    return iced::widget::operation::is_focused("sidebar_rename").then(
+                        move |focused| {
+                            if !focused {
+                                iced::Task::done(Message::CollectionItemRenameConfirm(editing_id))
+                            } else {
+                                iced::Task::none()
+                            }
+                        },
+                    );
+                }
+            }
             if let Event::Keyboard(key_event) = event {
                 match key_event {
                     KeyEvent::KeyPressed { key, modifiers, .. } if modifiers.control() => {
@@ -3727,6 +3827,11 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
 
+        Message::SidebarItemSelected(id) => {
+            app.sidebar_selected_id = Some(id);
+            iced::Task::none()
+        }
+
         Message::CollectionFolderAdd(parent_id) => {
             let id = app.next_collection_id();
             let folder = CollectionItem::Folder(CollectionFolder {
@@ -3748,6 +3853,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
 
         Message::CollectionRequestOpen(id) => {
+            app.sidebar_selected_id = Some(id);
             if let Some(req) = CrabiPie::collection_find_request(&app.collection.items, id) {
                 let saved = req.saved_state.clone();
                 let new_tab = TabState::from_saved(saved);
