@@ -66,6 +66,18 @@ enum Message {
     CancelRequest,
     SaveBinaryResponse,
     FileSaved(Result<String, String>),
+    ClearResponseText,
+
+    // Global Cookie auth
+    CookieJarOpen,
+    CookieJarClose,
+    CookieJarAdd(String),
+    CookieJarRemove(String, usize), // domain, index
+    CookieJarToggled(String, usize),
+    CookieJarNameChanged(String, usize, String),
+    CookieJarValueChanged(String, usize, String),
+    CookieJarDomainChanged(String),
+    CookieJarClearDomain(String),
 
     // Query params
     QueryParamAdd,
@@ -73,6 +85,10 @@ enum Message {
     QueryParamKeyChanged(usize, String),
     QueryParamValueChanged(usize, String),
     QueryParamToggled(usize),
+
+    // streaming response
+    StreamChunk(String),
+    StreamDone,
 
     // WebSocket messages
     WsConnect,
@@ -163,6 +179,12 @@ struct CrabiPie {
     app_theme: iced::Theme,
     svg_rotation: f32,
 
+    // Global cookie jar
+    cookie_jar_open: bool,
+    cookie_jar_new_domain: String,
+    cookie_jar: std::collections::HashMap<String, Vec<CookieEntry>>,
+    cookie_jar_error: Option<String>,
+
     // Find dialog (global)
     find_dialog_open: bool,
     find_replace_mode: bool,
@@ -214,6 +236,10 @@ struct TabState {
     form_data: Vec<FormField>,
     raw_form_content: text_editor::Content,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    // response stream
+    stream_buffer: String,
+    is_streaming: bool,
 
     // WebSocket-specific fields
     ws_connected: bool,
@@ -298,6 +324,8 @@ impl TabState {
             ws_count_received: 0,
             ws_message_type: WsMessageType::Text,
             ws_binary_message_type: WsBinaryMessageType::Base64,
+            is_streaming: false,
+            stream_buffer: String::new(),
         }
     }
 
@@ -351,6 +379,8 @@ impl TabState {
             ws_count_received: 0,
             ws_message_type: saved.ws_message_type,
             ws_binary_message_type: saved.ws_binary_message_type,
+            is_streaming: false,
+            stream_buffer: String::new(),
         }
     }
 
@@ -473,6 +503,10 @@ impl CrabiPie {
             save_modal_open: false,
             save_modal_name: String::new(),
             save_modal_folder_id: None,
+            cookie_jar_open: false,
+            cookie_jar_new_domain: String::new(),
+            cookie_jar: std::collections::HashMap::new(),
+            cookie_jar_error: None,
         };
 
         let task = iced::Task::batch([
@@ -1548,6 +1582,23 @@ impl CrabiPie {
             })
             .into()
     }
+
+    fn format_duration(dur: std::time::Duration) -> String {
+        let secs = dur.as_secs_f64();
+        if secs < 1.0 {
+            format!("{:.1}ms", secs * 1000.0)
+        } else if secs < 60.0 {
+            format!("{:.2}s", secs)
+        } else if secs < 3600.0 {
+            let m = secs as u64 / 60;
+            let s = secs as u64 % 60;
+            format!("{}m {}s", m, s)
+        } else {
+            let h = secs as u64 / 3600;
+            let m = (secs as u64 % 3600) / 60;
+            format!("{}h {}m", h, m)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1673,6 +1724,7 @@ impl CrabiPie {
         .spacing(10)
         .into()
     }
+
     fn render_title_row(&self) -> Element<'_, Message> {
         row![
             button(text(if self.sidebar_open { "◀" } else { "▶" }).size(14))
@@ -1800,7 +1852,16 @@ impl CrabiPie {
                 .tab_bar_position(iced_aw::TabBarPosition::Top)
                 .into();
 
-        container(column![text("Request").height(20), rule::horizontal(1.0), req_tabs,].spacing(10))
+        let req_title = row![
+            text("Request").height(20),
+            space::horizontal(),
+            button(text("🍪 Add Cookie").shaping(text::Shaping::Advanced))
+                .height(20)
+                .style(button::text)
+                .on_press(Message::CookieJarOpen)
+        ];
+
+        container(column![req_title, rule::horizontal(1.0), req_tabs,].spacing(10))
             .style(|theme: &iced::Theme| container::Style {
                 border: Border {
                     width: 0.5,
@@ -2159,6 +2220,169 @@ impl CrabiPie {
         column![type_selector, auth_form].spacing(10).into()
     }
 
+    fn render_cookie_jar_modal(&self) -> Element<'_, Message> {
+        if !self.cookie_jar_open {
+            return Space::new().into();
+        }
+
+        let content: Element<'_, Message> = if self.cookie_jar.is_empty() {
+            text("No cookies stored yet.").into()
+        } else {
+            let domain_sections: Vec<Element<'_, Message>> = self
+                .cookie_jar
+                .iter()
+                .map(|(domain, cookies)| {
+                    let domain_header: Element<'_, Message> = row![
+                        text(domain.clone()),
+                        space::horizontal(),
+                        tooltip(
+                            button(text("➕").shaping(text::Shaping::Advanced))
+                                .on_press(Message::CookieJarAdd(domain.clone())),
+                            "Add",
+                            tooltip::Position::Bottom
+                        ),
+                        tooltip(
+                            button(text("🧹").shaping(text::Shaping::Advanced))
+                                .on_press(Message::CookieJarClearDomain(domain.clone())),
+                            "Clear",
+                            tooltip::Position::Bottom
+                        ),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .into();
+
+                    let col_headers: Element<'_, Message> = row![
+                        text("").width(24), // checkbox space
+                        text("Name").size(11).width(Length::FillPortion(2)),
+                        text("Value").size(11).width(Length::FillPortion(3)),
+                        text("Expires").size(11).width(Length::FillPortion(2)),
+                        text("").width(30), // delete btn space
+                    ]
+                    .spacing(8)
+                    .into();
+
+                    let cookie_rows: Vec<Element<'_, Message>> = cookies
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let d1 = domain.clone();
+                            let d2 = domain.clone();
+                            let d3 = domain.clone();
+                            let d4 = domain.clone();
+                            row![
+                                checkbox(c.enabled)
+                                    .on_toggle(move |_| Message::CookieJarToggled(d1.clone(), i)),
+                                text_input("", &c.name)
+                                    .on_input(move |v| Message::CookieJarNameChanged(
+                                        d2.clone(),
+                                        i,
+                                        v
+                                    ))
+                                    .width(Length::FillPortion(2)),
+                                text_input("", &c.value)
+                                    .on_input(move |v| Message::CookieJarValueChanged(
+                                        d3.clone(),
+                                        i,
+                                        v
+                                    ))
+                                    .width(Length::FillPortion(3)),
+                                text(c.expires.as_deref().unwrap_or("session")).size(11),
+                                button(text("❌").shaping(text::Shaping::Advanced))
+                                    .style(button::text)
+                                    .on_press(Message::CookieJarRemove(d4.clone(), i)),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center)
+                            .into()
+                        })
+                        .collect();
+
+                    column![
+                        domain_header,
+                        col_headers,
+                        Column::with_children(cookie_rows).spacing(6),
+                    ]
+                    .spacing(6)
+                    .into()
+                })
+                .collect();
+
+            scrollable(Column::with_children(domain_sections).spacing(16))
+                .height(Length::Fixed(300.0))
+                .into()
+        };
+
+        let add_row: Element<'_, Message> = row![
+            text_input("domain (e.g. api.example.com)", &self.cookie_jar_new_domain)
+                .on_input(Message::CookieJarDomainChanged)
+                .width(Length::Fill),
+            button("+ Add Cookie")
+                .on_press(Message::CookieJarAdd(self.cookie_jar_new_domain.clone())),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into();
+
+        let error_el: Element<'_, Message> = match &self.cookie_jar_error {
+            Some(err) => text(err.clone())
+                .style(|theme| text::Style {
+                    color: Some(iced::Color::from_rgb(1.0, 0.3, 0.3)),
+                })
+                .into(),
+            None => Space::new().into(),
+        };
+
+        let modal_body = column![
+            column![
+                row![
+                    text("Cookie Jar"),
+                    space::horizontal(),
+                    button("✕")
+                        .on_press(Message::CookieJarClose)
+                        .style(button::text),
+                ]
+                .align_y(Alignment::Center)
+                .spacing(8),
+                rule::horizontal(1),
+            ],
+            content,
+            column![error_el, add_row]
+        ]
+        .spacing(12)
+        .padding(20);
+
+        let modal = container(modal_body)
+            .width(Length::Fixed(680.0))
+            .max_height(520)
+            .style(container::rounded_box);
+
+        let overlay = container(
+            container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.5,
+            })),
+            ..container::Style::default()
+        });
+
+        iced::widget::stack![
+            Space::new().width(Length::Fill).height(Length::Fill),
+            overlay,
+        ]
+        .into()
+    }
+
     fn render_response_section(&self) -> Element<'_, Message> {
         fn status_color(status: &str) -> iced::Color {
             let code = status
@@ -2195,14 +2419,14 @@ impl CrabiPie {
 
         if let Some(resp_time) = self.current_tab().response_time {
             header_row = header_row.push(
-                text(format!("⏱️{:.2}ms", resp_time.as_secs_f32() * 1000.0))
+                text(format!("⏱️ {}", Self::format_duration(resp_time)))
                     .shaping(text::Shaping::Advanced),
             );
         }
         if self.current_tab().is_response_binary {
             header_row = header_row.push(
                 text(format!(
-                    "🗃️{:.2} KB",
+                    "🗃️ {:.2} KB",
                     self.current_tab().response_bytes.len() as f32 / 1024.0
                 ))
                 .shaping(text::Shaping::Advanced),
@@ -2237,6 +2461,13 @@ impl CrabiPie {
                 tooltip::Position::Bottom,
             ));
         }
+        header_row = header_row.push(tooltip(
+            button(text("🧹").shaping(text::Shaping::Advanced))
+                .on_press(Message::ClearResponseText)
+                .style(button::text),
+            "Clear",
+            tooltip::Position::Bottom,
+        ));
 
         let res_tabs: iced_aw::Tabs<Message, ResponseTab, iced::Theme, iced::Renderer> =
             iced_aw::Tabs::new(Message::ResponseTabSelected)
@@ -2588,318 +2819,275 @@ impl CrabiPie {
         }
     }
 
-    fn send_request(&mut self) -> iced::Task<Message> {
-        let mut url = self.current_tab().url.clone();
-        let method = self.current_tab().method.clone();
-        let body = self.current_tab().body_content.text();
-        let headers = self.current_tab().headers.clone();
-        let auth_type = self.current_tab().auth_type.clone();
-        let bearer_token = self.current_tab().bearer_token.clone();
-        let content_type = self.current_tab().content_type.clone();
-        let form_data = self.current_tab().form_data.clone();
-        let api_key = self.current_tab().api_key.clone();
-        let api_key_name = self.current_tab().api_key_name.clone();
-        let api_key_position = self.current_tab().api_key_position;
+    fn build_request(&self) -> (reqwest::RequestBuilder, String) {
+        let tab = self.current_tab();
+        let mut url = tab.url.clone();
 
-        // Reset cancel flag, start timer, and clear previous response time
-        self.current_tab()
-            .cancel_flag
-            .store(false, Ordering::Relaxed);
-        self.current_tab_mut().response_time = None;
+        // ── headers ──────────────────────────
+        let mut header_map: reqwest::header::HeaderMap = tab
+            .headers
+            .iter()
+            .filter(|h| h.enabled)
+            .filter_map(|h| {
+                let name = reqwest::header::HeaderName::from_bytes(h.key.trim().as_bytes()).ok()?;
+                let value = reqwest::header::HeaderValue::from_str(h.value.trim()).ok()?;
+                Some((name, value))
+            })
+            .collect();
 
-        let cancel_flag = self.current_tab().cancel_flag.clone();
-
-        iced::Task::perform(
-            async move {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return HttpResponse {
-                        status: "Cancelled".to_string(),
-                        headers: String::new(),
-                        body: "Request was cancelled".to_string(),
-                        is_binary: false,
-                        filename: String::new(),
-                        bytes: Vec::new(),
-                        content_type: String::new(),
-                        response_time: None,
-                        accepts_range: false,
-                    };
-                }
-
-                // Parse headers
-                let mut header_map: reqwest::header::HeaderMap = headers
-                    .iter()
-                    .filter(|h| h.enabled)
-                    .filter_map(|h| {
-                        let name = reqwest::header::HeaderName::from_bytes(h.key.trim().as_bytes())
-                            .ok()?;
-                        let value = reqwest::header::HeaderValue::from_str(h.value.trim()).ok()?;
-                        Some((name, value))
-                    })
-                    .collect();
-
-                // Add auth header
-                if auth_type == AuthType::Bearer && !bearer_token.is_empty() {
-                    if let Ok(hv) =
-                        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", bearer_token))
-                    {
+        // ── auth ──────────────────────────────
+        match tab.auth_type {
+            AuthType::Bearer => {
+                if !tab.bearer_token.is_empty() {
+                    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&format!(
+                        "Bearer {}",
+                        tab.bearer_token
+                    )) {
                         header_map.insert(reqwest::header::AUTHORIZATION, hv);
                     }
-                } else if auth_type == AuthType::ApiKey
-                    && !api_key.is_empty()
-                    && !api_key_name.is_empty()
-                {
-                    if api_key_position == ApiKeyPosition::Header {
-                        if let Ok(hv) = reqwest::header::HeaderValue::from_str(api_key.as_str()) {
-                            if let Ok(hn) = reqwest::header::HeaderName::try_from(&api_key_name) {
-                                header_map.insert(hn, hv);
-                            }
+                }
+            }
+            AuthType::ApiKey => {
+                if !tab.api_key.is_empty() && !tab.api_key_name.is_empty() {
+                    if tab.api_key_position == ApiKeyPosition::Header {
+                        if let (Ok(hn), Ok(hv)) = (
+                            reqwest::header::HeaderName::try_from(&tab.api_key_name),
+                            reqwest::header::HeaderValue::from_str(&tab.api_key),
+                        ) {
+                            header_map.insert(hn, hv);
                         }
-                    } else {
-                        if let Ok(mut parsed) = url::Url::parse(&url) {
-                            parsed
-                                .query_pairs_mut()
-                                .append_pair(&api_key_name, &api_key);
-
-                            url = parsed.to_string();
-                        }
+                    } else if let Ok(mut parsed) = url::Url::parse(&url) {
+                        parsed
+                            .query_pairs_mut()
+                            .append_pair(&tab.api_key_name, &tab.api_key);
+                        url = parsed.to_string();
                     }
                 }
+            }
+            AuthType::None => {}
+        }
 
-                println!("{url}");
+        // ── cookie jar ───────────────────────
+        if let Some(domain) = extract_domain(&url) {
+            if let Some(cookies) = self.cookie_jar.get(&domain) {
+                let cookie_str = cookies
+                    .iter()
+                    .filter(|c| c.enabled && !c.name.is_empty())
+                    .map(|c| format!("{}={}", c.name, c.value))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if !cookie_str.is_empty() {
+                    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&cookie_str) {
+                        header_map.insert(reqwest::header::COOKIE, hv);
+                    }
+                }
+            }
+        }
 
-                // let client = reqwest::Client::new();
-                let client = &HTTP_CLIENT;
-
-                let mut request = match method {
-                    HttpMethod::GET => client.get(&url),
-                    HttpMethod::DELETE => client.delete(&url),
-                    HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH => {
-                        let req = match method {
-                            HttpMethod::POST => client.post(&url),
-                            HttpMethod::PUT => client.put(&url),
-                            HttpMethod::PATCH => client.patch(&url),
-                            _ => unreachable!(),
-                        };
-
-                        match content_type {
-                            ContentType::Json => {
-                                req.body(body).header("Content-Type", "application/json")
-                            }
-                            ContentType::XWWWFormUrlEncoded => {
-                                let mut params = vec![];
-                                for field in &form_data {
-                                    if field.enabled
-                                        && !field.key.is_empty()
-                                        && field.field_type == FormFieldType::Text
-                                    {
-                                        params.push((field.key.clone(), field.value.clone()));
+        // ── body ─────────────────────────────
+        let client = &HTTP_CLIENT;
+        let builder = match tab.method {
+            HttpMethod::GET => client.get(&url),
+            HttpMethod::DELETE => client.delete(&url),
+            HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH => {
+                let req = match tab.method {
+                    HttpMethod::POST => client.post(&url),
+                    HttpMethod::PUT => client.put(&url),
+                    HttpMethod::PATCH => client.patch(&url),
+                    _ => unreachable!(),
+                };
+                match tab.content_type {
+                    ContentType::Json => req
+                        .body(tab.body_content.text())
+                        .header("Content-Type", "application/json"),
+                    ContentType::XWWWFormUrlEncoded => {
+                        let params: Vec<_> = tab
+                            .form_data
+                            .iter()
+                            .filter(|f| {
+                                f.enabled
+                                    && !f.key.is_empty()
+                                    && f.field_type == FormFieldType::Text
+                            })
+                            .map(|f| (f.key.clone(), f.value.clone()))
+                            .collect();
+                        req.form(&params)
+                    }
+                    ContentType::FormData => {
+                        let mut form = reqwest::multipart::Form::new();
+                        for field in &tab.form_data {
+                            if field.enabled && !field.key.is_empty() {
+                                match field.field_type {
+                                    FormFieldType::Text => {
+                                        form = form.text(field.key.clone(), field.value.clone());
                                     }
-                                }
-                                req.form(&params)
-                            }
-                            ContentType::FormData => {
-                                let mut form = reqwest::multipart::Form::new();
-                                for field in form_data {
-                                    if field.enabled && !field.key.is_empty() {
-                                        match field.field_type {
-                                            FormFieldType::Text => {
-                                                form = form.text(field.key, field.value);
-                                            }
-                                            FormFieldType::File => {
-                                                for fp in field.files {
-                                                    if let Ok(fc) = std::fs::read(&fp) {
-                                                        let fname = std::path::Path::new(&fp)
-                                                            .file_name()
-                                                            .and_then(|n| n.to_str())
-                                                            .unwrap_or("file")
-                                                            .to_string();
-                                                        let part =
-                                                            reqwest::multipart::Part::bytes(fc)
-                                                                .file_name(fname);
-                                                        form = form.part(field.key.clone(), part);
-                                                    }
-                                                }
+                                    FormFieldType::File => {
+                                        for fp in &field.files {
+                                            if let Ok(fc) = std::fs::read(fp) {
+                                                let fname = std::path::Path::new(fp)
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or("file")
+                                                    .to_string();
+                                                let part = reqwest::multipart::Part::bytes(fc)
+                                                    .file_name(fname);
+                                                form = form.part(field.key.clone(), part);
                                             }
                                         }
                                     }
                                 }
-                                req.multipart(form)
                             }
                         }
+                        req.multipart(form)
+                    }
+                }
+            }
+        };
+
+        (builder.headers(header_map), url)
+    }
+
+    fn send_request(&mut self) -> iced::Task<Message> {
+        let (request, _url) = self.build_request();
+        let cancel_flag = self.current_tab().cancel_flag.clone();
+        self.current_tab()
+            .cancel_flag
+            .store(false, Ordering::Relaxed);
+        self.current_tab_mut().response_time = None;
+        self.current_tab_mut().stream_buffer = String::new();
+
+        iced::Task::run(
+            async_stream::stream! {
+                let start_time = tokio::time::Instant::now();
+                let resp = match request.send().await {
+                    Ok(r)  => r,
+                    Err(e) => {
+                        let msg = if e.is_timeout() { "Request timed out".into() }
+                                  else { format!("Request failed: {e}") };
+                        yield Message::ResponseReceived(HttpResponse {
+                            status: "Error".to_string(),
+                            body: msg,
+                            response_time: Some(start_time.elapsed()),
+                            ..Default::default()
+                        });
+                        return;
                     }
                 };
 
-                // Check cancellation before sending
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return HttpResponse {
-                        status: "Cancelled".to_string(),
-                        headers: String::new(),
-                        body: "Request was cancelled".to_string(),
-                        is_binary: false,
-                        filename: String::new(),
-                        bytes: Vec::new(),
-                        content_type: String::new(),
-                        response_time: None,
-                        accepts_range: false,
+                // ── emit status + headers immediately ───────────────────────────
+                let status = format!(
+                    "{} {}",
+                    resp.status().as_u16(),
+                    resp.status().canonical_reason().unwrap_or("")
+                );
+
+                let hm = resp.headers().clone();
+
+                // Cookies
+                let set_cookies: Vec<String> = hm.get_all("set-cookie")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+                    .collect();
+
+                // Headers all
+                let headers_text = format!("{:#?}", hm);
+
+                // Content Type
+                let ct = hm.get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("").to_string();
+
+                // Binary / video: fall back to old buffered path
+                let is_binary = ct.starts_with("image/")
+                    || ct.starts_with("application/pdf")
+                    || ct.starts_with("application/octet-stream")
+                    || ct.starts_with("video/")
+                    || ct.starts_with("audio/");
+
+                if is_binary {
+                    let accepts_range = hm.get("accept-ranges").and_then(|h| h.to_str().ok()).is_some();
+                    let filename = hm.get("content-disposition")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.split("filename=").nth(1)
+                            .map(|f| f.trim_matches(|c| c == '"' || c == '\'').to_string()))
+                        .unwrap_or_else(|| _url.split('/').last().unwrap_or("download").to_string());
+
+                    if accepts_range && ct.starts_with("video/") {
+                        yield Message::ResponseReceived(HttpResponse {
+                            status, headers: headers_text, is_binary: true,
+                            filename, content_type: ct,
+                            response_time: Some(start_time.elapsed()),
+                            accepts_range: true, ..Default::default()
+                        });
+                        return;
+                    }
+
+                    let (body, bytes) = match resp.bytes().await {
+                        Ok(b)  => (format!("Binary file ({} bytes)\n\nContent-Type: {}", b.len(), ct), b.to_vec()),
+                        Err(e) => (format!("Error reading binary data: {e}"), vec![]),
                     };
+                    yield Message::ResponseReceived(HttpResponse {
+                        status, headers: headers_text, body, is_binary: true,
+                        filename, bytes, content_type: ct,
+                        response_time: Some(start_time.elapsed()),
+                        set_cookies,
+                        accepts_range,
+                    });
+                    return;
                 }
 
-                request = request.headers(header_map.to_owned());
+                // ── TEXT: stream chunks ─────────────────────────────────────────
+                // Emit a "headers ready" snapshot so the UI can show status immediately
+                yield Message::ResponseReceived(HttpResponse {
+                    status: status.clone(),
+                    headers: headers_text,
+                    body: String::new(),
+                    content_type: ct.clone(),
+                    response_time: Some(start_time.elapsed()),
+                    set_cookies,
+                    ..Default::default()
+                });
 
-                let start_time = tokio::time::Instant::now();
+            use futures_util::StreamExt;
+            let mut byte_stream = resp.bytes_stream();
+            let mut buf: Vec<u8> = Vec::new();
 
-                match request.send().await {
-                    Ok(resp) => {
-                        let response_time = start_time.elapsed();
-
-                        // Check cancellation after receiving response
-                        if cancel_flag.load(Ordering::Relaxed) {
-                            return HttpResponse {
-                                status: "Cancelled".to_string(),
-                                headers: String::new(),
-                                body: "Request was cancelled".to_string(),
-                                is_binary: false,
-                                filename: String::new(),
-                                bytes: Vec::new(),
-                                content_type: String::new(),
-                                response_time: Some(response_time),
-                                accepts_range: false,
-                            };
-                        }
-
-                        let status_code = resp.status();
-                        let status = format!(
-                            "{} {}",
-                            resp.status().as_u16(),
-                            resp.status().canonical_reason().unwrap_or("")
-                        );
-                        let hm = resp.headers().clone();
-                        let headers = format!("{:#?}", hm);
-                        let ct = hm
-                            .get("content-type")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("")
-                            .to_string();
-
-                        let is_binary = ct.starts_with("image/")
-                            || ct.starts_with("application/pdf")
-                            || ct.starts_with("application/octet-stream")
-                            || ct.starts_with("video/")
-                            || ct.starts_with("audio/");
-
-                        let filename = hm
-                            .get("content-disposition")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| {
-                                s.split("filename=")
-                                    .nth(1)
-                                    .map(|f| f.trim_matches(|c| c == '"' || c == '\'').to_string())
-                            })
-                            .unwrap_or_else(|| {
-                                url.split('/').last().unwrap_or("download").to_string()
-                            });
-
-                        let accepts_ranges = hm
-                            .get("accept-ranges")
-                            .and_then(|h| h.to_str().ok())
-                            .is_some();
-
-                        if is_binary && accepts_ranges && ct.starts_with("video/") {
-                            return HttpResponse {
-                                status,
-                                headers,
-                                body: String::new(),
-                                bytes: Vec::new(),
-                                is_binary,
-                                filename,
-                                content_type: ct,
-                                response_time: Some(response_time),
-                                accepts_range: accepts_ranges,
-                            };
-                        }
-
-                        let (body, bytes) = if is_binary {
-                            match resp.bytes().await {
-                                Ok(b) => (
-                                    format!(
-                                        "Binary file ({} bytes)\n\nContent-Type: {}",
-                                        b.len(),
-                                        ct
-                                    ),
-                                    b.to_vec(),
-                                ),
-                                Err(e) => (format!("Error reading binary data: {}", e), Vec::new()),
+            while let Some(chunk_result) = byte_stream.next().await {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    yield Message::StreamChunk("…[cancelled]".to_string());
+                    break;
+                }
+                match chunk_result {
+                    Ok(bytes) => {
+                        buf.extend_from_slice(bytes.as_ref());
+                        match std::str::from_utf8(buf.as_slice()) {
+                            Ok(s) => {
+                                yield Message::StreamChunk(s.to_string());
+                                buf.clear();
                             }
-                        } else {
-                            let bt = resp
-                                .text()
-                                .await
-                                .unwrap_or_else(|e| format!("Error reading body: {}", e));
-
-                            if cancel_flag.load(Ordering::Relaxed) {
-                                return HttpResponse {
-                                    status: "Cancelled".to_string(),
-                                    headers: String::new(),
-                                    body: "Request was cancelled".to_string(),
-                                    is_binary: false,
-                                    filename: String::new(),
-                                    bytes: Vec::new(),
-                                    content_type: String::new(),
-                                    response_time: Some(response_time),
-                                    accepts_range: accepts_ranges,
-                                };
+                            Err(e) => {
+                                let valid_up_to = e.valid_up_to();
+                                if valid_up_to > 0 {
+                                    let s = unsafe {
+                                        std::str::from_utf8_unchecked(&buf.as_slice()[..valid_up_to])
+                                    }.to_string();
+                                    let remaining = buf.as_slice()[valid_up_to..].to_vec();
+                                    buf = remaining;
+                                    yield Message::StreamChunk(s);
+                                }
                             }
-
-                            let body = if let Ok(j) = serde_json::from_str::<serde_json::Value>(&bt)
-                            {
-                                serde_json::to_string_pretty(&j).unwrap_or(bt)
-                            } else {
-                                bt
-                            };
-                            (body, Vec::new())
-                        };
-
-                        HttpResponse {
-                            status,
-                            headers,
-                            body: if status_code == reqwest::StatusCode::NOT_FOUND
-                                && body.is_empty()
-                            {
-                                "Ops! the requested resource was not found".to_string()
-                            } else {
-                                body
-                            },
-                            is_binary,
-                            filename,
-                            bytes,
-                            content_type: ct,
-                            response_time: Some(response_time),
-                            accepts_range: accepts_ranges,
                         }
                     }
                     Err(e) => {
-                        let response_time = start_time.elapsed();
-                        let error_msg = if e.is_timeout() {
-                            format!("Request timed out")
-                        } else {
-                            format!("Request failed: {}", e)
-                        };
-
-                        HttpResponse {
-                            status: "Error".to_string(),
-                            headers: String::new(),
-                            body: error_msg,
-                            is_binary: false,
-                            filename: String::new(),
-                            bytes: Vec::new(),
-                            content_type: String::new(),
-                            response_time: Some(response_time),
-                            accepts_range: false,
-                        }
+                        yield Message::StreamChunk(format!("\n[stream error: {e}]"));
+                        break;
                     }
                 }
-            },
-            Message::ResponseReceived,
+            }
+
+            yield Message::StreamDone;
+                },
+            std::convert::identity, // stream already yields Message
         )
     }
 
@@ -3082,6 +3270,84 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
+        Message::ClearResponseText => {
+            app.current_tab_mut().response_body_content = text_editor::Content::with_text("");
+            app.current_tab_mut().response_headers_content = text_editor::Content::with_text("");
+            iced::Task::none()
+        }
+        Message::CookieJarOpen => {
+            app.cookie_jar_open = true;
+            iced::Task::none()
+        }
+        Message::CookieJarClose => {
+            for cookies in app.cookie_jar.values_mut() {
+                cookies.retain(|c| !c.name.trim().is_empty());
+            }
+            app.cookie_jar.retain(|_, cookies| !cookies.is_empty());
+            app.cookie_jar_open = false;
+            iced::Task::none()
+        }
+        Message::CookieJarAdd(domain) => {
+            if domain.trim().is_empty() {
+                app.cookie_jar_error = Some("Domain cannot be empty".to_string());
+            } else {
+                app.cookie_jar.entry(domain).or_default().push(CookieEntry {
+                    name: String::new(),
+                    value: String::new(),
+                    enabled: true,
+                    domain: String::new(),
+                    path: "/".to_string(),
+                    expires: None,
+                });
+                app.cookie_jar_new_domain = String::new();
+                app.cookie_jar_error = None;
+            }
+            iced::Task::none()
+        }
+        Message::CookieJarRemove(domain, idx) => {
+            if let Some(cookies) = app.cookie_jar.get_mut(&domain) {
+                if idx < cookies.len() {
+                    cookies.remove(idx);
+                }
+                if cookies.is_empty() {
+                    app.cookie_jar.remove(&domain);
+                }
+            }
+            iced::Task::none()
+        }
+        Message::CookieJarToggled(domain, idx) => {
+            if let Some(cookies) = app.cookie_jar.get_mut(&domain) {
+                if let Some(c) = cookies.get_mut(idx) {
+                    c.enabled = !c.enabled;
+                }
+            }
+            iced::Task::none()
+        }
+        Message::CookieJarNameChanged(domain, idx, val) => {
+            if let Some(cookies) = app.cookie_jar.get_mut(&domain) {
+                if let Some(c) = cookies.get_mut(idx) {
+                    c.name = val;
+                }
+            }
+            iced::Task::none()
+        }
+        Message::CookieJarValueChanged(domain, idx, val) => {
+            if let Some(cookies) = app.cookie_jar.get_mut(&domain) {
+                if let Some(c) = cookies.get_mut(idx) {
+                    c.value = val;
+                }
+            }
+            iced::Task::none()
+        }
+        Message::CookieJarDomainChanged(val) => {
+            app.cookie_jar_new_domain = val;
+            app.cookie_jar_error = None;
+            iced::Task::none()
+        }
+        Message::CookieJarClearDomain(domain) => {
+            app.cookie_jar.remove(&domain);
+            iced::Task::none()
+        }
         Message::Tick => {
             app.svg_rotation = (app.svg_rotation + 4.0) % 360.0;
             iced::Task::none()
@@ -3139,6 +3405,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::ResponseReceived(resp) => {
             app.current_tab_mut().loading = false;
+            app.current_tab_mut().is_streaming = true;
             app.current_tab_mut().active_response_tab = ResponseTab::Body;
             app.current_tab_mut().is_response_binary = resp.is_binary;
 
@@ -3146,6 +3413,21 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.current_tab_mut().response_content_type = resp.content_type.clone();
             app.current_tab_mut().response_time = resp.response_time;
             // app.current_tab_mut().response_bytes = resp.bytes;
+
+            // ── cookie jar extract ──────────────
+            let url = app.current_tab().url.clone();
+            if let Some(domain) = extract_domain(&url) {
+                for raw in &resp.set_cookies {
+                    if let Some(cookie) = parse_set_cookie(raw) {
+                        let jar = app.cookie_jar.entry(domain.clone()).or_default();
+                        if let Some(existing) = jar.iter_mut().find(|c| c.name == cookie.name) {
+                            *existing = cookie;
+                        } else {
+                            jar.push(cookie);
+                        }
+                    }
+                }
+            }
 
             if resp.is_binary && resp.content_type.starts_with("video/") && resp.accepts_range {
                 let url = url::Url::parse(&app.current_tab().url).unwrap();
@@ -3713,6 +3995,29 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
+        Message::StreamChunk(chunk) => {
+            app.current_tab_mut().stream_buffer.push_str(&chunk);
+            // Re-build the editor content from the full buffer each chunk.
+            // For very large responses you can throttle this, but it's fine for typical APIs.
+            let current = app.current_tab().stream_buffer.clone();
+            app.current_tab_mut().response_body_content = text_editor::Content::with_text(&current);
+            iced::Task::none()
+        }
+
+        Message::StreamDone => {
+            app.current_tab_mut().is_streaming = false;
+            app.current_tab_mut().loading = false;
+            // Optionally pretty-print JSON now that we have the full body
+            let body = app.current_tab().stream_buffer.clone();
+            if let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Ok(pretty) = serde_json::to_string_pretty(&j) {
+                    app.current_tab_mut().response_body_content =
+                        text_editor::Content::with_text(&pretty);
+                }
+            }
+
+            iced::Task::none()
+        }
         Message::WsConnect => {
             let url = app.current_tab().url.clone();
 
@@ -4012,6 +4317,12 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
                 ..Default::default()
             });
         iced::widget::stack![body, overlay].into()
+    } else {
+        body
+    };
+
+    let body: Element<'_, Message> = if app.cookie_jar_open {
+        iced::widget::stack![body, app.render_cookie_jar_modal()].into()
     } else {
         body
     };
@@ -4357,7 +4668,7 @@ impl ApiKeyPosition {
     const ALL: [ApiKeyPosition; 2] = [ApiKeyPosition::Header, ApiKeyPosition::QueryParams];
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct HttpResponse {
     status: String,
     headers: String,
@@ -4368,6 +4679,7 @@ struct HttpResponse {
     bytes: Vec<u8>,
     content_type: String,
     response_time: Option<tokio::time::Duration>,
+    set_cookies: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4676,6 +4988,16 @@ impl CollectionItem {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CookieEntry {
+    pub name: String,
+    pub value: String,
+    pub enabled: bool,
+    pub domain: String,
+    pub path: String,
+    pub expires: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CollectionFolder {
     id: usize,
@@ -4711,4 +5033,40 @@ async fn save_collection(collection: Collection) {
 async fn load_collection() -> Option<Collection> {
     let bytes = tokio::fs::read(collection_file_path()).await.ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn extract_domain(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+}
+
+fn parse_set_cookie(raw: &str) -> Option<CookieEntry> {
+    let mut parts = raw.split(';');
+    let main = parts.next()?;
+    let (name, value) = main.split_once('=')?;
+
+    let mut path = "/".to_string();
+    let mut domain = String::new();
+    let mut expires = None;
+
+    for part in parts {
+        let p = part.trim();
+        if let Some(v) = p.strip_prefix("path=") {
+            path = v.to_string();
+        } else if let Some(v) = p.strip_prefix("domain=") {
+            domain = v.to_string();
+        } else if let Some(v) = p.strip_prefix("expires=") {
+            expires = Some(v.to_string());
+        }
+    }
+
+    Some(CookieEntry {
+        name: name.trim().to_string(),
+        value: value.trim().to_string(),
+        enabled: true,
+        domain,
+        path,
+        expires,
+    })
 }

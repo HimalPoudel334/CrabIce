@@ -7,7 +7,7 @@ edition = "2024"
 iced = { version = "0.14.0", default-features = false, features = ["advanced", "highlighter", "image", "svg", "tokio", "sipper"] }
 iced_video_player = { git = "https://github.com/jazzfool/iced_video_player.git", branch = "master" }
 once_cell = "1.21.3"
-reqwest = { version = "0.12.24", features = ["multipart", "json", "gzip", "brotli", "zstd", "deflate"] }
+reqwest = { version = "0.12.24", features = ["multipart", "stream", "json", "gzip", "brotli", "zstd", "deflate"] }
 rfd = "0.16.0"
 serde_json = "1.0.145"
 tokio = { version = "1.48.0", features = ["fs", "macros"] }
@@ -17,15 +17,17 @@ serde = { version = "1.0.228", features = ["derive"] }
 futures = "0.3.31"
 chrono = "0.4.43"
 iced_aw = { version = "0.13.0", features = ["tabs", "tab_bar", "context_menu"] }
+async-tungstenite = "0.32.1"
+reqwest-websocket = "0.5.1"
+async-stream = "0.3.6"
+futures-util = "0.3.32"
+
 
 # Add GStreamer crates
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
 gstreamer-base = "0.23"
-async-tungstenite = "0.32.1"
-reqwest-websocket = "0.5.1"
-
 
 [profile.release]
 strip = true
