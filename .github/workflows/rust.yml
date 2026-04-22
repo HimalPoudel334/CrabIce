@@ -31,5 +31,5 @@ jobs:
                               gstreamer1.0-libav
 
       # Build the project
-      - name: Build CrabIce
+      - name: Build CrabiPie
         run: cargo build --release

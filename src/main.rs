@@ -68,6 +68,11 @@ enum Message {
     FileSaved(Result<String, String>),
     ClearResponseText,
 
+    // GraphQL
+    GraphqlQueryAction(text_editor::Action),
+    GraphqlVariablesAction(text_editor::Action),
+    GraphqlOperationChanged(String),
+
     // Global Cookie auth
     CookieJarOpen,
     CookieJarClose,
@@ -237,6 +242,11 @@ struct TabState {
     raw_form_content: text_editor::Content,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
+    // GraphQL
+    graphql_query: text_editor::Content,
+    graphql_variables: text_editor::Content,
+    graphql_operation: String,
+
     // response stream
     stream_buffer: String,
     is_streaming: bool,
@@ -326,6 +336,9 @@ impl TabState {
             ws_binary_message_type: WsBinaryMessageType::Base64,
             is_streaming: false,
             stream_buffer: String::new(),
+            graphql_query: text_editor::Content::new(),
+            graphql_variables: text_editor::Content::with_text("{}"),
+            graphql_operation: String::new(),
         }
     }
 
@@ -381,6 +394,9 @@ impl TabState {
             ws_binary_message_type: saved.ws_binary_message_type,
             is_streaming: false,
             stream_buffer: String::new(),
+            graphql_query: text_editor::Content::new(),
+            graphql_variables: text_editor::Content::with_text("{}"),
+            graphql_operation: String::new(),
         }
     }
 
@@ -517,7 +533,7 @@ impl CrabiPie {
     }
 
     fn title(&self) -> String {
-        "CrabIce".to_string()
+        "CrabiPie".to_string()
     }
 
     fn current_tab(&self) -> &TabState {
@@ -1016,6 +1032,41 @@ impl CrabiPie {
         .into()
     }
 
+    fn render_graphql_tab(&self) -> Element<'_, Message> {
+        let operation_row = row![
+            text("Operation:"),
+            text_input(
+                "optional operation name",
+                &self.current_tab().graphql_operation
+            )
+            .on_input(Message::GraphqlOperationChanged)
+            .width(200),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let query_editor = column![
+            text("Query:").size(12),
+            text_editor(&self.current_tab().graphql_query)
+                .on_action(Message::GraphqlQueryAction)
+                .height(Length::FillPortion(3)),
+        ]
+        .spacing(4);
+
+        let variables_editor = column![
+            text("Variables (JSON):").size(12),
+            text_editor(&self.current_tab().graphql_variables)
+                .on_action(Message::GraphqlVariablesAction)
+                .height(Length::FillPortion(2)),
+        ]
+        .spacing(4);
+
+        column![operation_row, query_editor, variables_editor]
+            .spacing(10)
+            .height(Length::Fill)
+            .into()
+    }
+
     // Helper function to connect
     async fn connect_ws(
         url: &str,
@@ -1068,6 +1119,7 @@ impl CrabiPie {
             json_theme: json_theme_str,
             app_theme: app_theme_str,
             next_tab_id: self.next_tab_id,
+            cookie_jar: self.cookie_jar.clone(),
         };
 
         iced::Task::perform(save_app_state(state), |_| Message::SaveComplete)
@@ -1826,7 +1878,13 @@ impl CrabiPie {
                 .push(
                     RequestTab::Body,
                     iced_aw::TabLabel::Text("Body".into()),
-                    container(self.render_body_tab()).padding(Padding {
+                    container({
+                        match self.current_tab().request_type {
+                            RequestType::GraphQL => self.render_graphql_tab(),
+                            _ => self.render_body_tab(),
+                        }
+                    })
+                    .padding(Padding {
                         top: 10.0,
                         ..Default::default()
                     }),
@@ -2353,7 +2411,7 @@ impl CrabiPie {
         .padding(20);
 
         let modal = container(modal_body)
-            .width(Length::Fixed(680.0))
+            .width(Length::Fixed(640.0))
             .max_height(520)
             .style(container::rounded_box);
 
@@ -2886,6 +2944,30 @@ impl CrabiPie {
 
         // ── body ─────────────────────────────
         let client = &HTTP_CLIENT;
+        if tab.request_type == RequestType::GraphQL {
+            let variables: serde_json::Value = serde_json::from_str(&tab.graphql_variables.text())
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+
+            let body = serde_json::json!({
+                "query": tab.graphql_query.text(),
+                "variables": variables,
+                "operationName": if tab.graphql_operation.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(tab.graphql_operation.clone())
+                }
+            });
+
+            return (
+                client
+                    .post(&url)
+                    .body(body.to_string())
+                    .header("Content-Type", "application/json")
+                    .headers(header_map),
+                url,
+            );
+        }
+
         let builder = match tab.method {
             HttpMethod::GET => client.get(&url),
             HttpMethod::DELETE => client.delete(&url),
@@ -3170,7 +3252,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::RequestTypeSelected(req_type) => {
             match req_type {
-                RequestType::HTTP => {
+                RequestType::HTTP | RequestType::GraphQL => {
                     app.current_tab_mut().request_type = req_type;
                 }
                 RequestType::WebSocket => {
@@ -3273,6 +3355,18 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         Message::ClearResponseText => {
             app.current_tab_mut().response_body_content = text_editor::Content::with_text("");
             app.current_tab_mut().response_headers_content = text_editor::Content::with_text("");
+            iced::Task::none()
+        }
+        Message::GraphqlQueryAction(action) => {
+            app.current_tab_mut().graphql_query.perform(action);
+            iced::Task::none()
+        }
+        Message::GraphqlVariablesAction(action) => {
+            app.current_tab_mut().graphql_variables.perform(action);
+            iced::Task::none()
+        }
+        Message::GraphqlOperationChanged(val) => {
+            app.current_tab_mut().graphql_operation = val;
             iced::Task::none()
         }
         Message::CookieJarOpen => {
@@ -4115,6 +4209,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 app.tabs = saved.tabs.into_iter().map(TabState::from_saved).collect();
                 app.next_tab_id = saved.next_tab_id;
                 app.active_tab = saved.active_tab.min(app.tabs.len().saturating_sub(1));
+                app.cookie_jar = saved.cookie_jar;
             }
             iced::Task::none()
         }
@@ -4331,7 +4426,7 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
 }
 
 fn main() -> iced::Result {
-    let icon_bytes = include_bytes!("../CrabIce.ico");
+    let icon_bytes = include_bytes!("../CrabiPie.ico");
     iced::application(CrabiPie::new, update, view)
         .theme(|app: &CrabiPie| app.app_theme.clone())
         .subscription(|app| app.subscription())
@@ -4729,7 +4824,7 @@ impl RequestHeaders {
         vec![
             Self {
                 key: "User-Agent".to_string(),
-                value: "CrabIce".to_string(),
+                value: "CrabiPie".to_string(),
                 enabled: true,
             },
             Self {
@@ -4759,6 +4854,7 @@ enum RequestTab {
     Headers,
     Auth,
     Query,
+    GraphQL,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -4862,6 +4958,7 @@ struct AppPersistedState {
     json_theme: String,
     app_theme: String,
     next_tab_id: usize,
+    cookie_jar: std::collections::HashMap<String, Vec<CookieEntry>>,
 }
 
 fn state_file_path() -> std::path::PathBuf {
@@ -4870,7 +4967,7 @@ fn state_file_path() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(".")); // last resort: current dir
 
-    let dir = base.join(".crabice");
+    let dir = base.join(".crabipie");
     std::fs::create_dir_all(&dir).ok();
     dir.join("session.json")
 }
@@ -4946,15 +5043,10 @@ fn json_theme_from_str(s: &str) -> json_highlighter::JsonThemeWrapper {
     }
 }
 
-struct DragState {
-    dragging_id: usize,     // id of the item being dragged
-    hover_target_id: usize, // id of the item currently hovered over
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Collection {
     name: String,
-    items: Vec<CollectionItem>, // top-level items
+    items: Vec<CollectionItem>,
 }
 
 impl Collection {
@@ -4988,7 +5080,7 @@ impl CollectionItem {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CookieEntry {
     pub name: String,
     pub value: String,

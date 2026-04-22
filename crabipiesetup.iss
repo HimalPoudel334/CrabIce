@@ -1,12 +1,12 @@
 ; --------------------------------------------------------------
-; CrabIce.iss — Full installer with MinGW + GStreamer (media)
+; CrabiPie.iss — Full installer with MinGW + GStreamer (media)
 ; --------------------------------------------------------------
 
-#define MyAppName      "CrabIce"
+#define MyAppName      "CrabiPie"
 #define MyAppVersion   "0.1.0"
 #define MyAppPublisher "Himal Poudel"
 #define MyAppURL       "https://github.com/himalpoudel334/CrabIce"
-#define MyAppExeName   "CrabIce.exe"
+#define MyAppExeName   "CrabiPie.exe"
 
 #define MyAppSourceDir "C:\Users\himal\Documents\Projects\rust\CrabIce\target\release"
 #define MSYS2_MINGW64  "C:\msys64\mingw64"
@@ -20,13 +20,13 @@ AppPublisherURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=Output
-OutputBaseFilename=CrabIce_Setup_v{#MyAppVersion}
+OutputBaseFilename=CrabiPie_Setup_v{#MyAppVersion}
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=admin
-UninstallDisplayIcon={app}\CrabIce.ico
+UninstallDisplayIcon={app}\CrabiPie.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -42,7 +42,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#MyAppSourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Icon
-Source: "CrabIce.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "CrabiPie.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 ; -------------------------
 ; MinGW runtime
@@ -84,8 +84,8 @@ Source: "{#MSYS2_MINGW64}\lib\gstreamer-1.0\*"; DestDir: "{app}\gstreamer-1.0"; 
 ; ICONS
 ; --------------------------------------------------------------
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\CrabIce.ico"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\CrabIce.ico"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\CrabiPie.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\CrabiPie.ico"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 
 ; --------------------------------------------------------------
@@ -94,3 +94,22 @@ Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 [Run]
 Filename: "{cmd}"; Parameters: "/C setx GST_PLUGIN_PATH ""{app}\gstreamer-1.0"""; Flags: runhidden
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  StatePath: String;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    StatePath := ExpandConstant('{%USERPROFILE}\.crabipie');
+    if DirExists(StatePath) then
+    begin
+      if MsgBox('Remove CrabiPie saved data (sessions, collections, cookies)?'#13#10 +
+                StatePath, mbConfirmation, MB_YESNO) = IDYES then
+      begin
+        DelTree(StatePath, True, True, True);
+      end;
+    end;
+  end;
+end;
