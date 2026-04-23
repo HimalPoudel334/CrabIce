@@ -72,6 +72,12 @@ enum Message {
     GraphqlQueryAction(text_editor::Action),
     GraphqlVariablesAction(text_editor::Action),
     GraphqlOperationChanged(String),
+    FetchGraphqlSchema,
+    GraphqlSchemaFetched(Result<GraphqlSchema, String>),
+    GraphqlFieldToggled(String, String),
+    GraphqlTypeToggled(String),
+    GraphqlSearchChanged(String),
+    GraphqlCollapseAll,
 
     // Global Cookie auth
     CookieJarOpen,
@@ -242,10 +248,15 @@ struct TabState {
     raw_form_content: text_editor::Content,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
-    // GraphQL
+    // GraphQL Editors ---
     graphql_query: text_editor::Content,
     graphql_variables: text_editor::Content,
     graphql_operation: String,
+    graphql_schema: Option<GraphqlSchema>,
+    graphql_schema_loading: bool,
+    graphql_schema_error: Option<String>,
+    graphql_expanded_types: std::collections::HashSet<String>,
+    graphql_search: String,
 
     // response stream
     stream_buffer: String,
@@ -339,6 +350,11 @@ impl TabState {
             graphql_query: text_editor::Content::new(),
             graphql_variables: text_editor::Content::with_text("{}"),
             graphql_operation: String::new(),
+            graphql_schema: None,
+            graphql_schema_loading: false,
+            graphql_schema_error: None,
+            graphql_expanded_types: std::collections::HashSet::new(),
+            graphql_search: String::new(),
         }
     }
 
@@ -397,6 +413,11 @@ impl TabState {
             graphql_query: text_editor::Content::new(),
             graphql_variables: text_editor::Content::with_text("{}"),
             graphql_operation: String::new(),
+            graphql_schema: None,
+            graphql_schema_loading: false,
+            graphql_schema_error: None,
+            graphql_expanded_types: std::collections::HashSet::new(),
+            graphql_search: String::new(),
         }
     }
 
@@ -621,7 +642,7 @@ impl CrabiPie {
                 .on_input(Message::ReplaceTextChanged)
                 .into()
         } else {
-            space::horizontal().width(0).into()
+            Space::new().into()
         };
 
         let replace_btns_or_space: Element<'_, Message> = if self.find_replace_mode {
@@ -644,7 +665,7 @@ impl CrabiPie {
             .align_y(iced::Alignment::End)
             .into()
         } else {
-            space::horizontal().width(0).into()
+            Space::new().into()
         };
 
         let match_info: Element<'_, Message> = if !self.find_text.is_empty() {
@@ -655,7 +676,7 @@ impl CrabiPie {
             .align_y(iced::Alignment::Center)
             .into()
         } else {
-            space::horizontal().width(0).into()
+            Space::new().into()
         };
 
         let find_mode_buttons = row![
@@ -1033,38 +1054,128 @@ impl CrabiPie {
     }
 
     fn render_graphql_tab(&self) -> Element<'_, Message> {
+        let tab = self.current_tab();
+
+        // ── left: schema tree ────────────────
+        let schema_panel: Element<'_, Message> = if tab.graphql_schema_loading {
+            container(text("Loading schema...").size(14))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
+        } else if let Some(err) = &tab.graphql_schema_error {
+            container(text(err).style(|_| text::Style {
+                color: Some(iced::Color::from_rgb(1.0, 0.3, 0.3)),
+            }))
+            .padding(10)
+            .into()
+        } else if let Some(schema) = &tab.graphql_schema {
+            // --- Search + Collapse Bar ---
+            let top_bar = row![
+                text_input("Search fields", &tab.graphql_search)
+                    .on_input(Message::GraphqlSearchChanged)
+                    .width(Length::Fill)
+                    .padding(5),
+                button(text("󰡍").size(16))
+                    .style(button::text)
+                    .padding(5)
+                    .on_press(Message::GraphqlCollapseAll),
+                button(text("↻").size(16))
+                    .style(button::text)
+                    .padding(5)
+                    .on_press(Message::FetchGraphqlSchema),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            // --- Root Type Row ---
+            let root_type_name = &schema.query_type.name;
+            let root_expanded = tab.graphql_expanded_types.contains(root_type_name);
+
+            let root_row = row![
+                button(text(if root_expanded { "▼" } else { "▶" }).size(10))
+                    .style(button::text)
+                    .on_press(Message::GraphqlTypeToggled(root_type_name.clone())),
+                text(root_type_name).size(16),
+            ]
+            .align_y(Alignment::Center);
+
+            let mut scroll_content = Column::new().spacing(0); // Set spacing to 0 for tight rows
+            scroll_content = scroll_content.push(
+                container(root_row).padding(Padding::new(0.0).top(8)), // Space before root
+            );
+
+            if root_expanded {
+                if let Some(root_type) = schema
+                    .types
+                    .iter()
+                    .find(|t| t.name.as_ref() == Some(root_type_name))
+                {
+                    let tree_rows = render_schema_tree(
+                        &schema.types,
+                        root_type,
+                        &tab.graphql_expanded_types,
+                        &tab.graphql_search,
+                        1, // Indentation level
+                        "",
+                    );
+                    for row in tree_rows {
+                        scroll_content = scroll_content.push(row);
+                    }
+                }
+            }
+
+            column![
+                top_bar,
+                scrollable(scroll_content)
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+            ]
+            .spacing(4) // Tight spacing between bar and content
+            .height(Length::Fill)
+            .into()
+        } else {
+            // ... (Empty State - unchanged)
+            container(button("Fetch Schema").on_press(Message::FetchGraphqlSchema)).into()
+        };
+
+        // ── right: query + variables ──────────
         let operation_row = row![
-            text("Operation:"),
-            text_input(
-                "optional operation name",
-                &self.current_tab().graphql_operation
-            )
-            .on_input(Message::GraphqlOperationChanged)
-            .width(200),
+            text("Operation:").size(12),
+            text_input("optional", &tab.graphql_operation)
+                .on_input(Message::GraphqlOperationChanged)
+                .width(Length::FillPortion(1)),
+            space::horizontal(),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
 
-        let query_editor = column![
+        let right_panel = column![
+            operation_row,
             text("Query:").size(12),
-            text_editor(&self.current_tab().graphql_query)
+            text_editor(&tab.graphql_query)
                 .on_action(Message::GraphqlQueryAction)
                 .height(Length::FillPortion(3)),
-        ]
-        .spacing(4);
-
-        let variables_editor = column![
             text("Variables (JSON):").size(12),
-            text_editor(&self.current_tab().graphql_variables)
+            text_editor(&tab.graphql_variables)
                 .on_action(Message::GraphqlVariablesAction)
                 .height(Length::FillPortion(2)),
         ]
-        .spacing(4);
+        .spacing(8)
+        .height(Length::Fill);
 
-        column![operation_row, query_editor, variables_editor]
-            .spacing(10)
-            .height(Length::Fill)
-            .into()
+        // ── main layout ──────────────────────
+        row![
+            container(schema_panel)
+                .width(Length::FillPortion(1))
+                .height(Length::Fill),
+            rule::vertical(1),
+            container(right_panel)
+                .width(Length::FillPortion(2))
+                .height(Length::Fill)
+        ]
+        .spacing(5)
+        .height(Length::Fill)
+        .into()
     }
 
     // Helper function to connect
@@ -3358,15 +3469,103 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::GraphqlQueryAction(action) => {
+            // text_editor::Content::perform handles the editing logic
             app.current_tab_mut().graphql_query.perform(action);
             iced::Task::none()
         }
+
         Message::GraphqlVariablesAction(action) => {
             app.current_tab_mut().graphql_variables.perform(action);
             iced::Task::none()
         }
+
         Message::GraphqlOperationChanged(val) => {
             app.current_tab_mut().graphql_operation = val;
+            iced::Task::none()
+        }
+
+        Message::FetchGraphqlSchema => {
+            let url = app.current_tab().url.clone();
+            if url.is_empty() {
+                return iced::Task::none();
+            }
+
+            let tab = app.current_tab_mut();
+            tab.graphql_schema_loading = true;
+            tab.graphql_schema_error = None;
+
+            iced::Task::perform(
+                async move {
+                    let body = serde_json::json!({ "query": INTROSPECTION_QUERY });
+                    let resp = HTTP_CLIENT
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .body(body.to_string())
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    let text = resp.text().await.map_err(|e| e.to_string())?;
+
+                    // This function should now return your new GraphqlSchema struct
+                    parse_graphql_schema(&text)
+                },
+                Message::GraphqlSchemaFetched,
+            )
+        }
+
+        Message::GraphqlSchemaFetched(result) => {
+            let tab = app.current_tab_mut();
+            tab.graphql_schema_loading = false;
+            match result {
+                Ok(schema) => {
+                    tab.graphql_schema = Some(schema);
+                    tab.graphql_schema_error = None;
+                    // Optional: Auto-expand the root query type
+                    // tab.graphql_expanded_types.insert(schema.query_type.name.clone());
+                }
+                Err(e) => {
+                    tab.graphql_schema_error = Some(e);
+                }
+            }
+            iced::Task::none()
+        }
+
+        Message::GraphqlFieldToggled(type_name, field_name) => {
+            println!("Clicked: {} -> {}", type_name, field_name);
+            if let Some(schema) = app.current_tab_mut().graphql_schema.as_mut() {
+                // Fix: Use as_deref() to compare Option<String> with &str
+                if let Some(t) = schema
+                    .types
+                    .iter_mut()
+                    .find(|t| t.name.as_deref() == Some(&type_name))
+                {
+                    // Fix: Access fields safely using as_mut() on the Option
+                    if let Some(fields) = t.fields.as_mut() {
+                        if let Some(f) = fields.iter_mut().find(|f| f.name == field_name) {
+                            f.is_selected = !f.is_selected;
+                        }
+                    }
+                }
+            }
+            iced::Task::none()
+        }
+
+        Message::GraphqlTypeToggled(name) => {
+            let expanded = &mut app.current_tab_mut().graphql_expanded_types;
+            if !expanded.remove(&name) {
+                expanded.insert(name);
+            }
+            iced::Task::none()
+        }
+
+        Message::GraphqlSearchChanged(val) => {
+            app.current_tab_mut().graphql_search = val;
+            iced::Task::none()
+        }
+        Message::GraphqlCollapseAll => {
+            // Clear the set to collapse everything
+            app.current_tab_mut().graphql_expanded_types.clear();
             iced::Task::none()
         }
         Message::CookieJarOpen => {
@@ -4097,7 +4296,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.current_tab_mut().response_body_content = text_editor::Content::with_text(&current);
             iced::Task::none()
         }
-
         Message::StreamDone => {
             app.current_tab_mut().is_streaming = false;
             app.current_tab_mut().loading = false;
@@ -4201,7 +4399,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.current_tab_mut().ws_binary_message_type = msg_type;
             iced::Task::none()
         }
-
         Message::StateLoaded(maybe_state) => {
             if let Some(saved) = maybe_state {
                 app.json_theme = json_theme_from_str(&saved.json_theme);
@@ -4213,7 +4410,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::SaveComplete => iced::Task::none(),
         Message::CollectionLoaded(maybe_collection) => {
             if let Some(collection) = maybe_collection {
@@ -4221,17 +4417,14 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::ToggleSidebar => {
             app.sidebar_open = !app.sidebar_open;
             iced::Task::none()
         }
-
         Message::SidebarItemSelected(id) => {
             app.sidebar_selected_id = Some(id);
             iced::Task::none()
         }
-
         Message::CollectionFolderAdd(parent_id) => {
             let id = app.next_collection_id();
             let folder = CollectionItem::Folder(CollectionFolder {
@@ -4246,12 +4439,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.sidebar_editing_name = "New Folder".to_string();
             app.collection_save_task()
         }
-
         Message::CollectionItemToggleExpand(id) => {
             CrabiPie::collection_toggle_expand(&mut app.collection.items, id);
             iced::Task::none()
         }
-
         Message::CollectionRequestOpen(id) => {
             app.sidebar_selected_id = Some(id);
             if let Some(req) = CrabiPie::collection_find_request(&app.collection.items, id) {
@@ -4262,7 +4453,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::CollectionItemRename(id) => {
             // find current name
             fn find_name(items: &[CollectionItem], id: usize) -> Option<String> {
@@ -4284,12 +4474,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::CollectionItemRenameInput(text) => {
             app.sidebar_editing_name = text;
             iced::Task::none()
         }
-
         Message::CollectionItemRenameConfirm(id) => {
             let new_name = app.sidebar_editing_name.trim().to_string();
             if !new_name.is_empty() {
@@ -4299,42 +4487,34 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.sidebar_editing_name = String::new();
             app.collection_save_task()
         }
-
         Message::CollectionItemRenameCancel => {
             app.sidebar_editing_id = None;
             app.sidebar_editing_name = String::new();
             iced::Task::none()
         }
-
         Message::CollectionItemDelete(id) => {
             CrabiPie::collection_remove_item(&mut app.collection.items, id);
             app.collection_save_task()
         }
-
         Message::CollectionItemDuplicate(id) => {
             let new_id = app.next_collection_id();
             CrabiPie::collection_duplicate_item(&mut app.collection.items, id, new_id);
             app.collection_save_task()
         }
-
-        // Save modal
         Message::OpenSaveModal => {
             app.save_modal_open = true;
             app.save_modal_name = app.current_tab().title.clone();
             app.save_modal_folder_id = None;
             iced::Task::none()
         }
-
         Message::SaveModalNameChanged(name) => {
             app.save_modal_name = name;
             iced::Task::none()
         }
-
         Message::SaveModalFolderSelected(folder_id) => {
             app.save_modal_folder_id = folder_id;
             iced::Task::none()
         }
-
         Message::SaveModalConfirm => {
             let id = app.next_collection_id();
             let saved_state = app
@@ -4353,14 +4533,12 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.save_modal_folder_id = None;
             app.collection_save_task()
         }
-
         Message::SaveModalCancel => {
             app.save_modal_open = false;
             app.save_modal_name = String::new();
             app.save_modal_folder_id = None;
             iced::Task::none()
         }
-
         Message::CollectionSaved => iced::Task::none(),
     }
 }
@@ -4440,18 +4618,6 @@ fn main() -> iced::Result {
         .exit_on_close_request(false)
         .run()
 }
-
-const BODY_DEFAULT: &str = r#"{
-  "title": "foo",
-  "body": "bar",
-  "userId": 1,
-  "foo": "bar"
-}"#;
-
-const RAW_FORM_PLACEHOLDER: &str = r#"Rows are separated by newline.
-Keys and values are separated by :
-Prepend # to the rows that you want to add but keep it disabled.
-"#;
 
 #[derive(Debug, Hash, Clone)]
 struct WebSocketRecipe {
@@ -5162,3 +5328,355 @@ fn parse_set_cookie(raw: &str) -> Option<CookieEntry> {
         expires,
     })
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IntrospectionResponse {
+    data: SchemaWrapper,
+}
+
+#[derive(Debug, Deserialize)]
+struct SchemaWrapper {
+    #[serde(rename = "__schema")]
+    schema: GraphqlSchema,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlSchema {
+    query_type: TypeRef,
+    types: Vec<GraphqlType>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct TypeRef {
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlType {
+    name: Option<String>,
+    kind: String,
+    fields: Option<Vec<GraphqlField>>,
+    input_fields: Option<Vec<GraphqlField>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlField {
+    name: String,
+    // The "type" field is an object, not a string
+    #[serde(rename = "type")]
+    field_type: TypeDetail,
+
+    #[serde(default)]
+    args: Vec<GraphqlArg>,
+
+    #[serde(default)]
+    is_selected: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlArg {
+    name: String,
+    #[serde(rename = "type")]
+    arg_type: TypeDetail,
+}
+
+impl std::fmt::Display for GraphqlArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.name, self.arg_type)
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TypeDetail {
+    name: Option<String>,
+    kind: String,
+    // This allows for [String!]! logic
+    of_type: Option<Box<TypeDetail>>,
+}
+
+impl TypeDetail {
+    /// Recursively finds the actual name of the type,
+    /// bypassing NON_NULL and LIST wrappers.
+    pub fn get_base_name(&self) -> Option<&String> {
+        if let Some(ref name) = self.name {
+            Some(name)
+        } else if let Some(ref inner) = self.of_type {
+            inner.get_base_name()
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for TypeDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind.as_str() {
+            "NON_NULL" => {
+                if let Some(inner) = &self.of_type {
+                    write!(f, "{}!", inner)
+                } else {
+                    write!(f, "Unknown!")
+                }
+            }
+            "LIST" => {
+                if let Some(inner) = &self.of_type {
+                    write!(f, "[{}]", inner)
+                } else {
+                    write!(f, "[Unknown]")
+                }
+            }
+            // For SCALAR, OBJECT, etc., just print the name
+            _ => write!(f, "{}", self.name.as_deref().unwrap_or("Unknown")),
+        }
+    }
+}
+
+fn parse_graphql_schema(json: &str) -> Result<GraphqlSchema, String> {
+    let wrapper: IntrospectionResponse =
+        serde_json::from_str(json).map_err(|e| format!("JSON Deserialization Error: {}", e))?;
+
+    let mut schema = wrapper.data.schema;
+
+    schema.types.retain(|t| {
+        t.name
+            .as_ref()
+            .map(|name| !name.starts_with("__"))
+            .unwrap_or(true)
+    });
+
+    Ok(schema)
+}
+
+fn render_schema_tree<'a>(
+    types: &'a [GraphqlType],
+    current_type: &'a GraphqlType,
+    expanded: &std::collections::HashSet<String>,
+    search: &str,
+    depth: u16,
+    path: &str,
+) -> Vec<Element<'a, Message>> {
+    let mut rows: Vec<Element<'a, Message>> = vec![];
+
+    let fields_to_render = current_type
+        .fields
+        .as_ref()
+        .or(current_type.input_fields.as_ref());
+
+    let Some(fields) = fields_to_render else {
+        return rows;
+    };
+
+    let current_type_name = current_type.name.as_deref().unwrap_or("Unknown");
+
+    let indent_width = depth as f32 * 16.0;
+
+    for field in fields {
+        // Search filter
+        if !search.is_empty() && !field.name.to_lowercase().contains(&search.to_lowercase()) {
+            continue;
+        }
+
+        let base_type_name = field
+            .field_type
+            .get_base_name()
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown");
+
+        let field_path = if path.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{}.{}", path, field.name)
+        };
+
+        // Check expandability
+        let target_type = types
+            .iter()
+            .find(|t| t.name.as_deref() == Some(base_type_name));
+
+        let has_type_children = target_type.map_or(false, |t| {
+            t.fields.as_ref().map_or(false, |f| !f.is_empty())
+                || t.input_fields.as_ref().map_or(false, |f| !f.is_empty())
+        });
+
+        let has_args = !field.args.is_empty();
+        let is_expandable = has_type_children || has_args;
+        let is_expanded = expanded.contains(&field_path);
+
+        // UI Components
+        let expander_width = 20.0;
+
+        let expand_btn: Element<'a, Message> = if is_expandable {
+            container(
+                button(text(if is_expanded { "▼" } else { "▶" }).size(10))
+                    .style(button::text)
+                    .padding(0)
+                    .on_press(Message::GraphqlTypeToggled(field_path.clone())),
+            )
+            .width(expander_width)
+            .center_x(expander_width)
+            .into()
+        } else {
+            Space::new().width(expander_width).into()
+        };
+
+        let type_label =
+            text(format!("{}", field.field_type))
+                .size(13)
+                .style(|theme: &iced::Theme| text::Style {
+                    color: Some(iced::Color::from_rgb(0.5, 0.5, 0.5)), // Grey out the types
+                });
+
+        let field_row = row![
+            Space::new().width(indent_width),
+            expand_btn,
+            // 2. Use the pre-cloned variables here
+            checkbox(field.is_selected).on_toggle(move |_| Message::GraphqlFieldToggled(
+                current_type_name.to_string(),
+                field.name.clone()
+            )),
+            text(field.name.clone()).size(14),
+            type_label,
+        ]
+        .spacing(4)
+        .padding(Padding {
+            top: 2.0,
+            ..Default::default()
+        })
+        .align_y(Alignment::Center);
+
+        rows.push(field_row.into());
+
+        // Recursive expansion
+        if is_expanded {
+            // A. Render Arguments AND their nested fields
+            for arg in &field.args {
+                let arg_path = format!("{}.{}", field_path, arg.name);
+                let is_arg_expanded = expanded.contains(&arg_path);
+
+                // Find if the argument type has sub-fields (is it an Input Object?)
+                let arg_base_name = arg
+                    .arg_type
+                    .get_base_name()
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let arg_target_type = types
+                    .iter()
+                    .find(|t| t.name.as_deref() == Some(arg_base_name));
+
+                // An argument is expandable if it has input_fields
+                let is_arg_expandable = arg_target_type.map_or(false, |t| t.input_fields.is_some());
+
+                // --- Render the Argument Row ---
+                let arg_expander: Element<'a, Message> = if is_arg_expandable {
+                    button(text(if is_arg_expanded { "▼" } else { "▶" }).size(10))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::GraphqlTypeToggled(arg_path.clone()))
+                        .into()
+                } else {
+                    Space::new().width(20.0).into()
+                };
+
+                // --- Render the Argument Row ---
+                let arg_row = row![
+                    Space::new().width(indent_width + 20.0),
+                    container(arg_expander).width(20.0).center_x(20.0),
+                    text(format!("arg: {}", arg.name))
+                        .size(13)
+                        .style(|_| text::Style {
+                            color: Some(iced::Color::from_rgb(0.9, 0.5, 0.1))
+                        }),
+                    text(format!("({})", arg.arg_type))
+                        .size(10)
+                        .style(|_| text::Style {
+                            color: Some(iced::Color::from_rgb(0.5, 0.5, 0.5))
+                        }),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center);
+
+                rows.push(arg_row.into());
+
+                // --- Recurse into Argument Children (the 'code', 'eq' part) ---
+                if is_arg_expanded && is_arg_expandable {
+                    if let Some(arg_type_obj) = arg_target_type {
+                        let arg_children = render_schema_tree(
+                            types,
+                            arg_type_obj,
+                            expanded,
+                            search,
+                            depth + 2, // Move children further right
+                            &arg_path,
+                        );
+                        rows.extend(arg_children);
+                    }
+                }
+            }
+
+            // B. Recurse into child fields (Return Types)
+            if let Some(child_type_obj) = target_type {
+                let children = render_schema_tree(
+                    types,
+                    child_type_obj,
+                    expanded,
+                    search,
+                    depth + 1,
+                    &field_path,
+                );
+                rows.extend(children);
+            }
+        }
+    }
+
+    rows
+}
+
+const BODY_DEFAULT: &str = r#"{
+  "title": "foo",
+  "body": "bar",
+  "userId": 1,
+  "foo": "bar"
+}"#;
+
+const RAW_FORM_PLACEHOLDER: &str = r#"Rows are separated by newline.
+Keys and values are separated by :
+Prepend # to the rows that you want to add but keep it disabled.
+"#;
+
+const INTROSPECTION_QUERY: &str = r#"
+{
+  __schema {
+    queryType { name }
+    types {
+      name
+      kind
+      fields(includeDeprecated: false) {
+        name
+        type {
+          name
+          kind
+          ofType { name kind ofType { name kind } }
+        }
+        args {
+          name
+          type { name kind ofType { name kind } }
+        }
+      }
+      inputFields {
+        name
+        type {
+          name
+          kind
+          ofType { name kind ofType { name kind } }
+        }
+      }
+    }
+  }
+}
+"#;
