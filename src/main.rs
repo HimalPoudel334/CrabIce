@@ -74,8 +74,9 @@ enum Message {
     GraphqlOperationChanged(String),
     FetchGraphqlSchema,
     GraphqlSchemaFetched(Result<GraphqlSchema, String>),
-    GraphqlFieldToggled(String, String),
+    GraphqlFieldToggled(String),
     GraphqlTypeToggled(String),
+    GraphqlArgToggled(String),
     GraphqlSearchChanged(String),
     GraphqlCollapseAll,
 
@@ -257,6 +258,8 @@ struct TabState {
     graphql_schema_error: Option<String>,
     graphql_expanded_types: std::collections::HashSet<String>,
     graphql_search: String,
+    graphql_selected_paths: std::collections::HashSet<String>,
+    manually_selected_paths: std::collections::HashSet<String>,
 
     // response stream
     stream_buffer: String,
@@ -355,6 +358,8 @@ impl TabState {
             graphql_schema_error: None,
             graphql_expanded_types: std::collections::HashSet::new(),
             graphql_search: String::new(),
+            graphql_selected_paths: std::collections::HashSet::new(),
+            manually_selected_paths: std::collections::HashSet::new(),
         }
     }
 
@@ -395,8 +400,8 @@ impl TabState {
             response_content_type: String::new(),
             response_time: None,
             loading: false,
-            active_request_tab: RequestTab::Query,
-            active_response_tab: ResponseTab::Body,
+            active_request_tab: saved.active_request_tab,
+            active_response_tab: saved.active_response_tab,
             copied: false,
             ws_connected: false,
             ws_input: String::new(),
@@ -410,14 +415,16 @@ impl TabState {
             ws_binary_message_type: saved.ws_binary_message_type,
             is_streaming: false,
             stream_buffer: String::new(),
-            graphql_query: text_editor::Content::new(),
-            graphql_variables: text_editor::Content::with_text("{}"),
-            graphql_operation: String::new(),
-            graphql_schema: None,
+            graphql_query: text_editor::Content::with_text(&saved.graphql_query),
+            graphql_variables: text_editor::Content::with_text(&saved.graphql_variables),
+            graphql_operation: saved.graphql_operation,
+            graphql_schema: saved.graphql_schema,
             graphql_schema_loading: false,
-            graphql_schema_error: None,
-            graphql_expanded_types: std::collections::HashSet::new(),
+            graphql_schema_error: saved.graphql_schema_error,
+            graphql_expanded_types: saved.graphql_expanded_types,
             graphql_search: String::new(),
+            graphql_selected_paths: saved.graphql_selected_paths,
+            manually_selected_paths: saved.manually_selected_paths,
         }
     }
 
@@ -459,6 +466,17 @@ impl TabState {
             },
             ws_message_type: self.ws_message_type,
             ws_binary_message_type: self.ws_binary_message_type,
+            graphql_query: self.graphql_query.text(),
+            graphql_variables: self.graphql_variables.text(),
+            graphql_operation: self.graphql_operation.clone(),
+            graphql_schema: self.graphql_schema.clone(),
+            graphql_schema_error: self.graphql_schema_error.clone(),
+            graphql_expanded_types: self.graphql_expanded_types.clone(),
+            graphql_selected_paths: self.graphql_selected_paths.clone(),
+            manually_selected_paths: self.manually_selected_paths.clone(),
+
+            active_request_tab: self.active_request_tab,
+            active_response_tab: self.active_response_tab,
         }
     }
 
@@ -1101,7 +1119,8 @@ impl CrabiPie {
 
             let mut scroll_content = Column::new().spacing(0); // Set spacing to 0 for tight rows
             scroll_content = scroll_content.push(
-                container(root_row).padding(Padding::new(0.0).top(8)), // Space before root
+                // container(root_row).padding(Padding::new(0.0).top(8)), // Space before root
+                root_row,
             );
 
             if root_expanded {
@@ -1114,6 +1133,7 @@ impl CrabiPie {
                         &schema.types,
                         root_type,
                         &tab.graphql_expanded_types,
+                        &tab.graphql_selected_paths,
                         &tab.graphql_search,
                         1, // Indentation level
                         "",
@@ -1127,6 +1147,16 @@ impl CrabiPie {
             column![
                 top_bar,
                 scrollable(scroll_content)
+                    .direction(scrollable::Direction::Both {
+                        vertical: scrollable::Scrollbar::default()
+                            .width(12.0) // Make the bar wide enough to see
+                            .spacing(10.0) // Force 10px of "dead zone" between text and bar
+                            .scroller_width(8.0),
+                        horizontal: scrollable::Scrollbar::default()
+                            .width(12.0)
+                            .spacing(10.0)
+                            .scroller_width(8.0),
+                    })
                     .height(Length::Fill)
                     .width(Length::Fill)
             ]
@@ -1135,7 +1165,12 @@ impl CrabiPie {
             .into()
         } else {
             // ... (Empty State - unchanged)
-            container(button("Fetch Schema").on_press(Message::FetchGraphqlSchema)).into()
+            container(
+                button("Fetch Schema")
+                    .style(button::text)
+                    .on_press(Message::FetchGraphqlSchema),
+            )
+            .into()
         };
 
         // ── right: query + variables ──────────
@@ -1762,6 +1797,31 @@ impl CrabiPie {
             format!("{}h {}m", h, m)
         }
     }
+
+    pub fn build_query(&self) -> String {
+        let tab = self.current_tab();
+        let mut buf = String::from("query {\n");
+
+        if let Some(schema) = &tab.graphql_schema {
+            // Find the "Query" type (or whatever your query_type is named)
+            if let Some(root_type) = schema
+                .types
+                .iter()
+                .find(|t| t.name.as_deref() == Some("Query"))
+            {
+                buf.push_str(&generate_selection_set(
+                    &schema.types,
+                    root_type,
+                    &tab.graphql_selected_paths,
+                    1,       // Start at indent level 1
+                    "Query", // Starting path
+                ));
+            }
+        }
+
+        buf.push('}');
+        buf
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1793,6 +1853,19 @@ struct SavedState {
     response_status: Option<String>,
     response_headers: Option<String>,
     response_body: Option<String>,
+
+    // GraphQL
+    graphql_query: String,
+    graphql_variables: String,
+    graphql_operation: String,
+    graphql_schema: Option<GraphqlSchema>,
+    graphql_schema_error: Option<String>,
+    graphql_expanded_types: std::collections::HashSet<String>,
+    graphql_selected_paths: std::collections::HashSet<String>,
+    manually_selected_paths: std::collections::HashSet<String>,
+
+    active_request_tab: RequestTab,
+    active_response_tab: ResponseTab,
 }
 
 impl Default for SavedState {
@@ -1823,6 +1896,16 @@ impl Default for SavedState {
             response_body: None,
             ws_message_type: WsMessageType::Text,
             ws_binary_message_type: WsBinaryMessageType::Base64,
+            graphql_query: String::new(),
+            graphql_variables: String::new(),
+            graphql_operation: String::new(),
+            graphql_schema: None,
+            graphql_schema_error: None,
+            graphql_expanded_types: std::collections::HashSet::new(),
+            graphql_selected_paths: std::collections::HashSet::new(),
+            manually_selected_paths: std::collections::HashSet::new(),
+            active_request_tab: RequestTab::Query,
+            active_response_tab: ResponseTab::Body,
         }
     }
 }
@@ -3531,23 +3614,53 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
 
-        Message::GraphqlFieldToggled(type_name, field_name) => {
-            println!("Clicked: {} -> {}", type_name, field_name);
-            if let Some(schema) = app.current_tab_mut().graphql_schema.as_mut() {
-                // Fix: Use as_deref() to compare Option<String> with &str
-                if let Some(t) = schema
-                    .types
-                    .iter_mut()
-                    .find(|t| t.name.as_deref() == Some(&type_name))
-                {
-                    // Fix: Access fields safely using as_mut() on the Option
-                    if let Some(fields) = t.fields.as_mut() {
-                        if let Some(f) = fields.iter_mut().find(|f| f.name == field_name) {
-                            f.is_selected = !f.is_selected;
+        Message::GraphqlFieldToggled(path) | Message::GraphqlArgToggled(path) => {
+            {
+                let tab = app.current_tab_mut();
+                let selected = &mut tab.graphql_selected_paths;
+                let manual = &mut tab.manually_selected_paths;
+
+                if selected.contains(&path) {
+                    // --- TOGGLE OFF ---
+                    // 4. Recursive uncheck (Downwards)
+                    let child_prefix = format!("{}.", path);
+                    selected.retain(|p| p != &path && !p.starts_with(&child_prefix));
+                    manual.retain(|p| p != &path && !p.starts_with(&child_prefix));
+
+                    // 3. Walk backwards (Upwards)
+                    let mut parts: Vec<String> = path.split('.').map(|s| s.to_string()).collect();
+                    while parts.len() > 1 {
+                        parts.pop();
+                        let parent_path = parts.join(".");
+
+                        let sibling_prefix = format!("{}.", parent_path);
+                        let has_active_children =
+                            selected.iter().any(|p| p.starts_with(&sibling_prefix));
+
+                        if !has_active_children && !manual.contains(&parent_path) {
+                            selected.remove(&parent_path);
+                        } else {
+                            break;
                         }
+                    }
+                } else {
+                    // --- TOGGLE ON ---
+                    manual.insert(path.clone()); // Track this as a manual click
+
+                    // 1. Bubbling check (Upwards)
+                    let parts: Vec<&str> = path.split('.').collect();
+                    let mut current_path = String::new();
+                    for (i, part) in parts.iter().enumerate() {
+                        if i > 0 {
+                            current_path.push('.');
+                        }
+                        current_path.push_str(part);
+                        selected.insert(current_path.clone());
                     }
                 }
             }
+            app.current_tab_mut().graphql_query =
+                text_editor::Content::with_text(&app.build_query());
             iced::Task::none()
         }
 
@@ -5023,7 +5136,7 @@ enum RequestTab {
     GraphQL,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 enum ResponseTab {
     Body,
     Headers,
@@ -5341,19 +5454,19 @@ struct SchemaWrapper {
     schema: GraphqlSchema,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GraphqlSchema {
     query_type: TypeRef,
     types: Vec<GraphqlType>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct TypeRef {
     name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphqlType {
     name: Option<String>,
@@ -5362,7 +5475,7 @@ struct GraphqlType {
     input_fields: Option<Vec<GraphqlField>>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GraphqlField {
     name: String,
@@ -5377,12 +5490,15 @@ struct GraphqlField {
     is_selected: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GraphqlArg {
     name: String,
     #[serde(rename = "type")]
     arg_type: TypeDetail,
+
+    #[serde(default)] // Default to false when parsing JSON
+    pub is_selected: bool,
 }
 
 impl std::fmt::Display for GraphqlArg {
@@ -5391,7 +5507,7 @@ impl std::fmt::Display for GraphqlArg {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct TypeDetail {
     name: Option<String>,
@@ -5457,6 +5573,7 @@ fn render_schema_tree<'a>(
     types: &'a [GraphqlType],
     current_type: &'a GraphqlType,
     expanded: &std::collections::HashSet<String>,
+    selected_paths: &std::collections::HashSet<String>,
     search: &str,
     depth: u16,
     path: &str,
@@ -5506,6 +5623,7 @@ fn render_schema_tree<'a>(
 
         let has_args = !field.args.is_empty();
         let is_expandable = has_type_children || has_args;
+        let field_path_clone = field_path.clone();
         let is_expanded = expanded.contains(&field_path);
 
         // UI Components
@@ -5516,7 +5634,7 @@ fn render_schema_tree<'a>(
                 button(text(if is_expanded { "▼" } else { "▶" }).size(10))
                     .style(button::text)
                     .padding(0)
-                    .on_press(Message::GraphqlTypeToggled(field_path.clone())),
+                    .on_press(Message::GraphqlTypeToggled(field_path_clone.clone())),
             )
             .width(expander_width)
             .center_x(expander_width)
@@ -5532,14 +5650,13 @@ fn render_schema_tree<'a>(
                     color: Some(iced::Color::from_rgb(0.5, 0.5, 0.5)), // Grey out the types
                 });
 
+        let is_selected = selected_paths.contains(&field_path);
+        let field_path_cloned = field_path.clone();
         let field_row = row![
             Space::new().width(indent_width),
             expand_btn,
-            // 2. Use the pre-cloned variables here
-            checkbox(field.is_selected).on_toggle(move |_| Message::GraphqlFieldToggled(
-                current_type_name.to_string(),
-                field.name.clone()
-            )),
+            checkbox(is_selected)
+                .on_toggle(move |_| Message::GraphqlFieldToggled(field_path_cloned.clone())),
             text(field.name.clone()).size(14),
             type_label,
         ]
@@ -5552,11 +5669,13 @@ fn render_schema_tree<'a>(
 
         rows.push(field_row.into());
 
-        // Recursive expansion
+        // Only recurse if expanded
         if is_expanded {
             // A. Render Arguments AND their nested fields
             for arg in &field.args {
                 let arg_path = format!("{}.{}", field_path, arg.name);
+                let arg_path_cloned = arg_path.clone();
+                let is_arg_selected = selected_paths.contains(&arg_path);
                 let is_arg_expanded = expanded.contains(&arg_path);
 
                 // Find if the argument type has sub-fields (is it an Input Object?)
@@ -5565,6 +5684,7 @@ fn render_schema_tree<'a>(
                     .get_base_name()
                     .map(|s| s.as_str())
                     .unwrap_or("");
+
                 let arg_target_type = types
                     .iter()
                     .find(|t| t.name.as_deref() == Some(arg_base_name));
@@ -5576,29 +5696,38 @@ fn render_schema_tree<'a>(
                 let arg_expander: Element<'a, Message> = if is_arg_expandable {
                     button(text(if is_arg_expanded { "▼" } else { "▶" }).size(10))
                         .style(button::text)
-                        .padding(0)
+                        .padding(0.0)
                         .on_press(Message::GraphqlTypeToggled(arg_path.clone()))
                         .into()
                 } else {
                     Space::new().width(20.0).into()
                 };
 
+                let t_name = current_type_name.to_string();
+                let f_name = field.name.clone();
+                let a_name = arg.name.clone();
                 // --- Render the Argument Row ---
                 let arg_row = row![
-                    Space::new().width(indent_width + 20.0),
+                    Space::new().width(indent_width + 16.0),
                     container(arg_expander).width(20.0).center_x(20.0),
+                    checkbox(is_arg_selected)
+                        .on_toggle(move |_| Message::GraphqlArgToggled(arg_path_cloned.clone())),
                     text(format!("arg: {}", arg.name))
                         .size(13)
                         .style(|_| text::Style {
                             color: Some(iced::Color::from_rgb(0.9, 0.5, 0.1))
                         }),
                     text(format!("({})", arg.arg_type))
-                        .size(10)
+                        .size(14)
                         .style(|_| text::Style {
                             color: Some(iced::Color::from_rgb(0.5, 0.5, 0.5))
                         }),
                 ]
                 .spacing(4)
+                .padding(Padding {
+                    top: 2.0,
+                    ..Default::default()
+                })
                 .align_y(Alignment::Center);
 
                 rows.push(arg_row.into());
@@ -5610,6 +5739,7 @@ fn render_schema_tree<'a>(
                             types,
                             arg_type_obj,
                             expanded,
+                            selected_paths,
                             search,
                             depth + 2, // Move children further right
                             &arg_path,
@@ -5625,6 +5755,7 @@ fn render_schema_tree<'a>(
                     types,
                     child_type_obj,
                     expanded,
+                    selected_paths,
                     search,
                     depth + 1,
                     &field_path,
@@ -5635,6 +5766,80 @@ fn render_schema_tree<'a>(
     }
 
     rows
+}
+
+fn generate_selection_set(
+    all_types: &[GraphqlType],
+    current_type: &GraphqlType,
+    selected_paths: &std::collections::HashSet<String>,
+    indent: usize,
+    current_path: &str,
+) -> String {
+    let mut output = String::new();
+    let spaces = "  ".repeat(indent);
+
+    let fields = current_type
+        .fields
+        .as_ref()
+        .or(current_type.input_fields.as_ref());
+
+    if let Some(fields) = fields {
+        for field in fields {
+            let field_path = format!("{}.{}", current_path, field.name);
+
+            // ONLY proceed if this field is in the HashSet
+            if selected_paths.contains(&field_path) {
+                output.push_str(&format!("{}{}", spaces, field.name));
+
+                // --- 1. Handle Arguments ---
+                let active_args: Vec<_> = field
+                    .args
+                    .iter()
+                    .filter(|a| selected_paths.contains(&format!("{}.arg:{}", field_path, a.name)))
+                    .collect();
+
+                if !active_args.is_empty() {
+                    output.push('(');
+                    let arg_strings: Vec<String> = active_args
+                        .iter()
+                        .map(|a| format!("{}: TODO_VAL", a.name)) // We'll talk about values next!
+                        .collect();
+                    output.push_str(&arg_strings.join(", "));
+                    output.push(')');
+                }
+
+                // --- 2. Handle Sub-selection (Nested Objects) ---
+                let base_name = field.field_type.get_base_name();
+                let sub_type = all_types
+                    .iter()
+                    .find(|t| t.name.as_deref() == base_name.map(|s| s.as_str()));
+
+                // Check if any children of this field are selected
+                let has_selected_children = selected_paths
+                    .iter()
+                    .any(|p| p.starts_with(&format!("{}.", field_path)) && !p.contains(".arg:"));
+
+                if let Some(st) = sub_type {
+                    if has_selected_children {
+                        output.push_str(" {\n");
+                        output.push_str(&generate_selection_set(
+                            all_types,
+                            st,
+                            selected_paths,
+                            indent + 1,
+                            &field_path,
+                        ));
+                        output.push_str(&format!("{}}}\n", spaces));
+                    } else {
+                        output.push('\n');
+                    }
+                } else {
+                    output.push('\n');
+                }
+            }
+        }
+    }
+    output
 }
 
 const BODY_DEFAULT: &str = r#"{
