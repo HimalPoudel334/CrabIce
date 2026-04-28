@@ -1196,14 +1196,8 @@ impl CrabiPie {
                 top_bar,
                 scrollable(scroll_content)
                     .direction(scrollable::Direction::Both {
-                        vertical: scrollable::Scrollbar::default()
-                            .width(12.0) // Make the bar wide enough to see
-                            .spacing(10.0) // Force 10px of "dead zone" between text and bar
-                            .scroller_width(8.0),
-                        horizontal: scrollable::Scrollbar::default()
-                            .width(12.0)
-                            .spacing(10.0)
-                            .scroller_width(8.0),
+                        vertical: scrollable::Scrollbar::default().width(0).scroller_width(0),
+                        horizontal: scrollable::Scrollbar::default().width(0).scroller_width(0),
                     })
                     .height(Length::Fill)
                     .width(Length::Fill)
@@ -1932,15 +1926,19 @@ impl TabMetadata {
         }
     }
 
-async fn load_all() -> Vec<TabMetadata> {
-    let path = state_dir().join("tabs/metadata.json");
-    let bytes = tokio::fs::read(&path).await;
-    let result: Vec<TabMetadata> = bytes.ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    println!("metadata ids: {:?}", result.iter().map(|m| m.id).collect::<Vec<_>>());
-    result
-}
+    async fn load_all() -> Vec<TabMetadata> {
+        let path = state_dir().join("tabs/metadata.json");
+        let bytes = tokio::fs::read(&path).await;
+        let result: Vec<TabMetadata> = bytes
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        println!(
+            "metadata ids: {:?}",
+            result.iter().map(|m| m.id).collect::<Vec<_>>()
+        );
+        result
+    }
 
     async fn save_all(tabs: &[TabMetadata]) {
         let path = state_dir().join("tabs/metadata.json");
@@ -2139,7 +2137,12 @@ impl CrabiPie {
 
         tab_bar = tab_bar.push(add_button);
 
-        container(tab_bar)
+        let scrolling_tabs = scrollable(tab_bar).direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::default().width(0).scroller_width(0),
+        ));
+
+        container(scrolling_tabs)
+            .width(Length::Fill)
             .style(|theme: &iced::Theme| container::Style {
                 background: Some(iced::Background::Color(theme.palette().background)),
                 ..Default::default()
@@ -2148,8 +2151,6 @@ impl CrabiPie {
     }
 
     fn render_active_tab_content(&self) -> Element<'_, Message> {
-        let tab = &self.tabs[self.active_tab];
-
         // Render the content using the active tab's data
         column![
             self.render_request_row(),
@@ -2217,7 +2218,7 @@ impl CrabiPie {
 
         let send_button = if tab.loading {
             button(
-                text("⏹ Cancel")
+                text("🛑 Cancel")
                     .align_x(alignment::Horizontal::Center)
                     .shaping(text::Shaping::Advanced)
                     .width(Length::Fill),
@@ -3141,6 +3142,7 @@ impl CrabiPie {
         } else {
             text_editor(&tab.response_headers_content)
                 .on_action(Message::ResponseHeadersAction)
+                .height(Length::FillPortion(1))
                 .highlight_with::<json_highlighter::JsonHighlighter>(
                     self.get_highlighter_settings(),
                     |highlight, _theme| {
@@ -3153,7 +3155,6 @@ impl CrabiPie {
                                 iced::Color::from_rgb(1.0, 0.5, 0.0)
                             }
                         };
-
                         iced::advanced::text::highlighter::Format {
                             color: Some(color),
                             font: None,
@@ -3164,13 +3165,7 @@ impl CrabiPie {
                 .into()
         };
 
-        scrollable(content)
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
-            })
-            .height(Length::FillPortion(1))
-            .into()
+        content
     }
 
     fn loading_overlay(&self) -> Option<Element<'_, Message>> {
@@ -5182,18 +5177,24 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 }
 
 fn view(app: &CrabiPie) -> Element<'_, Message> {
-    let Some(tab) = app.current_tab() else {
-        return iced::widget::text("Loading...").into();
+    let tab_content = match app.current_tab() {
+        None => iced::widget::container(iced::widget::text("Loading..."))
+            .center(iced::Fill)
+            .into(),
+        Some(tab) => {
+            if tab.request_type == RequestType::WebSocket {
+                app.render_websocket_panel()
+            } else {
+                app.render_active_tab_content()
+            }
+        }
     };
+
     let main_content = column![
         app.render_title_row(),
         app.render_tabs(),
         rule::horizontal(1.0),
-        if tab.request_type == RequestType::WebSocket {
-            app.render_websocket_panel()
-        } else {
-            app.render_active_tab_content()
-        }
+        tab_content
     ]
     .height(Length::Fill);
 
@@ -5252,8 +5253,7 @@ fn main() -> iced::Result {
         .title(|app: &CrabiPie| app.title())
         .window(iced::window::Settings {
             size: iced::Size::new(1500.0, 800.0),
-            icon: iced::window::icon::from_file_data(icon_bytes, None).ok(), //rather than adding
-            //iamge dependency , just let the function determine the file type in runtime
+            icon: iced::window::icon::from_file_data(icon_bytes, None).ok(),
             ..Default::default()
         })
         .exit_on_close_request(false)
