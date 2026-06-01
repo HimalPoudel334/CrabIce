@@ -7,10 +7,12 @@ use reqwest_websocket::RequestBuilderExt;
 use std::sync::atomic::Ordering;
 
 use iced::{
-    Alignment, Border, Element, Event, Length, Padding, alignment,
+    Alignment, Border, Element, Event, Length, Padding,
+    advanced::text::Editor,
+    alignment,
     widget::{
         Column, Space, button, checkbox, column, container, pick_list, row, rule, scrollable,
-        space, text, text_editor, text_editor::Content, text_input, tooltip,
+        space, text, text_editor, text_input, tooltip,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -32,7 +34,7 @@ enum Message {
         id: usize,
         saved: Option<SavedState>,
     },
-    RequestTabLoad(usize), // trigger load for tab index
+    RequestTabLoad(usize),
 
     UrlChanged(String),
     RequestTypeSelected(RequestType),
@@ -89,7 +91,7 @@ enum Message {
     CookieJarOpen,
     CookieJarClose,
     CookieJarAdd(String),
-    CookieJarRemove(String, usize), // domain, index
+    CookieJarRemove(String, usize),
     CookieJarToggled(String, usize),
     CookieJarNameChanged(String, usize, String),
     CookieJarValueChanged(String, usize, String),
@@ -165,7 +167,7 @@ enum Message {
     ToggleSidebar,
     SidebarItemSelected(usize),
     CollectionLoaded(Option<Collection>),
-    CollectionFolderAdd(Option<usize>), // parent id, None = root
+    CollectionFolderAdd(Option<usize>),
     CollectionItemToggleExpand(usize),
     CollectionRequestOpen(usize),
     CollectionItemRename(usize),
@@ -186,10 +188,18 @@ enum Message {
 }
 
 struct CrabiPie {
-    // Tab managemen
+    // Tab management
     tabs: Vec<TabLoadState>,
     active_tab: usize,
     next_tab_id: usize,
+
+    // text_editor contents , same for all tabs,
+    request_body_content: text_editor::Content,
+    raw_form_content: text_editor::Content,
+    graphql_query_content: text_editor::Content,
+    graphql_variables_content: text_editor::Content,
+    response_body_content: text_editor::Content,
+    response_headers_content: text_editor::Content,
 
     // Global UI state (shared across all tabs)
     json_theme: json_highlighter::JsonThemeWrapper,
@@ -242,7 +252,7 @@ struct TabState {
     request_type: RequestType,
     method: HttpMethod,
     headers: Vec<RequestHeaders>,
-    body_content: text_editor::Content,
+    request_body: std::sync::Arc<str>,
     form_view_type: FormViewType,
     auth_type: AuthType,
     bearer_token: String,
@@ -252,12 +262,12 @@ struct TabState {
     content_type: ContentType,
     query_params: Vec<QueryParam>,
     form_data: Vec<FormField>,
-    raw_form_content: text_editor::Content,
+    raw_form_content: std::sync::Arc<str>,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     // GraphQL Editors ---
-    graphql_query: text_editor::Content,
-    graphql_variables: text_editor::Content,
+    graphql_query: std::sync::Arc<str>,
+    graphql_variables: std::sync::Arc<str>,
     graphql_operation: String,
     graphql_schema: Option<GraphqlSchema>,
     graphql_schema_loading: bool,
@@ -291,8 +301,8 @@ struct TabState {
 
     // Response data
     response_status: String,
-    response_headers_content: text_editor::Content,
-    response_body_content: text_editor::Content,
+    response_body: std::sync::Arc<str>,
+    response_headers: std::sync::Arc<str>,
     is_response_binary: bool,
     response_filename: String,
     response_bytes: Vec<u8>,
@@ -325,7 +335,7 @@ impl TabState {
             request_type: RequestType::HTTP,
             method: HttpMethod::GET,
             headers: RequestHeaders::default(),
-            body_content: text_editor::Content::with_text(BODY_DEFAULT),
+            request_body: std::sync::Arc::from(BODY_DEFAULT),
             form_view_type: FormViewType::Formatted,
             auth_type: AuthType::None,
             bearer_token: String::new(),
@@ -335,14 +345,14 @@ impl TabState {
             content_type: ContentType::Json,
             query_params: vec![QueryParam::new()],
             form_data: vec![FormField::new()],
-            raw_form_content: text_editor::Content::with_text(""),
+            raw_form_content: std::sync::Arc::from(""),
             image_handle: None,
             video_player: None,
             video_state: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             response_status: String::new(),
-            response_headers_content: text_editor::Content::new(),
-            response_body_content: text_editor::Content::new(),
+            response_headers: std::sync::Arc::from(""),
+            response_body: std::sync::Arc::from(""),
             is_response_binary: false,
             response_filename: String::new(),
             response_bytes: Vec::new(),
@@ -364,8 +374,8 @@ impl TabState {
             ws_binary_message_type: WsBinaryMessageType::Base64,
             is_streaming: false,
             stream_buffer: String::new(),
-            graphql_query: text_editor::Content::new(),
-            graphql_variables: text_editor::Content::with_text("{}"),
+            graphql_query: std::sync::Arc::from(""),
+            graphql_variables: std::sync::Arc::from("{}"),
             graphql_operation: String::new(),
             graphql_schema: None,
             graphql_schema_loading: false,
@@ -394,7 +404,7 @@ impl TabState {
             request_type: saved.request_type,
             method: saved.method,
             headers: saved.headers,
-            body_content: text_editor::Content::with_text(&saved.body),
+            request_body: std::sync::Arc::from(saved.body.as_str()),
             form_view_type: saved.form_view_type,
             auth_type: saved.auth_type,
             bearer_token: saved.bearer_token,
@@ -404,18 +414,17 @@ impl TabState {
             content_type: saved.content_type,
             query_params: saved.query_params,
             form_data: saved.form_data,
-            raw_form_content: text_editor::Content::with_text(&saved.raw_form_content),
+            raw_form_content: std::sync::Arc::from(saved.raw_form_content.as_str()),
             image_handle: None,
             video_player: None,
             video_state: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             response_status: saved.response_status.unwrap_or_default(),
-            response_headers_content: text_editor::Content::with_text(
-                &saved.response_headers.unwrap_or_default(),
+            response_headers: std::sync::Arc::from(
+                saved.response_headers.unwrap_or_default().as_str(),
             ),
-            response_body_content: text_editor::Content::with_text(
-                &saved.response_body.unwrap_or_default(),
-            ),
+
+            response_body: std::sync::Arc::from(saved.response_body.unwrap_or_default().as_str()),
             is_response_binary: false,
             response_filename: String::new(),
             response_bytes: Vec::new(),
@@ -437,8 +446,8 @@ impl TabState {
             ws_binary_message_type: saved.ws_binary_message_type,
             is_streaming: false,
             stream_buffer: String::new(),
-            graphql_query: text_editor::Content::with_text(&saved.graphql_query),
-            graphql_variables: text_editor::Content::with_text(&saved.graphql_variables),
+            graphql_query: std::sync::Arc::from(saved.graphql_query.as_str()),
+            graphql_variables: std::sync::Arc::from(saved.graphql_variables.as_str()),
             graphql_operation: saved.graphql_operation,
             graphql_schema: saved.graphql_schema,
             graphql_schema_loading: false,
@@ -459,7 +468,7 @@ impl TabState {
             request_type: self.request_type.clone(),
             method: self.method.clone(),
             headers: self.headers.clone(),
-            body: self.body_content.text(),
+            body: self.request_body.to_string(),
             form_view_type: self.form_view_type,
             auth_type: self.auth_type.clone(),
             bearer_token: self.bearer_token.clone(),
@@ -469,7 +478,7 @@ impl TabState {
             content_type: self.content_type.clone(),
             query_params: self.query_params.clone(),
             form_data: self.form_data.clone(),
-            raw_form_content: self.raw_form_content.text(),
+            raw_form_content: self.raw_form_content.to_string(),
             json_theme: json_theme.to_string(),
             app_theme: app_theme.to_string(),
             response_status: if self.response_status.is_empty() {
@@ -477,20 +486,12 @@ impl TabState {
             } else {
                 Some(self.response_status.clone())
             },
-            response_headers: if self.response_headers_content.text().is_empty() {
-                None
-            } else {
-                Some(self.response_headers_content.text())
-            },
-            response_body: if self.response_body_content.text().is_empty() {
-                None
-            } else {
-                Some(self.response_body_content.text())
-            },
+            response_headers: Some(self.response_body.to_string()),
+            response_body: Some(self.response_body.to_string()),
             ws_message_type: self.ws_message_type,
             ws_binary_message_type: self.ws_binary_message_type,
-            graphql_query: self.graphql_query.text(),
-            graphql_variables: self.graphql_variables.text(),
+            graphql_query: self.graphql_query.to_string(),
+            graphql_variables: self.graphql_variables.to_string(),
             graphql_operation: self.graphql_operation.clone(),
             graphql_schema: self.graphql_schema.clone(),
             graphql_schema_error: self.graphql_schema_error.clone(),
@@ -585,6 +586,12 @@ impl CrabiPie {
             cookie_jar_new_domain: String::new(),
             cookie_jar: std::collections::HashMap::new(),
             cookie_jar_error: None,
+            raw_form_content: text_editor::Content::new(),
+            request_body_content: text_editor::Content::new(),
+            graphql_query_content: text_editor::Content::new(),
+            graphql_variables_content: text_editor::Content::new(),
+            response_headers_content: text_editor::Content::new(),
+            response_body_content: text_editor::Content::new(),
         };
 
         let task = iced::Task::batch([
@@ -877,8 +884,9 @@ impl CrabiPie {
 
         let text = self
             .current_tab()
-            .map(|t| t.response_body_content.text())
+            .map(|t| t.response_body.clone())
             .unwrap_or_default();
+
         println!("=== FIND NEXT ===");
         println!("Text length: {}", text.len());
         println!("Number of lines: {}", text.lines().count());
@@ -943,7 +951,7 @@ impl CrabiPie {
 
         let text = self
             .current_tab()
-            .map(|t| t.response_body_content.text())
+            .map(|t| t.response_body.clone())
             .unwrap_or_default();
         let matches = self.find_matches(&text, &self.find_text);
 
@@ -1229,11 +1237,11 @@ impl CrabiPie {
         let right_panel = column![
             operation_row,
             text("Query:").size(12),
-            text_editor(&tab.graphql_query)
+            text_editor(&self.graphql_query_content)
                 .on_action(Message::GraphqlQueryAction)
                 .height(Length::FillPortion(3)),
             text("Variables (JSON):").size(12),
-            text_editor(&tab.graphql_variables)
+            text_editor(&self.graphql_variables_content)
                 .on_action(Message::GraphqlVariablesAction)
                 .height(Length::FillPortion(2)),
         ]
@@ -2364,7 +2372,7 @@ impl CrabiPie {
 
         let editor_content = match tab.content_type {
             ContentType::Json => scrollable(
-                text_editor(&tab.body_content)
+                text_editor(&self.request_body_content)
                     .on_action(Message::BodyAction)
                     .highlight_with::<json_highlighter::JsonHighlighter>(
                         self.get_highlighter_settings(),
@@ -2392,7 +2400,7 @@ impl CrabiPie {
             ContentType::FormData | ContentType::XWWWFormUrlEncoded => match tab.form_view_type {
                 FormViewType::Formatted => self.render_form_data(),
                 FormViewType::Raw => scrollable(
-                    text_editor(&tab.raw_form_content)
+                    text_editor(&self.raw_form_content)
                         .placeholder(RAW_FORM_PLACEHOLDER)
                         .on_action(Message::FormRawAction)
                         .style(Self::get_editor_style)
@@ -2899,7 +2907,7 @@ impl CrabiPie {
             Some(&self.json_theme),
             Message::JsonThemeChanged,
         ));
-        if !tab.response_body_content.is_empty() || !tab.response_headers_content.is_empty() {
+        if !tab.response_body.is_empty() || !tab.response_headers.is_empty() {
             header_row = header_row.push(tooltip(
                 button(text(if tab.copied { "✅" } else { "📋" }).shaping(text::Shaping::Advanced))
                     .on_press(Message::CopyToClipboard)
@@ -3088,10 +3096,10 @@ impl CrabiPie {
             }
             body_column.into()
         } else {
-            let content: Element<'_, Message> = if tab.response_body_content.is_empty() {
+            let content: Element<'_, Message> = if tab.response_body.is_empty() {
                 space().into()
             } else {
-                text_editor(&tab.response_body_content)
+                text_editor(&self.response_body_content)
                     .on_action(Message::ResponseBodyAction)
                     .highlight_with::<json_highlighter::JsonHighlighter>(
                         self.get_highlighter_settings(),
@@ -3137,10 +3145,10 @@ impl CrabiPie {
             return iced::widget::text("Loading...").into();
         };
 
-        let content: Element<'_, Message> = if tab.response_headers_content.is_empty() {
+        let content: Element<'_, Message> = if tab.response_headers.is_empty() {
             space().into()
         } else {
-            text_editor(&tab.response_headers_content)
+            text_editor(&self.response_headers_content)
                 .on_action(Message::ResponseHeadersAction)
                 .height(Length::FillPortion(1))
                 .highlight_with::<json_highlighter::JsonHighlighter>(
@@ -3349,11 +3357,11 @@ impl CrabiPie {
         // ── body ─────────────────────────────
         let client = &HTTP_CLIENT;
         if tab.request_type == RequestType::GraphQL {
-            let variables: serde_json::Value = serde_json::from_str(&tab.graphql_variables.text())
+            let variables: serde_json::Value = serde_json::from_str(&tab.graphql_variables)
                 .unwrap_or(serde_json::Value::Object(Default::default()));
 
             let body = serde_json::json!({
-                "query": tab.graphql_query.text(),
+                "query": *tab.graphql_query,
                 "variables": variables,
                 "operationName": if tab.graphql_operation.is_empty() {
                     serde_json::Value::Null
@@ -3384,7 +3392,7 @@ impl CrabiPie {
                 };
                 match tab.content_type {
                     ContentType::Json => req
-                        .body(tab.body_content.text())
+                        .body(tab.request_body.to_string())
                         .header("Content-Type", "application/json"),
                     ContentType::XWWWFormUrlEncoded => {
                         let params: Vec<_> = tab
@@ -3640,18 +3648,44 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
     match message {
         Message::NoOp => iced::Task::none(),
         Message::TabSelected(index) => {
+            let req_body = app.request_body_content.text();
+            let raw_form = app.raw_form_content.text();
+            let gql_query = app.graphql_query_content.text();
+            let gql_vars = app.graphql_variables_content.text();
+
+            if let Some(tab) = app.current_tab_mut() {
+                tab.request_body = std::sync::Arc::from(req_body.as_str());
+                tab.raw_form_content = std::sync::Arc::from(raw_form.as_str());
+                tab.graphql_query = std::sync::Arc::from(gql_query.as_str());
+                tab.graphql_variables = std::sync::Arc::from(gql_vars.as_str());
+            }
+
+            // 3. SWITCH THE ACTIVE INDEX
             app.active_tab = index;
+
+            // 4. LOAD NEW DATA INTO EDITORS
             match &app.tabs[index] {
-                TabLoadState::Loaded(_) => iced::Task::none(), // instant
+                TabLoadState::Loaded(tab) => {
+                    app.request_body_content = text_editor::Content::with_text(&tab.request_body);
+                    app.raw_form_content = text_editor::Content::with_text(&tab.raw_form_content);
+                    app.graphql_query_content = text_editor::Content::with_text(&tab.graphql_query);
+                    app.graphql_variables_content =
+                        text_editor::Content::with_text(&tab.graphql_variables);
+                    app.response_body_content = text_editor::Content::with_text(&tab.response_body);
+                    app.response_headers_content =
+                        text_editor::Content::with_text(&tab.response_headers);
+                    iced::Task::none()
+                }
                 TabLoadState::Unloaded(meta) => {
                     let id = meta.id;
-                    app.tabs[index] = TabLoadState::Loading(meta.clone());
+                    let meta_clone = meta.clone();
+                    app.tabs[index] = TabLoadState::Loading(meta_clone);
                     iced::Task::perform(SavedState::load(id), move |s| Message::TabBodyLoaded {
                         id,
                         saved: s,
                     })
                 }
-                TabLoadState::Loading(_) => iced::Task::none(), // already in flight
+                TabLoadState::Loading(_) => iced::Task::none(),
             }
         }
         Message::AddNewTab => {
@@ -3663,12 +3697,31 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::TabBodyLoaded { id, saved } => {
+            println!("Loaded tab {}", id);
             // find the slot and hydrate it
             if let Some(slot) = app.tabs.iter_mut().find(|t| t.id() == id) {
                 *slot = match saved {
                     Some(s) => TabLoadState::Loaded(Box::new(TabState::from_saved(s))),
                     None => TabLoadState::Unloaded(slot.metadata().clone()), // fallback
                 };
+            }
+
+            if app.tabs.get(app.active_tab).map(|t| t.id()) == Some(id) {
+                if let Some(tab) = app.current_tab() {
+                    let req_body = tab.request_body.clone();
+                    let raw_form = tab.raw_form_content.clone();
+                    let gql_query = tab.graphql_query.clone();
+                    let gql_vars = tab.graphql_variables.clone();
+                    let res_body = tab.response_body.clone();
+                    let res_headers = tab.response_headers.clone();
+
+                    app.request_body_content = text_editor::Content::with_text(&req_body);
+                    app.raw_form_content = text_editor::Content::with_text(&raw_form);
+                    app.graphql_query_content = text_editor::Content::with_text(&gql_query);
+                    app.graphql_variables_content = text_editor::Content::with_text(&gql_vars);
+                    app.response_body_content = text_editor::Content::with_text(&res_body);
+                    app.response_headers_content = text_editor::Content::with_text(&res_headers);
+                }
             }
 
             // after active tab done, schedule background loading for others
@@ -3729,8 +3782,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     tab.url = "wss://echo.websocket.org".to_string();
                 }
                 _ => {
-                    tab.response_body_content =
-                        text_editor::Content::with_text("Ops! Sorry. Not implemented yet!");
+                    tab.response_body = std::sync::Arc::from("Ops! Sorry. Not implemented yet!");
                 }
             }
             iced::Task::none()
@@ -3762,10 +3814,16 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
         }
         Message::BodyAction(action) => {
-            let Some(tab) = app.current_tab_mut() else {
-                return iced::Task::none();
-            };
-            tab.body_content.perform(action);
+            match action {
+                text_editor::Action::Edit(_) => {
+                    app.request_body_content.perform(action);
+                    let updated_text = app.request_body_content.text();
+                    if let Some(tab) = app.current_tab_mut() {
+                        tab.request_body = std::sync::Arc::from(updated_text.as_str());
+                    }
+                }
+                _ => app.request_body_content.perform(action),
+            }
             iced::Task::none()
         }
         Message::AuthTypeSelected(auth_type) => {
@@ -3795,9 +3853,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             };
             tab.cancel_flag.store(true, Ordering::Relaxed);
             tab.loading = false;
-            tab.response_body_content =
-                text_editor::Content::with_text("Request cancelled by user");
+            tab.response_body = std::sync::Arc::from("Request cancelled by user");
             tab.response_status = "Cancelled".to_string();
+            app.response_body_content =
+                text_editor::Content::with_text("Request cancelled by user");
             iced::Task::none()
         }
         Message::SaveBinaryResponse => {
@@ -3834,43 +3893,43 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             };
             match result {
                 Ok(filename) => {
-                    tab.response_body_content = text_editor::Content::with_text(&format!(
-                        "File saved successfully: {}",
-                        filename
-                    ))
+                    tab.response_body =
+                        std::sync::Arc::from(format!("File saved successfully: {}", filename))
                 }
                 Err(error) => {
-                    tab.response_body_content =
-                        text_editor::Content::with_text(&format!("Error saving file: {}", error))
+                    tab.response_body =
+                        std::sync::Arc::from(format!("Error saving file: {}", error))
                 }
             }
+            app.response_body_content = text_editor::Content::with_text(&tab.response_body);
             iced::Task::none()
         }
         Message::ClearResponseText => {
             let Some(tab) = app.current_tab_mut() else {
                 return iced::Task::none();
             };
-            tab.response_body_content = text_editor::Content::with_text("");
-            tab.response_headers_content = text_editor::Content::with_text("");
+            tab.response_body = std::sync::Arc::from("");
+            tab.response_headers = std::sync::Arc::from("");
+            app.response_body_content = text_editor::Content::new();
+            app.response_headers_content = text_editor::Content::new();
             iced::Task::none()
         }
         Message::GraphqlQueryAction(action) => {
-            let Some(tab) = app.current_tab_mut() else {
-                return iced::Task::none();
-            };
-            // text_editor::Content::perform handles the editing logic
-            tab.graphql_query.perform(action);
+            app.graphql_query_content.perform(action);
+            let query_text = app.graphql_query_content.text();
+            if let Some(tab) = app.current_tab_mut() {
+                tab.graphql_query = std::sync::Arc::from(query_text.as_str());
+            }
             iced::Task::none()
         }
-
         Message::GraphqlVariablesAction(action) => {
-            let Some(tab) = app.current_tab_mut() else {
-                return iced::Task::none();
-            };
-            tab.graphql_variables.perform(action);
+            app.graphql_variables_content.perform(action);
+            let vars_text = app.graphql_variables_content.text();
+            if let Some(tab) = app.current_tab_mut() {
+                tab.graphql_variables = std::sync::Arc::from(vars_text.as_str());
+            }
             iced::Task::none()
         }
-
         Message::GraphqlOperationChanged(val) => {
             let Some(tab) = app.current_tab_mut() else {
                 return iced::Task::none();
@@ -3878,7 +3937,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             tab.graphql_operation = val;
             iced::Task::none()
         }
-
         Message::FetchGraphqlSchema => {
             let Some(tab) = app.current_tab_mut() else {
                 return iced::Task::none();
@@ -3929,7 +3987,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             iced::Task::none()
         }
-
         Message::GraphqlFieldToggled(path) | Message::GraphqlArgToggled(path) => {
             let Some(tab) = app.current_tab_mut() else {
                 return iced::Task::none();
@@ -3976,8 +4033,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 }
             }
             let query = app.build_query();
+            app.graphql_query_content = text_editor::Content::with_text(&query);
             if let Some(tab) = app.current_tab_mut() {
-                tab.graphql_query = text_editor::Content::with_text(&query);
+                tab.graphql_query = std::sync::Arc::from(query);
             }
             iced::Task::none()
         }
@@ -4190,8 +4248,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 } else {
                     tab.video_player = None;
                     tab.video_state = None;
-                    tab.response_headers_content = text_editor::Content::with_text(&resp.headers);
-                    tab.response_body_content = text_editor::Content::with_text(&resp.body);
+                    tab.response_headers = std::sync::Arc::from(resp.headers.as_str());
+                    tab.response_body = std::sync::Arc::from(resp.body.as_str());
+                    app.response_headers_content = text_editor::Content::with_text(&resp.headers);
+                    app.response_body_content = text_editor::Content::with_text(&resp.body);
                 }
 
                 url
@@ -4213,20 +4273,16 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::ResponseBodyAction(action) => {
-            if let Some(tab) = app.current_tab_mut() {
-                match action {
-                    text_editor::Action::Edit(_) => {}
-                    _ => tab.response_body_content.perform(action),
-                }
+            match action {
+                text_editor::Action::Edit(_) => {}
+                _ => app.response_body_content.perform(action),
             }
             iced::Task::none()
         }
         Message::ResponseHeadersAction(action) => {
-            if let Some(tab) = app.current_tab_mut() {
-                match action {
-                    text_editor::Action::Edit(_) => {}
-                    _ => tab.response_headers_content.perform(action),
-                }
+            match action {
+                text_editor::Action::Edit(_) => {}
+                _ => app.response_headers_content.perform(action),
             }
             iced::Task::none()
         }
@@ -4241,7 +4297,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             let Some(tab) = app.current_tab() else {
                 return iced::Task::none();
             };
-            let body_text = tab.body_content.text();
+            let body_text = tab.request_body.to_string();
 
             iced::Task::perform(
                 async move {
@@ -4258,17 +4314,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             )
         }
         Message::JsonPrettified(Ok(pretty)) => {
-            let Some(tab) = app.current_tab_mut() else {
-                return iced::Task::none();
-            };
-
-            tab.body_content.perform(text_editor::Action::SelectAll);
-
-            tab.body_content
+            if let Some(tab) = app.current_tab_mut() {
+                tab.request_body = std::sync::Arc::from(pretty.as_str());
+            }
+            app.request_body_content
+                .perform(text_editor::Action::SelectAll);
+            app.request_body_content
                 .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
                     std::sync::Arc::new(pretty),
                 )));
-
             iced::Task::none()
         }
         Message::JsonPrettified(Err(err)) => {
@@ -4282,11 +4336,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             if tab.is_response_binary {
                 return iced::Task::none();
             }
-            let text = match tab.active_response_tab {
-                ResponseTab::Body => tab.response_body_content.text(),
-                ResponseTab::Headers => tab.response_headers_content.text(),
-            };
+            let is_binary = tab.is_response_binary;
+            let active_response_tab = tab.active_response_tab.clone();
             tab.copied = true;
+
+            let text = match active_response_tab {
+                ResponseTab::Body => app.response_body_content.text(),
+                ResponseTab::Headers => app.response_headers_content.text(),
+            };
+
             iced::Task::batch([
                 iced::clipboard::write(text),
                 iced::Task::perform(
@@ -4510,42 +4568,37 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             let Some(tab) = app.current_tab_mut() else {
                 return iced::Task::none();
             };
-
             if matches!(
                 tab.content_type,
                 ContentType::FormData | ContentType::XWWWFormUrlEncoded
             ) {
                 let raw = TabState::form_data_to_raw(&tab.form_data);
-                tab.raw_form_content = text_editor::Content::with_text(&raw);
+                tab.raw_form_content = std::sync::Arc::from(raw.as_str());
                 tab.form_view_type = FormViewType::Raw;
+                app.raw_form_content = text_editor::Content::with_text(&raw);
             }
-
             iced::Task::none()
         }
         Message::ViewFormattedForm => {
-            let Some(tab) = app.current_tab_mut() else {
-                return iced::Task::none();
-            };
-
-            if matches!(
-                tab.content_type,
-                ContentType::FormData | ContentType::XWWWFormUrlEncoded
-            ) {
-                let raw = tab.raw_form_content.text();
-
-                tab.form_data = TabState::raw_to_form_data(&raw);
-                tab.form_view_type = FormViewType::Formatted;
+            let raw = app.raw_form_content.text();
+            if let Some(tab) = app.current_tab_mut() {
+                if matches!(
+                    tab.content_type,
+                    ContentType::FormData | ContentType::XWWWFormUrlEncoded
+                ) {
+                    tab.raw_form_content = std::sync::Arc::from(raw.as_str());
+                    tab.form_data = TabState::raw_to_form_data(&raw);
+                    tab.form_view_type = FormViewType::Formatted;
+                }
             }
-
             iced::Task::none()
         }
         Message::FormRawAction(action) => {
-            let Some(tab) = app.current_tab_mut() else {
-                return iced::Task::none();
+            app.raw_form_content.perform(action);
+            let raw_text = app.raw_form_content.text();
+            if let Some(tab) = app.current_tab_mut() {
+                tab.raw_form_content = std::sync::Arc::from(raw_text.as_str());
             };
-
-            tab.raw_form_content.perform(action);
-
             iced::Task::none()
         }
         Message::ToggleFindDialog => {
@@ -4824,26 +4877,27 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 return iced::Task::none();
             };
             tab.stream_buffer.push_str(&chunk);
-            // Re-build the editor content from the full buffer each chunk.
-            // For very large responses you can throttle this, but it's fine for typical APIs.
-            let current = tab.stream_buffer.clone();
-            tab.response_body_content = text_editor::Content::with_text(&current);
+            app.response_body_content = text_editor::Content::with_text(&tab.stream_buffer);
             iced::Task::none()
         }
         Message::StreamDone => {
             let Some(tab) = app.current_tab_mut() else {
                 return iced::Task::none();
             };
+
             tab.is_streaming = false;
             tab.loading = false;
-            // Optionally pretty-print JSON now that we have the full body
-            let body = tab.stream_buffer.clone();
-            if let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Ok(pretty) = serde_json::to_string_pretty(&j) {
-                    tab.response_body_content = text_editor::Content::with_text(&pretty);
-                }
+            let body = std::mem::take(&mut tab.stream_buffer);
+            tab.response_body = std::sync::Arc::from(body.as_str());
+            let display = if let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) {
+                serde_json::to_string_pretty(&j).unwrap_or_else(|_| body.clone())
+            } else {
+                body.clone()
+            };
+            if let Some(tab) = app.current_tab_mut() {
+                tab.response_body = std::sync::Arc::from(body.as_str());
             }
-
+            app.response_body_content = text_editor::Content::with_text(&display);
             iced::Task::none()
         }
         Message::WsConnect => {
