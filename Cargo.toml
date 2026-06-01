@@ -16,7 +16,7 @@ urlencoding = "2.1.3"
 serde = { version = "1.0.228", features = ["derive"] }
 futures = "0.3.31"
 chrono = "0.4.43"
-iced_aw = { version = "0.13.0", features = ["tabs", "tab_bar", "context_menu"] }
+iced_aw = { version = "0.13.0", default-features = false, features = ["tabs", "tab_bar", "context_menu"] }
 async-tungstenite = "0.32.1"
 reqwest-websocket = "0.5.1"
 async-stream = "0.3.6"
