@@ -3096,7 +3096,16 @@ impl CrabiPie {
             }
             body_column.into()
         } else {
-            let content: Element<'_, Message> = if tab.response_body.is_empty() {
+            let content: Element<'_, Message> = if tab.is_streaming {
+                scrollable(
+                    text(tab.stream_buffer.as_str())
+                        .font(iced::Font::MONOSPACE)
+                        .size(13),
+                )
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .into()
+            } else if tab.response_body.is_empty() {
                 space().into()
             } else {
                 text_editor(&self.response_body_content)
@@ -4220,6 +4229,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 tab.response_status = resp.status;
                 tab.response_content_type = resp.content_type.clone();
                 tab.response_time = resp.response_time;
+                tab.response_headers = std::sync::Arc::from(resp.headers.as_str());
 
                 let url = tab.url.clone();
 
@@ -4250,12 +4260,13 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     tab.video_state = None;
                     tab.response_headers = std::sync::Arc::from(resp.headers.as_str());
                     tab.response_body = std::sync::Arc::from(resp.body.as_str());
-                    app.response_headers_content = text_editor::Content::with_text(&resp.headers);
                     app.response_body_content = text_editor::Content::with_text(&resp.body);
                 }
 
                 url
             };
+
+            app.response_headers_content = text_editor::Content::with_text(&resp.headers);
 
             if let Some(domain) = extract_domain(&url) {
                 for raw in &resp.set_cookies {
@@ -4877,7 +4888,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 return iced::Task::none();
             };
             tab.stream_buffer.push_str(&chunk);
-            app.response_body_content = text_editor::Content::with_text(&tab.stream_buffer);
+
             iced::Task::none()
         }
         Message::StreamDone => {
