@@ -29,6 +29,7 @@ gstreamer-app = "0.23"
 gstreamer-video = "0.23"
 gstreamer-base = "0.23"
 flate2 = "1.1.9"
+regex = "1.13.1"
 
 [profile.release]
 strip = true

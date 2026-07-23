@@ -2,7 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use futures::channel::mpsc;
-use iced_aw::iced_aw_font::down_open;
 use reqwest_websocket::RequestBuilderExt;
 use std::sync::atomic::Ordering;
 
@@ -86,6 +85,19 @@ enum Message {
     GraphqlArgToggled(String),
     GraphqlSearchChanged(String),
     GraphqlCollapseAll,
+
+    // Global Env vars
+    EnvironmentAdd,
+    EnvironmentSelected(Option<usize>),
+    EnvironmentRenamed(usize, String),
+    EnvironmentDeleted(usize),
+    EnvVarAdd(usize),
+    EnvVarRemove(usize, usize),
+    EnvVarKeyChanged(usize, usize, String),
+    EnvVarValueChanged(usize, usize, String),
+    EnvVarToggled(usize, usize),
+    EnvPanelOpen,
+    EnvPanelClose,
 
     // Global Cookie auth
     CookieJarOpen,
@@ -205,6 +217,12 @@ struct CrabiPie {
     json_theme: json_highlighter::JsonThemeWrapper,
     app_theme: iced::Theme,
     svg_rotation: f32,
+
+    // Global environment vars
+    environments: Vec<Environment>,
+    active_environment_id: Option<usize>,
+    next_environment_id: usize,
+    env_panel_open: bool,
 
     // Global cookie jar
     cookie_jar_open: bool,
@@ -592,6 +610,10 @@ impl CrabiPie {
             graphql_variables_content: text_editor::Content::new(),
             response_headers_content: text_editor::Content::new(),
             response_body_content: text_editor::Content::new(),
+            environments: Vec::new(),
+            active_environment_id: None,
+            next_environment_id: 1,
+            env_panel_open: false,
         };
 
         let task = iced::Task::batch([
@@ -1308,13 +1330,15 @@ impl CrabiPie {
     fn save_task(&self) -> iced::Task<Message> {
         let json_theme_str = self.json_theme.to_string();
         let app_theme_str = self.app_theme.to_string();
-
         let session = SessionState {
             active_tab: self.active_tab,
             json_theme: json_theme_str.clone(),
             app_theme: app_theme_str.clone(),
             next_tab_id: self.next_tab_id,
             cookie_jar: self.cookie_jar.clone(),
+            environments: self.environments.clone(),
+            active_environment_id: self.active_environment_id,
+            next_environment_id: self.next_environment_id,
         };
 
         let metadata: Vec<TabMetadata> = self.tabs.iter().map(|t| t.metadata().clone()).collect();
@@ -1964,6 +1988,12 @@ struct SessionState {
     app_theme: String,
     next_tab_id: usize,
     cookie_jar: std::collections::HashMap<String, Vec<CookieEntry>>,
+    #[serde(default)]
+    environments: Vec<Environment>,
+    #[serde(default)]
+    active_environment_id: Option<usize>,
+    #[serde(default)]
+    next_environment_id: usize,
 }
 
 impl SessionState {
@@ -2173,18 +2203,51 @@ impl CrabiPie {
     }
 
     fn render_title_row(&self) -> Element<'_, Message> {
+        let env_names: Vec<String> = std::iter::once("No Environment".to_string())
+            .chain(self.environments.iter().map(|e| e.name.clone()))
+            .collect();
+
+        let selected_env_name = self
+            .active_environment()
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "No Environment".to_string());
+
+        let env_picker = row![
+            pick_list(env_names.clone(), Some(selected_env_name), {
+                let envs = self.environments.clone();
+                move |selected| {
+                    if selected == "No Environment" {
+                        Message::EnvironmentSelected(None)
+                    } else {
+                        let id = envs.iter().find(|e| e.name == selected).map(|e| e.id);
+                        Message::EnvironmentSelected(id)
+                    }
+                }
+            }),
+            button(text("⚙️").shaping(text::Shaping::Advanced))
+                .style(button::text)
+                .height(20)
+                .padding(Padding::new(0.0).top(0.0))
+                .on_press(Message::EnvPanelOpen),
+        ]
+        .spacing(4)
+        .height(20)
+        .align_y(Alignment::Center);
+
         row![
             button(text(if self.sidebar_open { "◀" } else { "▶" }).size(14))
                 .style(button::text)
                 .on_press(Message::ToggleSidebar),
             text("CrabiPie HTTP Client").size(16),
             space::horizontal(),
+            env_picker,
             text("App theme"),
             pick_list(
                 &iced::Theme::ALL[..],
                 Some(&self.app_theme),
                 Message::AppThemeChanged,
-            ),
+            )
+            .padding(4),
             button(text("📂").shaping(text::Shaping::Advanced).size(14))
                 .style(button::text)
                 .on_press(Message::LoadRequest),
@@ -2682,6 +2745,120 @@ impl CrabiPie {
         };
 
         column![type_selector, auth_form].spacing(10).into()
+    }
+
+    fn render_env_panel(&self) -> Element<'_, Message> {
+        if !self.env_panel_open {
+            return Space::new().into();
+        }
+
+        let content: Element<'_, Message> = if self.environments.is_empty() {
+            text("No environments yet. Click + Add to create one.").into()
+        } else {
+            let sections: Vec<Element<'_, Message>> = self
+                .environments
+                .iter()
+                .map(|env| {
+                    let env_id = env.id;
+
+                    let header = row![
+                        text_input("Environment name", &env.name)
+                            .on_input(move |name| Message::EnvironmentRenamed(env_id, name))
+                            .width(Length::FillPortion(2)),
+                        space::horizontal(),
+                        button(text("➕").shaping(text::Shaping::Advanced))
+                            .style(button::text)
+                            .on_press(Message::EnvVarAdd(env_id)),
+                        button(text("🗑").shaping(text::Shaping::Advanced))
+                            .style(button::text)
+                            .on_press(Message::EnvironmentDeleted(env_id)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center);
+
+                    let var_rows: Vec<Element<'_, Message>> = env
+                        .variables
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, var)| {
+                            row![
+                                checkbox(var.enabled)
+                                    .on_toggle(move |_| Message::EnvVarToggled(env_id, idx)),
+                                text_input("key", &var.key)
+                                    .on_input(move |k| Message::EnvVarKeyChanged(env_id, idx, k))
+                                    .width(Length::FillPortion(2)),
+                                text_input("value", &var.value)
+                                    .on_input(move |v| Message::EnvVarValueChanged(env_id, idx, v))
+                                    .width(Length::FillPortion(3)),
+                                button(text("❌").shaping(text::Shaping::Advanced))
+                                    .style(button::subtle)
+                                    .on_press(Message::EnvVarRemove(env_id, idx)),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center)
+                            .into()
+                        })
+                        .collect();
+
+                    column![header, Column::with_children(var_rows).spacing(6)]
+                        .spacing(8)
+                        .into()
+                })
+                .collect();
+
+            scrollable(Column::with_children(sections).spacing(20))
+                .height(Length::Fixed(320.0))
+                .into()
+        };
+
+        let modal_body = column![
+            row![
+                text("Environments"),
+                space::horizontal(),
+                button("+ Add Environment")
+                    .style(button::text)
+                    .on_press(Message::EnvironmentAdd),
+                button("✕")
+                    .on_press(Message::EnvPanelClose)
+                    .style(button::text),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(8),
+            rule::horizontal(1),
+            content,
+        ]
+        .spacing(12)
+        .padding(20);
+
+        let modal = container(modal_body)
+            .width(Length::Fixed(640.0))
+            .max_height(520)
+            .style(container::rounded_box);
+
+        let overlay = container(
+            container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.5,
+            })),
+            ..container::Style::default()
+        });
+
+        iced::widget::stack![
+            Space::new().width(Length::Fill).height(Length::Fill),
+            overlay,
+        ]
+        .into()
     }
 
     fn render_cookie_jar_modal(&self) -> Element<'_, Message> {
@@ -3300,7 +3477,11 @@ impl CrabiPie {
 
     fn build_request(&self) -> Option<(reqwest::RequestBuilder, String)> {
         let tab = self.current_tab()?;
-        let mut url = tab.url.clone();
+
+        let mut url = self.resolve_vars(&tab.url);
+        if !matches!(url.split_once("://"), Some(("http" | "https", _))) {
+            url = format!("https://{}", url);
+        }
 
         // ── headers ──────────────────────────
         let mut header_map: reqwest::header::HeaderMap = tab
@@ -3308,8 +3489,10 @@ impl CrabiPie {
             .iter()
             .filter(|h| h.enabled)
             .filter_map(|h| {
-                let name = reqwest::header::HeaderName::from_bytes(h.key.trim().as_bytes()).ok()?;
-                let value = reqwest::header::HeaderValue::from_str(h.value.trim()).ok()?;
+                let key = self.resolve_vars(&h.key);
+                let value = self.resolve_vars(&h.value);
+                let name = reqwest::header::HeaderName::from_bytes(key.trim().as_bytes()).ok()?;
+                let value = reqwest::header::HeaderValue::from_str(value.trim()).ok()?;
                 Some((name, value))
             })
             .collect();
@@ -3632,6 +3815,29 @@ impl CrabiPie {
 
     fn event_subscription(&self) -> iced::Subscription<Message> {
         iced::event::listen().map(Message::EventOccurred)
+    }
+
+    fn active_environment(&self) -> Option<&Environment> {
+        self.active_environment_id
+            .and_then(|id| self.environments.iter().find(|e| e.id == id))
+    }
+
+    fn resolve_vars(&self, input: &str) -> String {
+        if !input.contains("{{") {
+            return input.to_string();
+        }
+        let Some(env) = self.active_environment() else {
+            return input.to_string();
+        };
+        VAR_RE
+            .replace_all(input, |caps: &regex::Captures| {
+                env.variables
+                    .iter()
+                    .find(|v| v.enabled && v.key == &caps[1])
+                    .map(|v| v.value.clone())
+                    .unwrap_or_else(|| caps[0].to_string())
+            })
+            .to_string()
     }
 }
 
@@ -4147,6 +4353,77 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         }
         Message::CookieJarClearDomain(domain) => {
             app.cookie_jar.remove(&domain);
+            iced::Task::none()
+        }
+        Message::EnvironmentAdd => {
+            let id = app.next_environment_id;
+            app.next_environment_id += 1;
+            app.environments
+                .push(Environment::new(id, format!("Environment {}", id)));
+            app.active_environment_id = Some(id);
+            app.save_task()
+        }
+        Message::EnvironmentSelected(id) => {
+            app.active_environment_id = id;
+            app.save_task()
+        }
+        Message::EnvironmentRenamed(id, name) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == id) {
+                env.name = name;
+            }
+            app.save_task()
+        }
+        Message::EnvironmentDeleted(id) => {
+            app.environments.retain(|e| e.id != id);
+            if app.active_environment_id == Some(id) {
+                app.active_environment_id = None;
+            }
+            app.save_task()
+        }
+        Message::EnvVarAdd(env_id) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                env.variables.push(EnvVar::new());
+            }
+            iced::Task::none()
+        }
+        Message::EnvVarRemove(env_id, idx) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                if idx < env.variables.len() {
+                    env.variables.remove(idx);
+                }
+            }
+            iced::Task::none()
+        }
+        Message::EnvVarKeyChanged(env_id, idx, key) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                if let Some(v) = env.variables.get_mut(idx) {
+                    v.key = key;
+                }
+            }
+            iced::Task::none()
+        }
+        Message::EnvVarValueChanged(env_id, idx, value) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                if let Some(v) = env.variables.get_mut(idx) {
+                    v.value = value;
+                }
+            }
+            iced::Task::none()
+        }
+        Message::EnvVarToggled(env_id, idx) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                if let Some(v) = env.variables.get_mut(idx) {
+                    v.enabled = !v.enabled;
+                }
+            }
+            iced::Task::none()
+        }
+        Message::EnvPanelOpen => {
+            app.env_panel_open = true;
+            iced::Task::none()
+        }
+        Message::EnvPanelClose => {
+            app.env_panel_open = false;
             iced::Task::none()
         }
         Message::Tick => {
@@ -5050,6 +5327,9 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 app.next_tab_id = session.next_tab_id;
                 app.cookie_jar = session.cookie_jar;
                 app.active_tab = session.active_tab.min(metadata.len().saturating_sub(1));
+                app.environments = session.environments;
+                app.active_environment_id = session.active_environment_id;
+                app.next_environment_id = session.next_environment_id.max(1);
             }
 
             // build tab list — all Unloaded first
@@ -5303,6 +5583,12 @@ fn view(app: &CrabiPie) -> Element<'_, Message> {
 
     let body: Element<'_, Message> = if app.cookie_jar_open {
         iced::widget::stack![body, app.render_cookie_jar_modal()].into()
+    } else {
+        body
+    };
+
+    let body: Element<'_, Message> = if app.env_panel_open {
+        iced::widget::stack![body, app.render_env_panel()].into()
     } else {
         body
     };
@@ -5925,6 +6211,40 @@ fn json_theme_from_str(s: &str) -> json_highlighter::JsonThemeWrapper {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct Environment {
+    id: usize,
+    name: String,
+    variables: Vec<EnvVar>,
+}
+
+impl Environment {
+    fn new(id: usize, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            variables: vec![EnvVar::new()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct EnvVar {
+    key: String,
+    value: String,
+    enabled: bool,
+}
+
+impl EnvVar {
+    fn new() -> Self {
+        Self {
+            key: String::new(),
+            value: String::new(),
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Collection {
     name: String,
@@ -6494,3 +6814,6 @@ const INTROSPECTION_QUERY: &str = r#"
   }
 }
 "#;
+
+static VAR_RE: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"\{\{(\w+)\}\}").unwrap());

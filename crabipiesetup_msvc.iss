@@ -8,7 +8,7 @@
 #define MyAppURL       "https://github.com"
 #define MyAppExeName   "CrabiPie.exe"
 
-#define MyAppSourceDir "C:\Users\HP\Documents\Projects\rust\crabice\target\release"
+#define MyAppSourceDir "C:\Users\HP\Documents\Himal\Projects\rust\crabice\target\release"
 #define GST_MSVC_DIR   "C:\Program Files\gstreamer\1.0\msvc_x86_64"
 
 [Setup]
