@@ -1159,10 +1159,22 @@ impl CrabiPie {
                 .center_y(Length::Fill)
                 .into()
         } else if let Some(err) = &tab.graphql_schema_error {
-            container(text(err).style(|_| text::Style {
-                color: Some(iced::Color::from_rgb(1.0, 0.3, 0.3)),
-            }))
+            container(
+                Column::new()
+                    .spacing(10)
+                    .push(text(err).style(|_| text::Style {
+                        color: Some(iced::Color::from_rgb(1.0, 0.3, 0.3)),
+                    }))
+                    .push(
+                        button(text("🔄 Try Again").shaping(text::Shaping::Advanced))
+                            .on_press(Message::FetchGraphqlSchema)
+                            .padding(8)
+                            .style(button::text),
+                    ),
+            )
             .padding(10)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
             .into()
         } else if let Some(schema) = &tab.graphql_schema {
             // --- Search + Collapse Bar ---
@@ -4532,14 +4544,23 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 } else if resp.is_binary && resp.content_type.starts_with("image/") {
                     tab.image_handle =
                         Some(iced::widget::image::Handle::from_bytes(resp.bytes.clone()));
+                    tab.response_bytes = resp.bytes.clone();
+                    tab.response_filename = resp.filename.clone();
+                } else if resp.is_binary {
+                    // PDFs, octet-stream, audio, non-range video — generic binary path
+                    tab.video_player = None;
+                    tab.video_state = None;
+                    tab.image_handle = None;
+                    tab.response_bytes = resp.bytes.clone();
+                    tab.response_filename = resp.filename.clone();
                 } else {
+                    // actual text response
                     tab.video_player = None;
                     tab.video_state = None;
                     tab.response_headers = std::sync::Arc::from(resp.headers.as_str());
                     tab.response_body = std::sync::Arc::from(resp.body.as_str());
                     app.response_body_content = text_editor::Content::with_text(&resp.body);
                 }
-
                 url
             };
 
