@@ -2572,25 +2572,28 @@ impl CrabiPie {
         let Some(tab) = self.current_tab() else {
             return iced::widget::text("Loading...").into();
         };
+
         let is_url_encoded = matches!(tab.content_type, ContentType::XWWWFormUrlEncoded);
 
         let mut fields_col = Column::new().spacing(10);
 
         for (idx, field) in tab.form_data.iter().enumerate() {
-            // Force text type if URL-encoded
             let effective_type = if is_url_encoded {
                 FormFieldType::Text
             } else {
                 field.field_type.clone()
             };
 
-            // Value input (always shown)
             let value_input = text_input("value", &field.value)
                 .on_input(move |val| Message::FormFieldValueChanged(idx, val))
-                .width(280);
+                .width(Length::Fill);
 
             let value_or_file: Element<'_, Message> = if effective_type == FormFieldType::Text {
-                row![text("Value:"), value_input].spacing(8).into()
+                row![text("Value:"), value_input,]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .width(Length::FillPortion(2))
+                    .into()
             } else {
                 let file_count_text: Element<'_, Message> = if !field.files.is_empty() {
                     text(format!("📎{} file(s)", field.files.len()))
@@ -2604,24 +2607,25 @@ impl CrabiPie {
                     text("File:"),
                     button(text("📁 Choose").shaping(text::Shaping::Advanced))
                         .on_press(Message::FormFieldFileSelect(idx)),
-                    file_count_text
+                    file_count_text,
                 ]
                 .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Length::FillPortion(2))
                 .into()
             };
 
-            // Build the main row — conditionally include type picker
             let mut field_row = row![
                 checkbox(field.enabled).on_toggle(move |_| Message::FormFieldToggled(idx)),
                 text("Key:"),
                 text_input("key", &field.key)
                     .on_input(move |key| Message::FormFieldKeyChanged(idx, key))
-                    .width(160),
+                    .width(Length::FillPortion(1)),
             ]
             .spacing(8)
-            .align_y(Alignment::Center);
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
 
-            // Only show type selector if NOT urlencoded
             if !is_url_encoded {
                 field_row = field_row.push(pick_list(
                     &FormFieldType::ALL[..],
@@ -2638,16 +2642,18 @@ impl CrabiPie {
 
             fields_col = fields_col.push(field_row);
 
-            // Show selected files (only for File type and not urlencoded)
             if effective_type == FormFieldType::File && !field.files.is_empty() && !is_url_encoded {
                 let mut files_col = Column::new().spacing(4);
+
                 for file in &field.files {
                     let filename = std::path::Path::new(file)
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or(file);
+
                     files_col = files_col.push(text(format!(" • {filename}")).size(13));
                 }
+
                 fields_col = fields_col.push(container(files_col).padding(Padding {
                     left: 20.0,
                     ..Default::default()
@@ -2661,7 +2667,10 @@ impl CrabiPie {
                 .style(button::subtle),
         );
 
-        scrollable(fields_col).height(Length::Fill).into()
+        scrollable(fields_col)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
     }
 
     fn render_query_tab(&self) -> Element<'_, Message> {
@@ -4045,6 +4054,8 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             match &app.tabs[index] {
                 TabLoadState::Loaded(tab) => {
                     app.request_body_content = text_editor::Content::with_text(&tab.request_body);
+                    app.raw_headers_content =
+                        text_editor::Content::with_text(&tab.raw_headers_content);
                     app.raw_form_content = text_editor::Content::with_text(&tab.raw_form_content);
                     app.graphql_query_content = text_editor::Content::with_text(&tab.graphql_query);
                     app.graphql_variables_content =
@@ -4087,6 +4098,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             if app.tabs.get(app.active_tab).map(|t| t.id()) == Some(id) {
                 if let Some(tab) = app.current_tab() {
                     let req_body = tab.request_body.clone();
+                    let raw_headers = tab.raw_headers_content.clone();
                     let raw_form = tab.raw_form_content.clone();
                     let gql_query = tab.graphql_query.clone();
                     let gql_vars = tab.graphql_variables.clone();
@@ -4094,6 +4106,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     let res_headers = tab.response_headers.clone();
 
                     app.request_body_content = text_editor::Content::with_text(&req_body);
+                    app.raw_headers_content = text_editor::Content::with_text(&raw_headers);
                     app.raw_form_content = text_editor::Content::with_text(&raw_form);
                     app.graphql_query_content = text_editor::Content::with_text(&gql_query);
                     app.graphql_variables_content = text_editor::Content::with_text(&gql_vars);
