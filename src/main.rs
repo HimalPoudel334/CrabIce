@@ -1226,7 +1226,7 @@ impl CrabiPie {
                         &tab.graphql_selected_paths,
                         &tab.graphql_search,
                         1, // Indentation level
-                        "",
+                        root_type_name,
                     );
                     for row in tree_rows {
                         scroll_content = scroll_content.push(row);
@@ -1914,19 +1914,21 @@ impl CrabiPie {
         let mut buf = String::from("query {\n");
 
         if let Some(schema) = &tab.graphql_schema {
-            // Find the "Query" type (or whatever your query_type is named)
+            // Find the "Query" type
+            let root_type_name = &schema.query_type.name;
             if let Some(root_type) = schema
                 .types
                 .iter()
                 .find(|t| t.name.as_deref() == Some("Query"))
             {
-                buf.push_str(&generate_selection_set(
+                let selection = generate_selection_set(
                     &schema.types,
                     root_type,
                     &tab.graphql_selected_paths,
-                    1,       // Start at indent level 1
-                    "Query", // Starting path
-                ));
+                    1, // Start at indent level 1
+                    root_type_name,
+                );
+                buf.push_str(&selection);
             }
         }
 
@@ -4223,12 +4225,21 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
             if selected.contains(&path) {
                 // --- TOGGLE OFF ---
-                // 4. Recursive uncheck (Downwards)
-                let child_prefix = format!("{}.", path);
-                selected.retain(|p| p != &path && !p.starts_with(&child_prefix));
-                manual.retain(|p| p != &path && !p.starts_with(&child_prefix));
+                // 1. Remove the path itself
+                selected.remove(&path);
+                manual.remove(&path);
 
-                // 3. Walk backwards (Upwards)
+                // 2. Remove ALL children (including args)
+                let child_prefix = format!("{}.", path);
+                selected.retain(|p| !p.starts_with(&child_prefix));
+                manual.retain(|p| !p.starts_with(&child_prefix));
+
+                // Also remove args for this path
+                let arg_prefix = format!("{}.arg:", path);
+                selected.retain(|p| !p.starts_with(&arg_prefix));
+                manual.retain(|p| !p.starts_with(&arg_prefix));
+
+                // 3. Walk backwards (Upwards) - uncheck parents if no children remain
                 let mut parts: Vec<String> = path.split('.').map(|s| s.to_string()).collect();
                 while parts.len() > 1 {
                     parts.pop();
@@ -4238,6 +4249,7 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     let has_active_children =
                         selected.iter().any(|p| p.starts_with(&sibling_prefix));
 
+                    // Only remove if not manually selected AND no children
                     if !has_active_children && !manual.contains(&parent_path) {
                         selected.remove(&parent_path);
                     } else {
@@ -4246,9 +4258,11 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 }
             } else {
                 // --- TOGGLE ON ---
-                manual.insert(path.clone()); // Track this as a manual click
+                // 1. Add the clicked path
+                manual.insert(path.clone());
+                selected.insert(path.clone());
 
-                // 1. Bubbling check (Upwards)
+                // 2. Bubbling check (Upwards) - auto-select all parents
                 let parts: Vec<&str> = path.split('.').collect();
                 let mut current_path = String::new();
                 for (i, part) in parts.iter().enumerate() {
@@ -4256,9 +4270,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         current_path.push('.');
                     }
                     current_path.push_str(part);
-                    selected.insert(current_path.clone());
+
+                    // Don't override manual selections, but add if not present
+                    if !selected.contains(&current_path) {
+                        selected.insert(current_path.clone());
+                    }
                 }
             }
+
+            // Update the query
             let query = app.build_query();
             app.graphql_query_content = text_editor::Content::with_text(&query);
             if let Some(tab) = app.current_tab_mut() {
@@ -6731,59 +6751,122 @@ fn generate_selection_set(
         for field in fields {
             let field_path = format!("{}.{}", current_path, field.name);
 
-            // ONLY proceed if this field is in the HashSet
-            if selected_paths.contains(&field_path) {
-                output.push_str(&format!("{}{}", spaces, field.name));
+            // ONLY proceed if this field is directly selected
+            if !selected_paths.contains(&field_path) {
+                continue;
+            }
 
-                // --- 1. Handle Arguments ---
-                let active_args: Vec<_> = field
-                    .args
+            output.push_str(&format!("{}{}", spaces, field.name));
+
+            // --- 1. Handle Arguments ---
+            let active_args: Vec<_> = field
+                .args
+                .iter()
+                .filter(|a| selected_paths.contains(&format!("{}.arg:{}", field_path, a.name)))
+                .collect();
+
+            if !active_args.is_empty() {
+                output.push('(');
+                let arg_strings: Vec<String> = active_args
                     .iter()
-                    .filter(|a| selected_paths.contains(&format!("{}.arg:{}", field_path, a.name)))
+                    .map(|a| format!("{}: ${}", a.name, a.name))
                     .collect();
+                output.push_str(&arg_strings.join(", "));
+                output.push(')');
+            }
 
-                if !active_args.is_empty() {
-                    output.push('(');
-                    let arg_strings: Vec<String> = active_args
-                        .iter()
-                        .map(|a| format!("{}: TODO_VAL", a.name)) // We'll talk about values next!
-                        .collect();
-                    output.push_str(&arg_strings.join(", "));
-                    output.push(')');
-                }
+            // --- 2. Handle Sub-selection (Nested Objects) ---
+            let base_name = field.field_type.get_base_name();
+            let sub_type = all_types
+                .iter()
+                .find(|t| t.name.as_deref() == base_name.map(|s| s.as_str()));
 
-                // --- 2. Handle Sub-selection (Nested Objects) ---
-                let base_name = field.field_type.get_base_name();
-                let sub_type = all_types
-                    .iter()
-                    .find(|t| t.name.as_deref() == base_name.map(|s| s.as_str()));
-
-                // Check if any children of this field are selected
+            if let Some(st) = sub_type {
+                // Check if any children of this field are selected (excluding args)
                 let has_selected_children = selected_paths
                     .iter()
                     .any(|p| p.starts_with(&format!("{}.", field_path)) && !p.contains(".arg:"));
 
-                if let Some(st) = sub_type {
-                    if has_selected_children {
-                        output.push_str(" {\n");
-                        output.push_str(&generate_selection_set(
-                            all_types,
-                            st,
-                            selected_paths,
-                            indent + 1,
-                            &field_path,
-                        ));
-                        output.push_str(&format!("{}}}\n", spaces));
-                    } else {
-                        output.push('\n');
-                    }
+                if has_selected_children {
+                    output.push_str(" {\n");
+                    output.push_str(&generate_selection_set(
+                        all_types,
+                        st,
+                        selected_paths,
+                        indent + 1,
+                        &field_path,
+                    ));
+                    output.push_str(&format!("{}}}\n", spaces));
                 } else {
                     output.push('\n');
                 }
+            } else {
+                output.push('\n');
             }
         }
     }
     output
+}
+
+fn generate_variables(
+    all_types: &[GraphqlType],
+    current_type: &GraphqlType,
+    selected_paths: &std::collections::HashSet<String>,
+    current_path: &str,
+) -> String {
+    let mut variables = String::new();
+    let fields = current_type
+        .fields
+        .as_ref()
+        .or(current_type.input_fields.as_ref());
+
+    if let Some(fields) = fields {
+        for field in fields {
+            let field_path = format!("{}.{}", current_path, field.name);
+
+            // Check if this field or its children are selected
+            let is_selected = selected_paths.contains(&field_path);
+            let has_selected_children = selected_paths
+                .iter()
+                .any(|p| p.starts_with(&format!("{}.", field_path)));
+
+            if !is_selected && !has_selected_children {
+                continue;
+            }
+
+            // Check for selected arguments
+            for arg in &field.args {
+                let arg_path = format!("{}.arg:{}", field_path, arg.name);
+                if selected_paths.contains(&arg_path) {
+                    // Add variable definition
+                    let var_name = arg.name.clone();
+                    let var_type = arg.arg_type.to_string();
+                    variables.push_str(&format!("  ${}: {}\n", var_name, var_type));
+                }
+            }
+
+            // Recurse for nested fields
+            let base_name = field.field_type.get_base_name();
+            if let Some(sub_type) = all_types
+                .iter()
+                .find(|t| t.name.as_deref() == base_name.map(|s| s.as_str()))
+            {
+                let has_selected_children = selected_paths
+                    .iter()
+                    .any(|p| p.starts_with(&format!("{}.", field_path)) && !p.contains(".arg:"));
+
+                if has_selected_children {
+                    variables.push_str(&generate_variables(
+                        all_types,
+                        sub_type,
+                        selected_paths,
+                        &field_path,
+                    ));
+                }
+            }
+        }
+    }
+    variables
 }
 
 fn proximity_order(active: usize, len: usize) -> Vec<usize> {
