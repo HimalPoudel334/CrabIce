@@ -21,15 +21,15 @@ async-tungstenite = "0.32.1"
 reqwest-websocket = "0.5.1"
 async-stream = "0.3.6"
 futures-util = "0.3.32"
-
+flate2 = "1.1.9"
+regex = "1.13.1"
+base64 = "0.23.0"
 
 # Add GStreamer crates
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
 gstreamer-base = "0.23"
-flate2 = "1.1.9"
-regex = "1.13.1"
 
 [profile.release]
 strip = true

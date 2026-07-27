@@ -19,8 +19,7 @@ use serde::{Deserialize, Serialize};
 mod json_highlighter;
 
 //TODOS:
-//1 base url
-//2 collections
+//1 collections
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -45,9 +44,13 @@ enum Message {
     HeaderKeyChanged(usize, String),
     HeaderValueChanged(usize, String),
     HeaderToggled(usize),
+    HeadersViewTypeChanged(HeaderViewType),
+    HeaderRawAction(text_editor::Action),
 
     BodyAction(text_editor::Action),
     AuthTypeSelected(AuthType),
+    UsernameChanged(String),
+    PasswordChanged(String),
     ApiKeyNameChanged(String),
     ApiKeyChanged(String),
     ApiKeyPositionChanged(ApiKeyPosition),
@@ -207,6 +210,7 @@ struct CrabiPie {
 
     // text_editor contents , same for all tabs,
     request_body_content: text_editor::Content,
+    raw_headers_content: text_editor::Content,
     raw_form_content: text_editor::Content,
     graphql_query_content: text_editor::Content,
     graphql_variables_content: text_editor::Content,
@@ -270,10 +274,14 @@ struct TabState {
     request_type: RequestType,
     method: HttpMethod,
     headers: Vec<RequestHeaders>,
+    header_view_type: HeaderViewType,
+    raw_headers_content: std::sync::Arc<str>,
     request_body: std::sync::Arc<str>,
     form_view_type: FormViewType,
     auth_type: AuthType,
     bearer_token: String,
+    username: String,
+    password: String,
     api_key_name: String,
     api_key: String,
     api_key_position: ApiKeyPosition,
@@ -353,11 +361,15 @@ impl TabState {
             request_type: RequestType::HTTP,
             method: HttpMethod::GET,
             headers: RequestHeaders::default(),
+            header_view_type: HeaderViewType::Formatted,
+            raw_headers_content: std::sync::Arc::from(RAW_FORM_PLACEHOLDER),
             request_body: std::sync::Arc::from(BODY_DEFAULT),
             form_view_type: FormViewType::Formatted,
             auth_type: AuthType::None,
             bearer_token: String::new(),
             api_key_name: String::new(),
+            username: String::new(),
+            password: String::new(),
             api_key: String::new(),
             api_key_position: ApiKeyPosition::Header,
             content_type: ContentType::Json,
@@ -422,10 +434,14 @@ impl TabState {
             request_type: saved.request_type,
             method: saved.method,
             headers: saved.headers,
+            header_view_type: saved.header_view_type,
+            raw_headers_content: std::sync::Arc::from(saved.raw_headers_content.as_str()),
             request_body: std::sync::Arc::from(saved.body.as_str()),
             form_view_type: saved.form_view_type,
             auth_type: saved.auth_type,
             bearer_token: saved.bearer_token,
+            username: saved.username,
+            password: saved.password,
             api_key_name: saved.api_key_name,
             api_key: saved.api_key,
             api_key_position: saved.api_key_position,
@@ -486,9 +502,13 @@ impl TabState {
             request_type: self.request_type.clone(),
             method: self.method.clone(),
             headers: self.headers.clone(),
+            header_view_type: self.header_view_type,
+            raw_headers_content: self.raw_headers_content.to_string(),
             body: self.request_body.to_string(),
             form_view_type: self.form_view_type,
             auth_type: self.auth_type.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
             bearer_token: self.bearer_token.clone(),
             api_key_name: self.api_key_name.clone(),
             api_key: self.api_key.clone(),
@@ -520,6 +540,52 @@ impl TabState {
             active_request_tab: self.active_request_tab,
             active_response_tab: self.active_response_tab,
         }
+    }
+
+    fn headers_to_raw(headers: &[RequestHeaders]) -> String {
+        headers
+            .iter()
+            .filter_map(|h| {
+                if h.key.is_empty() && h.value.is_empty() {
+                    None
+                } else {
+                    let mut line = format!("{}: {}", h.key, h.value);
+
+                    if !h.enabled {
+                        line = format!("# {}", line);
+                    }
+
+                    Some(line)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn raw_to_headers(raw: &str) -> Vec<RequestHeaders> {
+        raw.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+
+                if line.is_empty() {
+                    return None;
+                }
+
+                let (enabled, line) = if let Some(rest) = line.strip_prefix('#') {
+                    (false, rest.trim())
+                } else {
+                    (true, line)
+                };
+
+                let (key, value) = line.split_once(':')?;
+
+                Some(RequestHeaders {
+                    enabled,
+                    key: key.trim().to_string(),
+                    value: value.trim().to_string(),
+                })
+            })
+            .collect()
     }
 
     fn form_data_to_raw(form_data: &[FormField]) -> String {
@@ -604,6 +670,7 @@ impl CrabiPie {
             cookie_jar_new_domain: String::new(),
             cookie_jar: std::collections::HashMap::new(),
             cookie_jar_error: None,
+            raw_headers_content: text_editor::Content::new(),
             raw_form_content: text_editor::Content::new(),
             request_body_content: text_editor::Content::new(),
             graphql_query_content: text_editor::Content::new(),
@@ -2031,8 +2098,12 @@ struct SavedState {
     request_type: RequestType,
     method: HttpMethod,
     headers: Vec<RequestHeaders>,
+    header_view_type: HeaderViewType,
+    raw_headers_content: String,
     body: String,
     form_view_type: FormViewType,
+    username: String,
+    password: String,
     auth_type: AuthType,
     bearer_token: String,
     api_key_name: String,
@@ -2077,9 +2148,13 @@ impl Default for SavedState {
             request_type: RequestType::HTTP,
             method: HttpMethod::GET,
             headers: vec![RequestHeaders::new()],
+            header_view_type: HeaderViewType::Formatted,
+            raw_headers_content: String::new(),
             body: String::new(),
             form_view_type: FormViewType::Formatted,
             auth_type: AuthType::None,
+            username: String::new(),
+            password: String::new(),
             api_key_position: ApiKeyPosition::Header,
             bearer_token: String::new(),
             api_key_name: String::new(),
@@ -2601,11 +2676,11 @@ impl CrabiPie {
 
             let key_input = text_input("key", &param.key)
                 .on_input(move |key| Message::QueryParamKeyChanged(idx, key))
-                .width(200);
+                .width(Length::FillPortion(1));
 
             let value_input = text_input("value", &param.value)
                 .on_input(move |val| Message::QueryParamValueChanged(idx, val))
-                .width(300);
+                .width(Length::FillPortion(2));
 
             let remove_btn = button(text("❌").shaping(text::Shaping::Advanced))
                 .style(button::text)
@@ -2620,7 +2695,8 @@ impl CrabiPie {
                 remove_btn,
             ]
             .spacing(8)
-            .align_y(Alignment::Center);
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
 
             params_col = params_col.push(param_row);
         }
@@ -2666,6 +2742,41 @@ impl CrabiPie {
             return iced::widget::text("Loading...").into();
         };
 
+        let picker = row![
+            space::horizontal(),
+            pick_list(
+                &HeaderViewType::ALL[..],
+                Some(tab.header_view_type.clone()),
+                Message::HeadersViewTypeChanged,
+            )
+            .padding(Padding::new(0.0).top(0.0))
+        ];
+
+        let content = match tab.header_view_type {
+            HeaderViewType::Formatted => self.render_formatted_headers(),
+
+            HeaderViewType::Raw => scrollable(
+                text_editor(&self.raw_headers_content)
+                    .placeholder("Header: Value")
+                    .on_action(Message::HeaderRawAction)
+                    .style(Self::get_editor_style)
+                    .min_height(200.0),
+            )
+            .height(Length::Fill)
+            .into(),
+        };
+
+        column![picker, content]
+            .spacing(10)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn render_formatted_headers(&self) -> Element<'_, Message> {
+        let Some(tab) = self.current_tab() else {
+            return iced::widget::text("Loading...").into();
+        };
+
         let mut headers_col = Column::new().spacing(10);
 
         for (idx, header) in tab.headers.iter().enumerate() {
@@ -2673,28 +2784,29 @@ impl CrabiPie {
 
             let key_input = text_input("key", &header.key)
                 .on_input(move |key| Message::HeaderKeyChanged(idx, key))
-                .width(200);
+                .width(Length::FillPortion(1));
 
             let value_input = text_input("value", &header.value)
                 .on_input(move |val| Message::HeaderValueChanged(idx, val))
-                .width(300);
+                .width(Length::FillPortion(2));
 
             let remove_btn = button(text("❌").shaping(text::Shaping::Advanced))
                 .style(button::subtle)
                 .on_press(Message::HeaderRemove(idx));
 
-            let param_row = row![
-                checkbox,
-                text("Key:"),
-                key_input,
-                text("Value:"),
-                value_input,
-                remove_btn,
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center);
-
-            headers_col = headers_col.push(param_row);
+            headers_col = headers_col.push(
+                row![
+                    checkbox,
+                    text("Key:"),
+                    key_input,
+                    text("Value:"),
+                    value_input,
+                    remove_btn,
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+            );
         }
 
         headers_col = headers_col.push(
@@ -2705,7 +2817,6 @@ impl CrabiPie {
 
         scrollable(headers_col).height(Length::Fill).into()
     }
-
     fn render_auth_tab(&self) -> Element<'_, Message> {
         let Some(tab) = self.current_tab() else {
             return iced::widget::text("Loading...").into();
@@ -2724,6 +2835,7 @@ impl CrabiPie {
 
         let auth_form: Element<'_, Message> = match tab.auth_type {
             AuthType::None => Space::new().into(),
+
             AuthType::Bearer => row![
                 text("Token:"),
                 text_input("", &tab.bearer_token)
@@ -2734,15 +2846,38 @@ impl CrabiPie {
             .spacing(10)
             .align_y(Alignment::Center)
             .into(),
+
+            AuthType::Basic => row![
+                column![text("Username:"), text("Password:"),]
+                    .spacing(10)
+                    .align_x(Alignment::End),
+                column![
+                    text_input("Username", &tab.username)
+                        .on_input(Message::UsernameChanged)
+                        .width(Length::Fill)
+                        .padding(8),
+                    text_input("Password", &tab.password)
+                        .on_input(Message::PasswordChanged)
+                        .secure(true) // hides the password
+                        .width(Length::Fill)
+                        .padding(8),
+                ]
+                .spacing(10)
+                .width(Length::Fill),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+
             AuthType::ApiKey => row![
                 column![text("Key:"), text("Value:"), text("Add to:"),]
                     .align_x(Alignment::Center)
                     .spacing(10),
                 column![
-                    text_input("", &tab.api_key_name)
+                    text_input("Key", &tab.api_key_name)
                         .on_input(Message::ApiKeyNameChanged)
                         .width(Length::Fill),
-                    text_input("", &tab.api_key)
+                    text_input("Value", &tab.api_key)
                         .on_input(Message::ApiKeyChanged)
                         .width(Length::Fill),
                     pick_list(
@@ -3513,6 +3648,20 @@ impl CrabiPie {
 
         // ── auth ──────────────────────────────
         match tab.auth_type {
+            AuthType::Basic => {
+                if !tab.username.is_empty() || !tab.password.is_empty() {
+                    let credentials = format!("{}:{}", tab.username, tab.password);
+                    let encoded = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        credentials,
+                    );
+                    if let Ok(hv) =
+                        reqwest::header::HeaderValue::from_str(&format!("Basic {}", encoded))
+                    {
+                        header_map.insert(reqwest::header::AUTHORIZATION, hv);
+                    }
+                }
+            }
             AuthType::Bearer => {
                 if !tab.bearer_token.is_empty() {
                     if let Ok(hv) = reqwest::header::HeaderValue::from_str(&format!(
@@ -4053,6 +4202,46 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 }
                 _ => app.request_body_content.perform(action),
             }
+            iced::Task::none()
+        }
+        Message::HeadersViewTypeChanged(view_type) => {
+            match view_type {
+                HeaderViewType::Raw => {
+                    let raw = {
+                        let Some(tab) = app.current_tab_mut() else {
+                            return iced::Task::none();
+                        };
+
+                        let raw = TabState::headers_to_raw(&tab.headers);
+                        tab.raw_headers_content = std::sync::Arc::from(raw.as_str());
+                        tab.header_view_type = HeaderViewType::Raw;
+                        raw
+                    };
+
+                    app.raw_headers_content = text_editor::Content::with_text(&raw);
+                }
+
+                HeaderViewType::Formatted => {
+                    let raw = app.raw_headers_content.text();
+
+                    let Some(tab) = app.current_tab_mut() else {
+                        return iced::Task::none();
+                    };
+
+                    tab.raw_headers_content = std::sync::Arc::from(raw.as_str());
+                    tab.headers = TabState::raw_to_headers(&raw);
+                    tab.header_view_type = HeaderViewType::Formatted;
+                }
+            }
+
+            iced::Task::none()
+        }
+        Message::HeaderRawAction(action) => {
+            app.raw_headers_content.perform(action);
+            let raw_text = app.raw_headers_content.text();
+            if let Some(tab) = app.current_tab_mut() {
+                tab.raw_headers_content = std::sync::Arc::from(raw_text.as_str());
+            };
             iced::Task::none()
         }
         Message::AuthTypeSelected(auth_type) => {
@@ -5136,6 +5325,20 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             tab.active_request_tab = request_tab;
             iced::Task::none()
         }
+        Message::UsernameChanged(username) => {
+            let Some(tab) = app.current_tab_mut() else {
+                return iced::Task::none();
+            };
+            tab.username = username;
+            iced::Task::none()
+        }
+        Message::PasswordChanged(password) => {
+            let Some(tab) = app.current_tab_mut() else {
+                return iced::Task::none();
+            };
+            tab.password = password;
+            iced::Task::none()
+        }
         Message::ApiKeyPositionChanged(position) => {
             let Some(tab) = app.current_tab_mut() else {
                 return iced::Task::none();
@@ -5886,6 +6089,22 @@ impl std::fmt::Display for FormViewType {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HeaderViewType {
+    Formatted,
+    Raw,
+}
+
+impl std::fmt::Display for HeaderViewType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Edit {:?}", self)
+    }
+}
+
+impl HeaderViewType {
+    const ALL: [HeaderViewType; 2] = [HeaderViewType::Formatted, HeaderViewType::Raw];
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum FormFieldType {
     Text,
     File,
@@ -5925,6 +6144,7 @@ impl FormField {
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 enum AuthType {
     None,
+    Basic,
     Bearer,
     ApiKey,
 }
@@ -5933,6 +6153,7 @@ impl std::fmt::Display for AuthType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AuthType::None => write!(f, "No Auth"),
+            AuthType::Basic => write!(f, "Basic Auth"),
             AuthType::Bearer => write!(f, "Bearer Token"),
             AuthType::ApiKey => write!(f, "Api Key"),
         }
@@ -5940,7 +6161,12 @@ impl std::fmt::Display for AuthType {
 }
 
 impl AuthType {
-    const ALL: [AuthType; 3] = [AuthType::None, AuthType::Bearer, AuthType::ApiKey];
+    const ALL: [AuthType; 4] = [
+        AuthType::None,
+        AuthType::Basic,
+        AuthType::Bearer,
+        AuthType::ApiKey,
+    ];
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
