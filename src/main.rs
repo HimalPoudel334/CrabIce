@@ -62,8 +62,8 @@ enum Message {
     ResponseTabSelected(ResponseTab),
     ResponseBodyAction(text_editor::Action),
     ResponseHeadersAction(text_editor::Action),
-    PrettifyJson,
-    JsonPrettified(Result<String, String>),
+    PrettifyJson(JsonTarget),
+    JsonPrettified(JsonTarget, Result<String, String>),
     CopyToClipboard,
     ResetCopied,
     JsonThemeChanged(json_highlighter::JsonThemeWrapper),
@@ -2501,7 +2501,7 @@ impl CrabiPie {
             }))
             .style(button::text)
             .on_press(if tab.content_type == ContentType::Json {
-                Message::PrettifyJson
+                Message::PrettifyJson(JsonTarget::RequestBody)
             } else if tab.form_view_type == FormViewType::Formatted {
                 Message::ViewRawForm
             } else {
@@ -3255,6 +3255,31 @@ impl CrabiPie {
                 tooltip::Position::Bottom,
             ));
         }
+        let prettify_target = match tab.active_response_tab {
+            ResponseTab::Body => {
+                if tab.is_response_binary {
+                    None
+                } else {
+                    Some(JsonTarget::ResponseBody)
+                }
+            }
+            ResponseTab::Headers => Some(JsonTarget::ResponseHeaders),
+        };
+
+        let prettify_button =
+            button(text("✨").shaping(text::Shaping::Advanced)).style(button::text);
+
+        let prettify_button = if let Some(target) = prettify_target {
+            prettify_button.on_press(Message::PrettifyJson(target))
+        } else {
+            prettify_button
+        };
+
+        header_row = header_row.push(tooltip(
+            prettify_button,
+            "Prettify",
+            tooltip::Position::Bottom,
+        ));
         header_row = header_row.push(tooltip(
             button(text("🧹").shaping(text::Shaping::Advanced))
                 .on_press(Message::ClearResponseText)
@@ -4824,11 +4849,24 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             tab.active_response_tab = response_tab;
             iced::Task::none()
         }
-        Message::PrettifyJson => {
+        Message::PrettifyJson(target) => {
             let Some(tab) = app.current_tab() else {
                 return iced::Task::none();
             };
-            let body_text = tab.request_body.to_string();
+
+            let body_text = match target {
+                JsonTarget::RequestBody => tab.request_body.to_string(),
+
+                JsonTarget::ResponseBody => {
+                    if tab.is_response_binary {
+                        return iced::Task::none();
+                    }
+
+                    tab.response_body.to_string()
+                }
+
+                JsonTarget::ResponseHeaders => tab.response_headers.to_string(),
+            };
 
             iced::Task::perform(
                 async move {
@@ -4841,22 +4879,51 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     .await
                     .map_err(|e| e.to_string())?
                 },
-                Message::JsonPrettified,
+                move |result| Message::JsonPrettified(target, result),
             )
         }
-        Message::JsonPrettified(Ok(pretty)) => {
-            if let Some(tab) = app.current_tab_mut() {
-                tab.request_body = std::sync::Arc::from(pretty.as_str());
+        Message::JsonPrettified(target, Ok(pretty)) => {
+            let Some(tab) = app.current_tab_mut() else {
+                return iced::Task::none();
+            };
+
+            match target {
+                JsonTarget::RequestBody => {
+                    tab.request_body = std::sync::Arc::from(pretty.as_str());
+
+                    app.request_body_content
+                        .perform(text_editor::Action::SelectAll);
+                    app.request_body_content.perform(text_editor::Action::Edit(
+                        text_editor::Edit::Paste(std::sync::Arc::new(pretty)),
+                    ));
+                }
+
+                JsonTarget::ResponseBody => {
+                    tab.response_body = std::sync::Arc::from(pretty.as_str());
+
+                    app.response_body_content
+                        .perform(text_editor::Action::SelectAll);
+                    app.response_body_content.perform(text_editor::Action::Edit(
+                        text_editor::Edit::Paste(std::sync::Arc::new(pretty)),
+                    ));
+                }
+
+                JsonTarget::ResponseHeaders => {
+                    tab.response_headers = std::sync::Arc::from(pretty.as_str());
+
+                    app.response_headers_content
+                        .perform(text_editor::Action::SelectAll);
+                    app.response_headers_content
+                        .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                            std::sync::Arc::new(pretty),
+                        )));
+                }
             }
-            app.request_body_content
-                .perform(text_editor::Action::SelectAll);
-            app.request_body_content
-                .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                    std::sync::Arc::new(pretty),
-                )));
+
             iced::Task::none()
         }
-        Message::JsonPrettified(Err(err)) => {
+
+        Message::JsonPrettified(_, Err(err)) => {
             eprintln!("Prettify failed: {err}");
             iced::Task::none()
         }
@@ -5432,17 +5499,23 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
             tab.is_streaming = false;
             tab.loading = false;
+
             let body = std::mem::take(&mut tab.stream_buffer);
             tab.response_body = std::sync::Arc::from(body.as_str());
+
+            // Auto-prettify disabled for now.
+            // Uncomment this block if you decide to automatically format JSON responses.
+            /*
             let display = if let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) {
                 serde_json::to_string_pretty(&j).unwrap_or_else(|_| body.clone())
             } else {
                 body.clone()
             };
-            if let Some(tab) = app.current_tab_mut() {
-                tab.response_body = std::sync::Arc::from(body.as_str());
-            }
-            app.response_body_content = text_editor::Content::with_text(&display);
+            */
+
+            // Show the response exactly as received.
+            app.response_body_content = text_editor::Content::with_text(&body);
+
             iced::Task::none()
         }
         Message::WsConnect => {
@@ -6131,6 +6204,13 @@ impl std::fmt::Display for FormFieldType {
 
 impl FormFieldType {
     const ALL: [FormFieldType; 2] = [FormFieldType::Text, FormFieldType::File];
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum JsonTarget {
+    RequestBody,
+    ResponseBody,
+    ResponseHeaders,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
