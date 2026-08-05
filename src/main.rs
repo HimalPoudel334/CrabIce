@@ -17,6 +17,7 @@ use iced::{
 use serde::{Deserialize, Serialize};
 
 mod json_highlighter;
+mod pdf_viewer;
 
 //TODOS:
 //1 collections
@@ -138,6 +139,10 @@ enum Message {
 
     //Subscription
     Tick,
+
+    // Pdf controls
+    PdfNextPage,
+    PdfPreviousPage,
 
     //Video
     TogglePause,
@@ -321,6 +326,10 @@ struct TabState {
     //image handle
     image_handle: Option<iced::widget::image::Handle>,
 
+    // Pdf response
+    pdf_viewer: Option<pdf_viewer::PdfViewer>,
+    pdf_current_image: Option<iced::advanced::image::Handle>,
+
     // Video response
     video_player: Option<iced_video_player::Video>,
     video_state: Option<VideoState>,
@@ -377,6 +386,8 @@ impl TabState {
             form_data: vec![FormField::new()],
             raw_form_content: std::sync::Arc::from(""),
             image_handle: None,
+            pdf_viewer: None,
+            pdf_current_image: None,
             video_player: None,
             video_state: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -491,6 +502,8 @@ impl TabState {
             graphql_selected_paths: saved.graphql_selected_paths,
             manually_selected_paths: saved.manually_selected_paths,
             dirty: false,
+            pdf_viewer: None,
+            pdf_current_image: None,
         }
     }
 
@@ -2002,6 +2015,29 @@ impl CrabiPie {
         buf.push('}');
         buf
     }
+
+    fn render_and_prefetch(&mut self) -> iced::Task<Message> {
+        let Some(tab) = self.current_tab_mut() else {
+            return iced::Task::none();
+        };
+        let Some(pdf) = &mut tab.pdf_viewer else {
+            return iced::Task::none();
+        };
+
+        let current = pdf.current_page;
+        tab.pdf_current_image = pdf.render_current_page().ok();
+
+        for neighbor in [current.checked_sub(1), Some(current + 1)]
+            .into_iter()
+            .flatten()
+        {
+            if neighbor < pdf.page_count() && !pdf.is_cached(neighbor) {
+                let _ = pdf.render_page(neighbor);
+            }
+        }
+
+        iced::Task::none()
+    }
 }
 
 enum TabLoadState {
@@ -3351,6 +3387,42 @@ impl CrabiPie {
                         )
                         .height(Length::Fill)
                         .width(Length::Fill),
+                    );
+                }
+            } else if tab.response_content_type.starts_with("application/pdf") {
+                if let (Some(pdf), Some(page_image)) = (&tab.pdf_viewer, &tab.pdf_current_image) {
+                    body_column = body_column.push(
+                        iced::widget::row![
+                            button(text("◀").shaping(text::Shaping::Advanced))
+                                .on_press(Message::PdfPreviousPage)
+                                .style(button::text),
+                            text(format!(
+                                "Page {} / {}",
+                                pdf.current_page + 1,
+                                pdf.page_count()
+                            )),
+                            button(text("▶").shaping(text::Shaping::Advanced))
+                                .on_press(Message::PdfNextPage)
+                                .style(button::text),
+                        ]
+                        .height(15)
+                        .spacing(10),
+                    );
+                    body_column = body_column.push(
+                        scrollable(
+                            iced::widget::image(page_image.clone())
+                                .content_fit(iced::ContentFit::Contain),
+                        )
+                        .height(Length::Fill)
+                        .width(Length::Fill),
+                    );
+                } else {
+                    body_column = body_column.push(
+                        text("📄 Rendering PDF...")
+                            .shaping(text::Shaping::Advanced)
+                            .style(|_| text::Style {
+                                color: Some(iced::Color::from_rgb(1.0, 0.65, 0.0)),
+                            }),
                     );
                 }
             } else if tab.response_content_type.starts_with("video/") {
@@ -4820,6 +4892,23 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.svg_rotation = (app.svg_rotation + 4.0) % 360.0;
             iced::Task::none()
         }
+        Message::PdfNextPage => {
+            if let Some(tab) = app.current_tab_mut() {
+                if let Some(pdf) = &mut tab.pdf_viewer {
+                    pdf.next_page();
+                }
+            }
+            app.render_and_prefetch()
+        }
+        Message::PdfPreviousPage => {
+            if let Some(tab) = app.current_tab_mut() {
+                if let Some(pdf) = &mut tab.pdf_viewer {
+                    pdf.previous_page();
+                    tab.pdf_current_image = pdf.render_current_page().ok();
+                }
+            }
+            iced::Task::none()
+        }
         Message::TogglePause => {
             if let Some(tab) = app.current_tab_mut() {
                 if let Some(vp) = tab.video_player.as_mut() {
@@ -4928,11 +5017,23 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         Some(iced::widget::image::Handle::from_bytes(resp.bytes.clone()));
                     tab.response_bytes = resp.bytes.clone();
                     tab.response_filename = resp.filename.clone();
-                } else if resp.is_binary {
-                    // PDFs, octet-stream, audio, non-range video
+                } else if resp.is_binary && resp.content_type == "application/pdf" {
                     tab.video_player = None;
-                    tab.video_state = None;
                     tab.image_handle = None;
+                    match pdf_viewer::PdfViewer::from_bytes(resp.bytes.clone()) {
+                        Ok(viewer) => {
+                            tab.pdf_viewer = Some(viewer);
+                            tab.pdf_current_image = tab
+                                .pdf_viewer
+                                .as_mut()
+                                .and_then(|p| p.render_current_page().ok());
+                        }
+
+                        Err(e) => {
+                            eprintln!("PDF load error: {e:?}");
+                        }
+                    }
+
                     tab.response_bytes = resp.bytes.clone();
                     tab.response_filename = resp.filename.clone();
                 } else {

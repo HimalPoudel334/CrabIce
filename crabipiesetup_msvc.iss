@@ -10,6 +10,7 @@
 
 #define MyAppSourceDir "C:\Users\HP\Documents\Himal\Projects\rust\crabice\target\release"
 #define GST_MSVC_DIR   "C:\Program Files\gstreamer\1.0\msvc_x86_64"
+#define PDFIUM_DIR     "C:\Users\HP\Documents\Himal\Projects\rust\crabice\vendor\pdfium"
 
 [Setup]
 AppId={{B9E5F7A1-2C3D-4E5F-9A1B-7C8D9E0F1A2B}}
@@ -41,6 +42,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; ── Main application ───────────────────────────────────────────
 Source: "{#MyAppSourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "CrabiPie.ico";                      DestDir: "{app}"; Flags: ignoreversion
+
+; ── PDF rendering (pdfium) ──────────────────────────────────────
+Source: "{#PDFIUM_DIR}\pdfium.dll";          DestDir: "{app}"; Flags: ignoreversion
 
 ; ── Core GLib runtime ──────────────────────────────────────────
 Source: "{#GST_MSVC_DIR}\bin\glib-2.0-0.dll";       DestDir: "{app}"; Flags: ignoreversion

@@ -30,6 +30,8 @@ gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
 gstreamer-base = "0.23"
+pdfium-render = "0.9.3"
+lru = "0.18.2"
 
 [profile.release]
 strip = true
