@@ -1,7 +1,7 @@
 #![allow(unused)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use futures::channel::mpsc;
+use iced::futures::SinkExt;
 use reqwest_websocket::RequestBuilderExt;
 use std::sync::atomic::Ordering;
 
@@ -3457,14 +3457,23 @@ impl CrabiPie {
             body_column.into()
         } else {
             let content: Element<'_, Message> = if tab.is_streaming {
-                scrollable(
-                    text(tab.stream_buffer.as_str())
-                        .font(iced::Font::MONOSPACE)
-                        .size(13),
-                )
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into()
+                const LIVE_VIEW_CAP: usize = 64 * 1024; // ~64KB tail while streaming
+                let buf = tab.stream_buffer.as_str();
+                let visible: &str = if buf.len() > LIVE_VIEW_CAP {
+                    // find a char boundary so we don't panic slicing mid-UTF8-codepoint
+                    let start = buf.len() - LIVE_VIEW_CAP;
+                    let safe_start = (start..buf.len())
+                        .find(|&i| buf.is_char_boundary(i))
+                        .unwrap_or(buf.len());
+                    &buf[safe_start..]
+                } else {
+                    buf
+                };
+                scrollable(text(visible).font(iced::Font::MONOSPACE).size(13))
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+                    .id(format!("stream-scroll-{}", tab.id))
+                    .into()
             } else if tab.response_body.is_empty() {
                 space().into()
             } else {
@@ -3514,9 +3523,9 @@ impl CrabiPie {
             return iced::widget::text("Loading...").into();
         };
 
-        let content: Element<'_, Message> = if tab.response_headers.is_empty() {
+        let content: Element<'_, Message> = /*if tab.response_headers.is_empty() {
             space().into()
-        } else {
+        } else {*/
             text_editor(&self.response_headers_content)
                 .on_action(Message::ResponseHeadersAction)
                 .height(Length::FillPortion(1))
@@ -3539,8 +3548,8 @@ impl CrabiPie {
                     },
                 )
                 .style(|theme: &iced::Theme, status| Self::get_editor_style(theme, status))
-                .into()
-        };
+                .into();
+        //};
 
         content
     }
@@ -3825,6 +3834,12 @@ impl CrabiPie {
                     }
                 }
             }
+            HttpMethod::HEAD => client.head(&url),
+            HttpMethod::OPTIONS => client.request(reqwest::Method::OPTIONS, &url),
+            HttpMethod::QUERY => {
+                let query_verb = reqwest::Method::from_bytes(b"QUERY").unwrap();
+                client.request(query_verb, &url)
+            }
         };
 
         Some((builder.headers(header_map), url))
@@ -3837,6 +3852,8 @@ impl CrabiPie {
         let Some(tab) = self.current_tab() else {
             return iced::Task::none();
         };
+
+        let is_head = tab.method == HttpMethod::HEAD;
         let cancel_flag = tab.cancel_flag.clone();
         tab.cancel_flag.store(false, Ordering::Relaxed);
         if let Some(mut_tab) = self.current_tab_mut() {
@@ -3844,25 +3861,31 @@ impl CrabiPie {
             mut_tab.stream_buffer = String::new();
         }
 
-        iced::Task::run(
-            async_stream::stream! {
+        iced::Task::stream(iced::stream::channel(
+            100,
+            move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
                 let start_time = tokio::time::Instant::now();
                 let resp = match request.send().await {
-                    Ok(r)  => r,
+                    Ok(r) => r,
                     Err(e) => {
-                        let msg = if e.is_timeout() { "Request timed out".into() }
-                                  else { format!("Request failed: {e}") };
-                        yield Message::ResponseReceived(HttpResponse {
-                            status: "Error".to_string(),
-                            body: msg,
-                            response_time: Some(start_time.elapsed()),
-                            ..Default::default()
-                        });
+                        let msg = if e.is_timeout() {
+                            "Request timed out".into()
+                        } else {
+                            format!("Request failed: {e}")
+                        };
+                        let _ = output
+                            .send(Message::ResponseReceived(HttpResponse {
+                                status: "Error".to_string(),
+                                body: msg,
+                                response_time: Some(start_time.elapsed()),
+                                ..Default::default()
+                            }))
+                            .await;
                         return;
                     }
                 };
 
-                // ── emit status + headers immediately ───────────────────────────
+                // ── Emit status + headers immediately ───────────────────────────
                 let status = format!(
                     "{} {}",
                     resp.status().as_u16(),
@@ -3872,7 +3895,8 @@ impl CrabiPie {
                 let hm = resp.headers().clone();
 
                 // Cookies
-                let set_cookies: Vec<String> = hm.get_all("set-cookie")
+                let set_cookies: Vec<String> = hm
+                    .get_all("set-cookie")
                     .iter()
                     .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
                     .collect();
@@ -3880,103 +3904,210 @@ impl CrabiPie {
                 // Headers all
                 let headers_text = format!("{:#?}", hm);
 
-                // Content Type
-                let ct = hm.get("content-type")
+                // ── 1. Header Evaluation & Content Inspection ───────────────────
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
-                    .unwrap_or("").to_string();
+                    .unwrap_or("")
+                    .to_lowercase();
 
-                // Binary / video: fall back to old buffered path
-                let is_binary = ct.starts_with("image/")
-                    || ct.starts_with("application/pdf")
-                    || ct.starts_with("application/octet-stream")
-                    || ct.starts_with("video/")
-                    || ct.starts_with("audio/");
+                let is_chunked = resp
+                    .headers()
+                    .get(reqwest::header::TRANSFER_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    .map_or(false, |v| v.to_lowercase().contains("chunked"));
+
+                let content_length = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+
+                // Threshold for large responses (5 MB)
+                const LARGE_RESPONSE_THRESHOLD: u64 = 5 * 1024 * 1024;
+
+                let is_explicit_stream = content_type.contains("text/event-stream")
+                    || content_type.contains("application/x-ndjson")
+                    || content_type.contains("application/json-seq");
+
+                let is_large_body =
+                    content_length.map_or(false, |len| len > LARGE_RESPONSE_THRESHOLD);
+
+                let should_stream = is_explicit_stream || is_chunked || is_large_body;
+
+                // ── 2. Binary Handling Path ─────────────────────────────────────
+                let is_binary = content_type.starts_with("image/")
+                    || content_type.starts_with("application/pdf")
+                    || content_type.starts_with("application/octet-stream")
+                    || content_type.starts_with("video/")
+                    || content_type.starts_with("audio/");
 
                 if is_binary {
-                    let accepts_range = hm.get("accept-ranges").and_then(|h| h.to_str().ok()).is_some();
-                    let filename = hm.get("content-disposition")
+                    let accepts_range = hm
+                        .get("accept-ranges")
+                        .and_then(|h| h.to_str().ok())
+                        .is_some();
+                    let filename = hm
+                        .get("content-disposition")
                         .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.split("filename=").nth(1)
-                            .map(|f| f.trim_matches(|c| c == '"' || c == '\'').to_string()))
-                        .unwrap_or_else(|| _url.split('/').last().unwrap_or("download").to_string());
-
-                    if accepts_range && ct.starts_with("video/") {
-                        yield Message::ResponseReceived(HttpResponse {
-                            status, headers: headers_text, is_binary: true,
-                            filename, content_type: ct,
-                            response_time: Some(start_time.elapsed()),
-                            accepts_range: true, ..Default::default()
+                        .and_then(|s| {
+                            s.split("filename=")
+                                .nth(1)
+                                .map(|f| f.trim_matches(|c| c == '"' || c == '\'').to_string())
+                        })
+                        .unwrap_or_else(|| {
+                            _url.split('/').last().unwrap_or("download").to_string()
                         });
+
+                    if accepts_range && content_type.starts_with("video/") {
+                        let _ = output
+                            .send(Message::ResponseReceived(HttpResponse {
+                                status,
+                                headers: headers_text,
+                                is_binary: true,
+                                filename,
+                                content_type,
+                                response_time: Some(start_time.elapsed()),
+                                accepts_range: true,
+                                ..Default::default()
+                            }))
+                            .await;
                         return;
                     }
 
                     let (body, bytes) = match resp.bytes().await {
-                        Ok(b)  => (format!("Binary file ({} bytes)\n\nContent-Type: {}", b.len(), ct), b.to_vec()),
+                        Ok(b) => (
+                            format!(
+                                "Binary file ({} bytes)\n\nContent-Type: {}",
+                                b.len(),
+                                content_type
+                            ),
+                            b.to_vec(),
+                        ),
                         Err(e) => (format!("Error reading binary data: {e}"), vec![]),
                     };
-                    yield Message::ResponseReceived(HttpResponse {
-                        status, headers: headers_text, body, is_binary: true,
-                        filename, bytes, content_type: ct,
-                        response_time: Some(start_time.elapsed()),
-                        set_cookies,
-                        accepts_range,
-                    });
+
+                    let _ = output
+                        .send(Message::ResponseReceived(HttpResponse {
+                            status,
+                            headers: headers_text,
+                            body,
+                            is_binary: true,
+                            filename,
+                            bytes,
+                            content_type,
+                            response_time: Some(start_time.elapsed()),
+                            set_cookies,
+                            accepts_range,
+                            is_streaming: false,
+                        }))
+                        .await;
                     return;
                 }
 
-                // ── TEXT: stream chunks ─────────────────────────────────────────
-                // Emit a "headers ready" snapshot so the UI can show status immediately
-                yield Message::ResponseReceived(HttpResponse {
-                    status: status.clone(),
-                    headers: headers_text,
-                    body: String::new(),
-                    content_type: ct.clone(),
-                    response_time: Some(start_time.elapsed()),
-                    set_cookies,
-                    ..Default::default()
-                });
-
-            use futures_util::StreamExt;
-            let mut byte_stream = resp.bytes_stream();
-            let mut buf: Vec<u8> = Vec::new();
-
-            while let Some(chunk_result) = byte_stream.next().await {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    yield Message::StreamChunk("…[cancelled]".to_string());
-                    break;
+                // ── 3. Empty Responses (HEAD, 204, 304) ────────────────────────
+                let is_empty_status =
+                    resp.status().as_u16() == 204 || resp.status().as_u16() == 304;
+                if is_head || is_empty_status {
+                    let _ = output
+                        .send(Message::ResponseReceived(HttpResponse {
+                            status,
+                            headers: headers_text,
+                            body: String::new(),
+                            content_type,
+                            response_time: Some(start_time.elapsed()),
+                            set_cookies,
+                            ..Default::default()
+                        }))
+                        .await;
+                    let _ = output.send(Message::StreamDone).await;
+                    return;
                 }
-                match chunk_result {
-                    Ok(bytes) => {
-                        buf.extend_from_slice(bytes.as_ref());
-                        match std::str::from_utf8(buf.as_slice()) {
-                            Ok(s) => {
-                                yield Message::StreamChunk(s.to_string());
-                                buf.clear();
+
+                // ── 4. Text Handling: Buffered vs. Streamed ────────────────────
+                if !should_stream {
+                    // ── BUFFERED PATH (Fast, 1 UI update for normal JSON/HTML)
+                    let body = match resp.text().await {
+                        Ok(t) => t,
+                        Err(e) => format!("Error reading response body: {e}"),
+                    };
+
+                    let _ = output
+                        .send(Message::ResponseReceived(HttpResponse {
+                            status,
+                            headers: headers_text,
+                            body,
+                            content_type,
+                            response_time: Some(start_time.elapsed()),
+                            set_cookies,
+                            ..Default::default()
+                        }))
+                        .await;
+                    let _ = output.send(Message::StreamDone).await;
+                } else {
+                    // ── STREAMED PATH (Real-time chunks for SSE / chunked / >5MB)
+                    let _ = output
+                        .send(Message::ResponseReceived(HttpResponse {
+                            status,
+                            headers: headers_text,
+                            body: String::new(),
+                            is_streaming: true,
+                            content_type,
+                            response_time: Some(start_time.elapsed()),
+                            set_cookies,
+                            ..Default::default()
+                        }))
+                        .await;
+
+                    use futures_util::StreamExt;
+                    let mut byte_stream = resp.bytes_stream();
+                    let mut buf: Vec<u8> = Vec::new();
+
+                    while let Some(chunk_result) = byte_stream.next().await {
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            let _ = output
+                                .send(Message::StreamChunk("…[cancelled]".to_string()))
+                                .await;
+                            break;
+                        }
+                        match chunk_result {
+                            Ok(bytes) => {
+                                buf.extend_from_slice(bytes.as_ref());
+                                match std::str::from_utf8(buf.as_slice()) {
+                                    Ok(s) => {
+                                        let _ =
+                                            output.send(Message::StreamChunk(s.to_string())).await;
+                                        buf.clear();
+                                    }
+                                    Err(e) => {
+                                        let valid_up_to = e.valid_up_to();
+                                        if valid_up_to > 0 {
+                                            let s = unsafe {
+                                                std::str::from_utf8_unchecked(
+                                                    &buf.as_slice()[..valid_up_to],
+                                                )
+                                            }
+                                            .to_string();
+                                            buf = buf.as_slice()[valid_up_to..].to_vec();
+                                            let _ = output.send(Message::StreamChunk(s)).await;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
-                                let valid_up_to = e.valid_up_to();
-                                if valid_up_to > 0 {
-                                    let s = unsafe {
-                                        std::str::from_utf8_unchecked(&buf.as_slice()[..valid_up_to])
-                                    }.to_string();
-                                    let remaining = buf.as_slice()[valid_up_to..].to_vec();
-                                    buf = remaining;
-                                    yield Message::StreamChunk(s);
-                                }
+                                let _ = output
+                                    .send(Message::StreamChunk(format!("\n[stream error: {e}]")))
+                                    .await;
+                                break;
                             }
                         }
                     }
-                    Err(e) => {
-                        yield Message::StreamChunk(format!("\n[stream error: {e}]"));
-                        break;
-                    }
-                }
-            }
 
-            yield Message::StreamDone;
-                },
-            std::convert::identity, // stream already yields Message
-        )
+                    let _ = output.send(Message::StreamDone).await;
+                }
+            },
+        ))
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
@@ -4757,16 +4888,20 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 let Some(tab) = app.current_tab_mut() else {
                     return iced::Task::none();
                 };
-
                 tab.loading = false;
-                tab.is_streaming = true;
-                tab.active_response_tab = ResponseTab::Body;
+                tab.is_streaming = resp.is_streaming;
+
+                tab.active_response_tab = if resp.is_streaming || !resp.body.is_empty() {
+                    ResponseTab::Body
+                } else {
+                    ResponseTab::Headers
+                };
+
                 tab.is_response_binary = resp.is_binary;
                 tab.response_status = resp.status;
                 tab.response_content_type = resp.content_type.clone();
                 tab.response_time = resp.response_time;
                 tab.response_headers = std::sync::Arc::from(resp.headers.as_str());
-
                 let url = tab.url.clone();
 
                 if resp.is_binary && resp.content_type.starts_with("video/") && resp.accepts_range {
@@ -4794,25 +4929,32 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     tab.response_bytes = resp.bytes.clone();
                     tab.response_filename = resp.filename.clone();
                 } else if resp.is_binary {
-                    // PDFs, octet-stream, audio, non-range video — generic binary path
+                    // PDFs, octet-stream, audio, non-range video
                     tab.video_player = None;
                     tab.video_state = None;
                     tab.image_handle = None;
                     tab.response_bytes = resp.bytes.clone();
                     tab.response_filename = resp.filename.clone();
                 } else {
-                    // actual text response
+                    // Text / JSON / Empty (HEAD, OPTIONS) response init
                     tab.video_player = None;
                     tab.video_state = None;
-                    tab.response_headers = std::sync::Arc::from(resp.headers.as_str());
-                    tab.response_body = std::sync::Arc::from(resp.body.as_str());
-                    app.response_body_content = text_editor::Content::with_text(&resp.body);
+
+                    let body_text = if resp.is_streaming {
+                        // Chunks are coming via StreamChunk — don't paint a
+                        // placeholder that might stomp on data about to arrive.
+                        String::new()
+                    } else if resp.body.is_empty() {
+                        "No response body".to_string()
+                    } else {
+                        resp.body.clone()
+                    };
+                    tab.response_body = std::sync::Arc::from(body_text.as_str());
+                    app.response_body_content = text_editor::Content::with_text(&body_text);
                 }
                 url
             };
-
             app.response_headers_content = text_editor::Content::with_text(&resp.headers);
-
             if let Some(domain) = extract_domain(&url) {
                 for raw in &resp.set_cookies {
                     if let Some(cookie) = parse_set_cookie(raw) {
@@ -4825,7 +4967,6 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     }
                 }
             }
-
             iced::Task::none()
         }
         Message::ResponseBodyAction(action) => {
@@ -5489,33 +5630,21 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 return iced::Task::none();
             };
             tab.stream_buffer.push_str(&chunk);
-
-            iced::Task::none()
+            iced::widget::operation::snap_to(
+                format!("stream-scroll-{}", tab.id),
+                scrollable::RelativeOffset::END,
+            )
         }
         Message::StreamDone => {
-            let Some(tab) = app.current_tab_mut() else {
-                return iced::Task::none();
-            };
-
-            tab.is_streaming = false;
-            tab.loading = false;
-
-            let body = std::mem::take(&mut tab.stream_buffer);
-            tab.response_body = std::sync::Arc::from(body.as_str());
-
-            // Auto-prettify disabled for now.
-            // Uncomment this block if you decide to automatically format JSON responses.
-            /*
-            let display = if let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) {
-                serde_json::to_string_pretty(&j).unwrap_or_else(|_| body.clone())
-            } else {
-                body.clone()
-            };
-            */
-
-            // Show the response exactly as received.
-            app.response_body_content = text_editor::Content::with_text(&body);
-
+            if let Some(tab) = app.current_tab_mut() {
+                tab.is_streaming = false;
+                tab.loading = false;
+                if !tab.stream_buffer.is_empty() {
+                    let body = std::mem::take(&mut tab.stream_buffer);
+                    tab.response_body = std::sync::Arc::from(body.as_str());
+                    app.response_body_content = text_editor::Content::with_text(&body);
+                }
+            }
             iced::Task::none()
         }
         Message::WsConnect => {
@@ -5990,7 +6119,7 @@ fn websocket_stream(url: String) -> impl futures::Stream<Item = Message> {
                     // Try to connect
                     match CrabiPie::connect_ws(&url).await {
                         Ok(websocket) => {
-                            let (sender, receiver) = mpsc::channel(100);
+                            let (sender, receiver) = iced::futures::channel::mpsc::channel(100);
                             let connection = WsConnection(sender);
 
                             Some((
@@ -6084,7 +6213,7 @@ enum WebSocketState {
     Disconnected,
     Connected {
         websocket: reqwest_websocket::WebSocket,
-        receiver: mpsc::Receiver<String>,
+        receiver: iced::futures::channel::mpsc::Receiver<String>,
     },
     Failed,
 }
@@ -6119,15 +6248,21 @@ enum HttpMethod {
     PUT,
     DELETE,
     PATCH,
+    HEAD,
+    OPTIONS,
+    QUERY,
 }
 
 impl HttpMethod {
-    const ALL: [HttpMethod; 5] = [
+    const ALL: [HttpMethod; 8] = [
         HttpMethod::GET,
         HttpMethod::POST,
         HttpMethod::PUT,
         HttpMethod::DELETE,
         HttpMethod::PATCH,
+        HttpMethod::HEAD,
+        HttpMethod::OPTIONS,
+        HttpMethod::QUERY,
     ];
 }
 
@@ -6286,6 +6421,7 @@ struct HttpResponse {
     status: String,
     headers: String,
     accepts_range: bool,
+    is_streaming: bool,
     body: String,
     is_binary: bool,
     filename: String,
@@ -6417,7 +6553,7 @@ struct WsMessageDisplay {
 }
 
 #[derive(Debug, Clone)]
-pub struct WsConnection(mpsc::Sender<String>);
+pub struct WsConnection(iced::futures::channel::mpsc::Sender<String>);
 
 impl WsConnection {
     pub fn send(&mut self, message: String) {
@@ -7240,3 +7376,6 @@ const INTROSPECTION_QUERY: &str = r#"
 
 static VAR_RE: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new(r"\{\{(\w+)\}\}").unwrap());
+
+// Threshold for large responses (e.g., 5 MB)
+const LARGE_RESPONSE_THRESHOLD: u64 = 5 * 1024 * 1024;
