@@ -103,6 +103,17 @@ enum Message {
     EnvPanelOpen,
     EnvPanelClose,
 
+    // Auth auto-refresh (per-environment)
+    EnvAuthPanelToggle(usize),
+    EnvAuthModeChanged(usize, AuthRefreshMode),
+    EnvAuthAutoRefreshToggled(usize),
+    EnvAuthFieldChanged(usize, EnvAuthField, String),
+    EnvAuthTestLogin(usize),
+    EnvAuthTestLoginResult(usize, Result<Vec<FieldSuggestion>, String>),
+    EnvAuthApplySuggestion(usize, SuggestionKind, String),
+    TokenRefreshed(usize, Result<AuthRefreshOutcome, String>),
+    SendRequestRetry,
+
     // Global Cookie auth
     CookieJarOpen,
     CookieJarClose,
@@ -229,9 +240,21 @@ struct CrabiPie {
 
     // Global environment vars
     environments: Vec<Environment>,
+    // Default environment a newly-created tab inherits; each tab can then
+    // override its own selection independently (see TabState.active_environment_id).
     active_environment_id: Option<usize>,
     next_environment_id: usize,
     env_panel_open: bool,
+
+    // Auth auto-refresh: which environment's config sub-panel is expanded.
+    auth_config_open_env: Option<usize>,
+    // Cached "Test Login" results per environment, so suggestions stay on
+    // screen until the user applies one or re-tests.
+    auth_test_result: std::collections::HashMap<usize, Result<Vec<FieldSuggestion>, String>>,
+    auth_test_loading_env: Option<usize>,
+    // Tab id waiting to be resent once the in-flight TokenRefreshed
+    // completes (set by both the preventive and reactive-401 paths).
+    pending_resend_tab: Option<usize>,
 
     // Global cookie jar
     cookie_jar_open: bool,
@@ -351,10 +374,17 @@ struct TabState {
     copied: bool,
     ws_connection_id: usize,
     dirty: bool,
+
+    // Which environment this tab resolves {{vars}} against. Environments
+    // themselves are still global/shared; only the *selection* is per-tab.
+    active_environment_id: Option<usize>,
+    // Guards against retrying an auth-refresh-triggered resend more than
+    // once per manual send, so a still-401ing token can't loop forever.
+    auth_retry_used: bool,
 }
 
 impl TabState {
-    fn new(id: usize) -> Self {
+    fn new(id: usize, default_environment_id: Option<usize>) -> Self {
         Self {
             metadata: TabMetadata {
                 id,
@@ -426,6 +456,8 @@ impl TabState {
             graphql_selected_paths: std::collections::HashSet::new(),
             manually_selected_paths: std::collections::HashSet::new(),
             dirty: false,
+            active_environment_id: default_environment_id,
+            auth_retry_used: false,
         }
     }
 
@@ -504,6 +536,8 @@ impl TabState {
             dirty: false,
             pdf_viewer: None,
             pdf_current_image: None,
+            active_environment_id: saved.active_environment_id,
+            auth_retry_used: false,
         }
     }
 
@@ -552,6 +586,7 @@ impl TabState {
 
             active_request_tab: self.active_request_tab,
             active_response_tab: self.active_response_tab,
+            active_environment_id: self.active_environment_id,
         }
     }
 
@@ -650,7 +685,7 @@ impl TabState {
 impl CrabiPie {
     fn new() -> (Self, iced::Task<Message>) {
         let app = Self {
-            tabs: vec![TabLoadState::Loaded(Box::new(TabState::new(0)))],
+            tabs: vec![TabLoadState::Loaded(Box::new(TabState::new(0, None)))],
             active_tab: 0,
             next_tab_id: 1,
             json_theme: json_highlighter::JsonThemeWrapper::Custom(
@@ -694,6 +729,10 @@ impl CrabiPie {
             active_environment_id: None,
             next_environment_id: 1,
             env_panel_open: false,
+            auth_config_open_env: None,
+            auth_test_result: std::collections::HashMap::new(),
+            auth_test_loading_env: None,
+            pending_resend_tab: None,
         };
 
         let task = iced::Task::batch([
@@ -730,7 +769,10 @@ impl CrabiPie {
     }
 
     fn add_tab(&mut self) {
-        let new_tab = TabLoadState::Loaded(Box::new(TabState::new(self.next_tab_id)));
+        let new_tab = TabLoadState::Loaded(Box::new(TabState::new(
+            self.next_tab_id,
+            self.active_environment_id,
+        )));
         self.tabs.push(new_tab);
         self.active_tab = self.tabs.len() - 1;
         self.next_tab_id += 1;
@@ -2172,6 +2214,9 @@ struct SavedState {
 
     active_request_tab: RequestTab,
     active_response_tab: ResponseTab,
+
+    #[serde(default)]
+    active_environment_id: Option<usize>,
 }
 
 impl Default for SavedState {
@@ -2216,6 +2261,7 @@ impl Default for SavedState {
             manually_selected_paths: std::collections::HashSet::new(),
             active_request_tab: RequestTab::Query,
             active_response_tab: ResponseTab::Body,
+            active_environment_id: None,
         }
     }
 }
@@ -2332,6 +2378,8 @@ impl CrabiPie {
             .chain(self.environments.iter().map(|e| e.name.clone()))
             .collect();
 
+        // `active_environment()` already resolves against the *current tab's*
+        // selection, so this picker is naturally per-tab.
         let selected_env_name = self
             .active_environment()
             .map(|e| e.name.clone())
@@ -2941,6 +2989,170 @@ impl CrabiPie {
         column![type_selector, auth_form].spacing(10).into()
     }
 
+    fn render_env_auth_section(&self, env: &Environment) -> Element<'_, Message> {
+        let env_id = env.id;
+        let is_open = self.auth_config_open_env == Some(env_id);
+
+        let toggle_btn = button(text(if is_open {
+            "🔐 Auth Auto-Refresh ▾"
+        } else {
+            "🔐 Auth Auto-Refresh ▸"
+        }))
+        .style(button::text)
+        .on_press(Message::EnvAuthPanelToggle(env_id));
+
+        if !is_open {
+            return column![toggle_btn].into();
+        }
+
+        let default_cfg = AuthRefreshConfig::default();
+        let cfg = env.auth_config.as_ref().unwrap_or(&default_cfg);
+
+        let mode_picker = pick_list(&AuthRefreshMode::ALL[..], Some(cfg.mode), move |m| {
+            Message::EnvAuthModeChanged(env_id, m)
+        });
+        let enabled_toggle = row![
+            checkbox(cfg.auto_refresh_enabled)
+                .on_toggle(move |_| Message::EnvAuthAutoRefreshToggled(env_id)),
+            text("Enabled"),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // No explicit return-type annotation here: closures have restrictions
+        // on elided lifetimes in return position, so let inference resolve it
+        // from how the pushes into `fields_col: Vec<Element<'_, Message>>` are used.
+        let field_row = |label: &'static str, value: &str, field: EnvAuthField| {
+            let el: Element<'_, Message> = row![
+                text(label).width(Length::Fixed(150.0)),
+                text_input("", value)
+                    .on_input(move |v| Message::EnvAuthFieldChanged(env_id, field, v))
+                    .width(Length::Fill),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into();
+            el
+        };
+
+        let mut fields_col: Vec<Element<'_, Message>> = vec![field_row(
+            "Login endpoint",
+            &cfg.login_endpoint,
+            EnvAuthField::LoginEndpoint,
+        )];
+
+        if cfg.mode == AuthRefreshMode::RefreshToken {
+            fields_col.push(field_row(
+                "Refresh endpoint",
+                &cfg.refresh_endpoint,
+                EnvAuthField::RefreshEndpoint,
+            ));
+        }
+
+        fields_col.push(field_row(
+            "Login body (JSON)",
+            &cfg.login_body_template,
+            EnvAuthField::LoginBodyTemplate,
+        ));
+        fields_col.push(field_row(
+            "Access token var",
+            &cfg.access_token_var,
+            EnvAuthField::AccessTokenVar,
+        ));
+
+        if cfg.mode == AuthRefreshMode::RefreshToken {
+            fields_col.push(field_row(
+                "Refresh token var",
+                &cfg.refresh_token_var,
+                EnvAuthField::RefreshTokenVar,
+            ));
+            fields_col.push(field_row(
+                "Refresh body (JSON)",
+                &cfg.refresh_body_template,
+                EnvAuthField::RefreshBodyTemplate,
+            ));
+        }
+
+        fields_col.push(field_row(
+            "Access token path",
+            &cfg.access_token_path,
+            EnvAuthField::AccessTokenPath,
+        ));
+
+        if cfg.mode == AuthRefreshMode::RefreshToken {
+            fields_col.push(field_row(
+                "Refresh token path",
+                &cfg.refresh_token_path,
+                EnvAuthField::RefreshTokenPath,
+            ));
+        }
+
+        fields_col.push(field_row(
+            "Expiry path (optional)",
+            &cfg.expiry_path,
+            EnvAuthField::ExpiryPath,
+        ));
+        fields_col.push(field_row(
+            "Default TTL (secs)",
+            &cfg.default_ttl_secs.to_string(),
+            EnvAuthField::DefaultTtlSecs,
+        ));
+
+        let test_label = if self.auth_test_loading_env == Some(env_id) {
+            "Testing…"
+        } else {
+            "Test Login & Suggest Fields"
+        };
+        let test_btn = button(text(test_label)).on_press(Message::EnvAuthTestLogin(env_id));
+
+        let suggestions_view: Element<'_, Message> = match self.auth_test_result.get(&env_id) {
+            Some(Ok(suggestions)) => {
+                let rows: Vec<Element<'_, Message>> = suggestions
+                    .iter()
+                    .map(|s| {
+                        let path = s.path.clone();
+                        let kind = s.kind;
+                        let label = format!(
+                            "Use as {}: {} = {}",
+                            s.kind,
+                            s.path,
+                            truncate_str(&s.sample_value, 28)
+                        );
+                        button(text(label))
+                            .style(button::secondary)
+                            .on_press(Message::EnvAuthApplySuggestion(env_id, kind, path))
+                            .into()
+                    })
+                    .collect();
+                column![
+                    text("Found these candidate fields — click to use:"),
+                    Column::with_children(rows).spacing(4),
+                ]
+                .spacing(6)
+                .into()
+            }
+            Some(Err(e)) => text(format!("Test login failed: {e}")).into(),
+            None => Space::new().into(),
+        };
+
+        let error_view: Element<'_, Message> = match &env.auth_last_error {
+            Some(err) => text(format!("⚠ Last auto-refresh error: {err}")).into(),
+            None => Space::new().into(),
+        };
+
+        column![
+            toggle_btn,
+            row![mode_picker, enabled_toggle].spacing(16).align_y(Alignment::Center),
+            text("Auto-refresh writes the token(s) into the env vars named below. Reference them in the tab's Bearer Token field as e.g. {{access_token}}.").size(12),
+            Column::with_children(fields_col).spacing(6),
+            row![test_btn].spacing(8),
+            suggestions_view,
+            error_view,
+        ]
+        .spacing(10)
+        .into()
+    }
+
     fn render_env_panel(&self) -> Element<'_, Message> {
         if !self.env_panel_open {
             return Space::new().into();
@@ -2994,9 +3206,16 @@ impl CrabiPie {
                         })
                         .collect();
 
-                    column![header, Column::with_children(var_rows).spacing(6)]
-                        .spacing(8)
-                        .into()
+                    let auth_section = self.render_env_auth_section(env);
+
+                    column![
+                        header,
+                        Column::with_children(var_rows).spacing(6),
+                        rule::horizontal(1),
+                        auth_section,
+                    ]
+                    .spacing(8)
+                    .into()
                 })
                 .collect();
 
@@ -3762,10 +3981,15 @@ impl CrabiPie {
             .collect();
 
         // ── auth ──────────────────────────────
+        // Auth fields go through resolve_vars too, so e.g. a Bearer Token
+        // field of "{{access_token}}" picks up whatever the environment's
+        // auth auto-refresh (or a manual paste) last wrote into that var.
         match tab.auth_type {
             AuthType::Basic => {
-                if !tab.username.is_empty() || !tab.password.is_empty() {
-                    let credentials = format!("{}:{}", tab.username, tab.password);
+                let username = self.resolve_vars(&tab.username);
+                let password = self.resolve_vars(&tab.password);
+                if !username.is_empty() || !password.is_empty() {
+                    let credentials = format!("{}:{}", username, password);
                     let encoded = base64::Engine::encode(
                         &base64::engine::general_purpose::STANDARD,
                         credentials,
@@ -3778,28 +4002,30 @@ impl CrabiPie {
                 }
             }
             AuthType::Bearer => {
-                if !tab.bearer_token.is_empty() {
-                    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&format!(
-                        "Bearer {}",
-                        tab.bearer_token
-                    )) {
+                let bearer_token = self.resolve_vars(&tab.bearer_token);
+                if !bearer_token.is_empty() {
+                    if let Ok(hv) =
+                        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", bearer_token))
+                    {
                         header_map.insert(reqwest::header::AUTHORIZATION, hv);
                     }
                 }
             }
             AuthType::ApiKey => {
-                if !tab.api_key.is_empty() && !tab.api_key_name.is_empty() {
+                let api_key = self.resolve_vars(&tab.api_key);
+                let api_key_name = self.resolve_vars(&tab.api_key_name);
+                if !api_key.is_empty() && !api_key_name.is_empty() {
                     if tab.api_key_position == ApiKeyPosition::Header {
                         if let (Ok(hn), Ok(hv)) = (
-                            reqwest::header::HeaderName::try_from(&tab.api_key_name),
-                            reqwest::header::HeaderValue::from_str(&tab.api_key),
+                            reqwest::header::HeaderName::try_from(&api_key_name),
+                            reqwest::header::HeaderValue::from_str(&api_key),
                         ) {
                             header_map.insert(hn, hv);
                         }
                     } else if let Ok(mut parsed) = url::Url::parse(&url) {
                         parsed
                             .query_pairs_mut()
-                            .append_pair(&tab.api_key_name, &tab.api_key);
+                            .append_pair(&api_key_name, &api_key);
                         url = parsed.to_string();
                     }
                 }
@@ -3917,7 +4143,85 @@ impl CrabiPie {
         Some((builder.headers(header_map), url))
     }
 
+    /// Entry point for firing a request. Checks whether the active tab's
+    /// environment needs a preventive token refresh first; if so, kicks that
+    /// off and defers the actual send until it completes (see
+    /// `Message::TokenRefreshed`). Otherwise sends immediately.
     fn send_request(&mut self) -> iced::Task<Message> {
+        if let Some(task) = self.maybe_start_preventive_auth_refresh() {
+            return task;
+        }
+        self.send_request_now()
+    }
+
+    /// If the active tab's environment has auto-refresh enabled and the
+    /// stored access token is missing or known-expired, starts a refresh
+    /// and returns a task that will re-invoke the send once it completes.
+    /// Returns `None` when no refresh is needed (the common case).
+    fn maybe_start_preventive_auth_refresh(&mut self) -> Option<iced::Task<Message>> {
+        // Scoped so all immutable borrows of `self` end before we touch
+        // `self.pending_resend_tab` / build the task below.
+        let (tab_id, env_id, env_clone) = {
+            let tab = self.current_tab()?;
+            if tab.auth_type != AuthType::Bearer {
+                return None;
+            }
+            let tab_id = tab.id;
+            let env = self.environment_for_tab(tab)?;
+            let cfg = env.auth_config.as_ref()?;
+            if !cfg.auto_refresh_enabled || cfg.mode == AuthRefreshMode::None {
+                return None;
+            }
+            let has_token = env
+                .get_var(&cfg.access_token_var)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            // 30s buffer so we don't race a token that's about to expire mid-flight.
+            if has_token && !env.is_token_expired(30) {
+                return None;
+            }
+            (tab_id, env.id, env.clone())
+        };
+
+        self.pending_resend_tab = Some(tab_id);
+        let client = HTTP_CLIENT.clone();
+        Some(iced::Task::perform(
+            async move { perform_auth_refresh(&client, &env_clone).await },
+            move |result| Message::TokenRefreshed(env_id, result),
+        ))
+    }
+
+    /// Called when a response comes back 401 while auto-refresh is
+    /// available and this send hasn't already been retried once. Kicks off
+    /// a refresh + one automatic resend, same as the preventive path but
+    /// triggered reactively instead of by a stale expiry.
+    fn maybe_retry_after_auth_failure(&mut self) -> Option<iced::Task<Message>> {
+        let (tab_id, env_id, env_clone) = {
+            let tab = self.current_tab()?;
+            if tab.auth_type != AuthType::Bearer || tab.auth_retry_used {
+                return None;
+            }
+            let tab_id = tab.id;
+            let env = self.environment_for_tab(tab)?;
+            let cfg = env.auth_config.as_ref()?;
+            if !cfg.auto_refresh_enabled || cfg.mode == AuthRefreshMode::None {
+                return None;
+            }
+            (tab_id, env.id, env.clone())
+        };
+
+        if let Some(tab_mut) = self.current_tab_mut() {
+            tab_mut.auth_retry_used = true;
+        }
+        self.pending_resend_tab = Some(tab_id);
+        let client = HTTP_CLIENT.clone();
+        Some(iced::Task::perform(
+            async move { perform_auth_refresh(&client, &env_clone).await },
+            move |result| Message::TokenRefreshed(env_id, result),
+        ))
+    }
+
+    fn send_request_now(&mut self) -> iced::Task<Message> {
         let Some((request, _url)) = self.build_request() else {
             return iced::Task::none();
         };
@@ -4217,9 +4521,17 @@ impl CrabiPie {
         iced::event::listen().map(Message::EventOccurred)
     }
 
+    /// The environment definition backing the *currently active tab's*
+    /// selection. Environment definitions are shared/global; only which one
+    /// a tab has selected is per-tab.
     fn active_environment(&self) -> Option<&Environment> {
-        self.active_environment_id
-            .and_then(|id| self.environments.iter().find(|e| e.id == id))
+        let env_id = self.current_tab()?.active_environment_id?;
+        self.environments.iter().find(|e| e.id == env_id)
+    }
+
+    fn environment_for_tab(&self, tab: &TabState) -> Option<&Environment> {
+        let env_id = tab.active_environment_id?;
+        self.environments.iter().find(|e| e.id == env_id)
     }
 
     fn resolve_vars(&self, input: &str) -> String {
@@ -4308,8 +4620,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
         Message::AddNewTab => {
             let new_id = app.next_tab_id;
             app.next_tab_id += 1;
-            app.tabs
-                .push(TabLoadState::Loaded(Box::new(TabState::new(new_id))));
+            app.tabs.push(TabLoadState::Loaded(Box::new(TabState::new(
+                new_id,
+                app.active_environment_id,
+            ))));
             app.active_tab = app.tabs.len() - 1;
             iced::Task::none()
         }
@@ -4425,11 +4739,71 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             let Some(tab) = app.current_tab_mut() else {
                 return iced::Task::none();
             };
+            // A fresh, user-initiated send always gets its own chance at an
+            // auth-refresh retry, independent of any earlier send on this tab.
+            tab.auth_retry_used = false;
             if !tab.loading && !tab.url.trim().is_empty() {
                 tab.loading = true;
                 app.send_request()
             } else {
                 iced::Task::none()
+            }
+        }
+        // Internal resend issued after an auth-refresh completes. Deliberately
+        // does NOT reset `auth_retry_used` — otherwise a token that's still
+        // bad after refreshing (e.g. wrong creds) would retry forever.
+        Message::SendRequestRetry => {
+            let Some(tab) = app.current_tab_mut() else {
+                return iced::Task::none();
+            };
+            tab.loading = true;
+            app.send_request_now()
+        }
+        Message::TokenRefreshed(env_id, result) => {
+            app.auth_test_loading_env = None;
+            match result {
+                Ok(outcome) => {
+                    if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                        if let Some(cfg) = env.auth_config.clone() {
+                            env.set_var(&cfg.access_token_var, outcome.access_token.clone());
+                            if let (Some(rt), false) =
+                                (&outcome.refresh_token, cfg.refresh_token_var.is_empty())
+                            {
+                                env.set_var(&cfg.refresh_token_var, rt.clone());
+                            }
+                        }
+                        env.token_expires_at = outcome.expires_at;
+                        env.auth_last_error = None;
+                    }
+
+                    let save = app.save_task();
+                    if let Some(tab_id) = app.pending_resend_tab.take() {
+                        if app.tabs.iter().any(|t| t.id() == tab_id) {
+                            return iced::Task::batch([
+                                save,
+                                iced::Task::done(Message::SendRequestRetry),
+                            ]);
+                        }
+                    }
+                    save
+                }
+                Err(err) => {
+                    if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                        env.auth_last_error = Some(err.clone());
+                    }
+                    app.pending_resend_tab = None;
+                    if let Some(tab) = app.current_tab_mut() {
+                        tab.loading = false;
+                        tab.response_status = "Auth Refresh Failed".to_string();
+                        tab.response_body = std::sync::Arc::from(
+                            format!(
+                                "Token auto-refresh failed: {err}\n\nCheck the environment's Auth Auto-Refresh settings (Environments panel), or paste a token manually and try again."
+                            )
+                            .as_str(),
+                        );
+                    }
+                    app.save_task()
+                }
             }
         }
         Message::BodyAction(action) => {
@@ -4826,7 +5200,123 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             app.save_task()
         }
         Message::EnvironmentSelected(id) => {
+            // Selection is per-tab; we also remember it as the default a
+            // brand-new tab will start with.
             app.active_environment_id = id;
+            if let Some(tab) = app.current_tab_mut() {
+                tab.active_environment_id = id;
+            }
+            app.save_task()
+        }
+        Message::EnvAuthPanelToggle(env_id) => {
+            app.auth_config_open_env = if app.auth_config_open_env == Some(env_id) {
+                None
+            } else {
+                Some(env_id)
+            };
+            iced::Task::none()
+        }
+        Message::EnvAuthModeChanged(env_id, mode) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                let cfg = env
+                    .auth_config
+                    .get_or_insert_with(AuthRefreshConfig::default);
+                cfg.mode = mode;
+            }
+            app.save_task()
+        }
+        Message::EnvAuthAutoRefreshToggled(env_id) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                let cfg = env
+                    .auth_config
+                    .get_or_insert_with(AuthRefreshConfig::default);
+                cfg.auto_refresh_enabled = !cfg.auto_refresh_enabled;
+            }
+            app.save_task()
+        }
+        Message::EnvAuthFieldChanged(env_id, field, value) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                let cfg = env
+                    .auth_config
+                    .get_or_insert_with(AuthRefreshConfig::default);
+                match field {
+                    EnvAuthField::LoginEndpoint => cfg.login_endpoint = value,
+                    EnvAuthField::RefreshEndpoint => cfg.refresh_endpoint = value,
+                    EnvAuthField::LoginBodyTemplate => cfg.login_body_template = value,
+                    EnvAuthField::RefreshBodyTemplate => cfg.refresh_body_template = value,
+                    EnvAuthField::AccessTokenVar => cfg.access_token_var = value,
+                    EnvAuthField::RefreshTokenVar => cfg.refresh_token_var = value,
+                    EnvAuthField::AccessTokenPath => cfg.access_token_path = value,
+                    EnvAuthField::RefreshTokenPath => cfg.refresh_token_path = value,
+                    EnvAuthField::ExpiryPath => cfg.expiry_path = value,
+                    EnvAuthField::DefaultTtlSecs => {
+                        cfg.default_ttl_secs = value.trim().parse::<i64>().unwrap_or(0);
+                    }
+                }
+            }
+            app.save_task()
+        }
+        Message::EnvAuthTestLogin(env_id) => {
+            let Some(env) = app.environments.iter().find(|e| e.id == env_id) else {
+                return iced::Task::none();
+            };
+            if env.auth_config.is_none() {
+                return iced::Task::none();
+            }
+            app.auth_test_loading_env = Some(env_id);
+            app.auth_test_result.remove(&env_id);
+            let client = HTTP_CLIENT.clone();
+            let env_clone = env.clone();
+            iced::Task::perform(
+                async move {
+                    let cfg = env_clone.auth_config.as_ref().unwrap();
+                    let endpoint = cfg.login_endpoint.clone();
+                    if endpoint.trim().is_empty() {
+                        return Err("No login endpoint set".to_string());
+                    }
+                    let body = build_body_from_template(&env_clone, &cfg.login_body_template)?;
+                    let resp = client
+                        .post(env_clone.resolve_own_vars(&endpoint))
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(|e| format!("Request failed: {e}"))?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        return Err(format!("Login endpoint returned {status}"));
+                    }
+                    let json: serde_json::Value = resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("Response wasn't valid JSON: {e}"))?;
+                    let suggestions = suggest_token_fields(&json);
+                    if suggestions.is_empty() {
+                        Err("No token-shaped fields found in the response".to_string())
+                    } else {
+                        Ok(suggestions)
+                    }
+                },
+                move |result| Message::EnvAuthTestLoginResult(env_id, result),
+            )
+        }
+        Message::EnvAuthTestLoginResult(env_id, result) => {
+            app.auth_test_loading_env = None;
+            app.auth_test_result.insert(env_id, result);
+            iced::Task::none()
+        }
+        Message::EnvAuthApplySuggestion(env_id, kind, path) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                let cfg = env
+                    .auth_config
+                    .get_or_insert_with(AuthRefreshConfig::default);
+                match kind {
+                    SuggestionKind::AccessToken | SuggestionKind::LooksLikeJwt => {
+                        cfg.access_token_path = path;
+                    }
+                    SuggestionKind::RefreshToken => cfg.refresh_token_path = path,
+                    SuggestionKind::Expiry => cfg.expiry_path = path,
+                }
+            }
             app.save_task()
         }
         Message::EnvironmentRenamed(id, name) => {
@@ -4973,6 +5463,14 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
         Message::ResponseReceived(resp) => {
+            // Auth auto-refresh backstop: a 401 with auto-refresh configured
+            // and not yet retried triggers one refresh + resend instead of
+            // surfacing the failure straight away.
+            if resp.status.starts_with("401") {
+                if let Some(retry_task) = app.maybe_retry_after_auth_failure() {
+                    return retry_task;
+                }
+            }
             let url = {
                 let Some(tab) = app.current_tab_mut() else {
                     return iced::Task::none();
@@ -5900,8 +6398,10 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
 
             // no saved tabs — create a fresh one
             if app.tabs.is_empty() {
-                app.tabs
-                    .push(TabLoadState::Loaded(Box::new(TabState::new(0))));
+                app.tabs.push(TabLoadState::Loaded(Box::new(TabState::new(
+                    0,
+                    app.active_environment_id,
+                ))));
                 app.next_tab_id = 1;
                 app.active_tab = 0;
                 return iced::Task::none();
@@ -6517,6 +7017,456 @@ impl ApiKeyPosition {
     const ALL: [ApiKeyPosition; 2] = [ApiKeyPosition::Header, ApiKeyPosition::QueryParams];
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Auth auto-refresh (login/refresh-token automation)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// How an environment renews its access token automatically.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum AuthRefreshMode {
+    /// No auto-refresh configured; bearer/basic fields behave exactly as before.
+    #[default]
+    None,
+    /// No dedicated refresh endpoint exists — "refreshing" means calling the
+    /// login endpoint again with the stored username/password.
+    ReLogin,
+    /// A proper OAuth2-style flow: login returns an access token *and* a
+    /// refresh token; renewal calls a separate refresh endpoint with the
+    /// refresh token instead of resending the password.
+    RefreshToken,
+}
+
+impl std::fmt::Display for AuthRefreshMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthRefreshMode::None => write!(f, "Off"),
+            AuthRefreshMode::ReLogin => write!(f, "Re-login (username/password)"),
+            AuthRefreshMode::RefreshToken => write!(f, "Refresh token"),
+        }
+    }
+}
+
+impl AuthRefreshMode {
+    const ALL: [AuthRefreshMode; 3] = [
+        AuthRefreshMode::None,
+        AuthRefreshMode::ReLogin,
+        AuthRefreshMode::RefreshToken,
+    ];
+}
+
+/// Where in the login/refresh response body a value should be read from,
+/// expressed as a dotted/bracketed JSON path, e.g. "data.tokens[0].access_token".
+type FieldPath = String;
+
+/// Per-environment configuration for automatic bearer-token renewal. Stored
+/// on `Environment` because credentials and endpoints are environment-scoped
+/// (dev/staging/prod each have their own login endpoint and creds).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct AuthRefreshConfig {
+    mode: AuthRefreshMode,
+    auto_refresh_enabled: bool,
+
+    /// Endpoint used for the initial login (both modes) and for ReLogin renewal.
+    login_endpoint: String,
+    /// Endpoint used to renew via refresh token (RefreshToken mode only). If
+    /// empty, falls back to `login_endpoint`.
+    refresh_endpoint: String,
+
+    /// Env var names the resolved tokens get written into. Reference these
+    /// with `{{access_token_var}}` in the tab's Bearer Token field.
+    access_token_var: String,
+    refresh_token_var: String,
+
+    /// Raw JSON request bodies, sent through the same {{var}} substitution
+    /// used everywhere else (URL, headers). This is what actually makes the
+    /// request shape generalize: instead of a fixed set of named fields
+    /// (which breaks the moment an API wants an extra field, a different
+    /// key name, or both tokens sent back together), the user just writes
+    /// the exact JSON their endpoint expects and references whichever env
+    /// vars they want by name.
+    /// Used for the initial login (and ReLogin-mode renewal).
+    login_body_template: String,
+    /// Used for RefreshToken-mode renewal when a refresh token is already
+    /// stored. Falls back to `login_body_template` when none is stored yet.
+    refresh_body_template: String,
+
+    /// JSON paths into the login/refresh response body.
+    access_token_path: FieldPath,
+    refresh_token_path: FieldPath,
+    /// Optional path to a seconds-until-expiry field (e.g. "expires_in").
+    /// Leave empty to fall back to `default_ttl_secs`.
+    expiry_path: FieldPath,
+    /// Used when the API doesn't report an expiry at all.
+    default_ttl_secs: i64,
+}
+
+impl Default for AuthRefreshConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthRefreshMode::None,
+            auto_refresh_enabled: false,
+            login_endpoint: String::new(),
+            refresh_endpoint: String::new(),
+            access_token_var: "access_token".to_string(),
+            refresh_token_var: "refresh_token".to_string(),
+            login_body_template: r#"{"username": "{{username}}", "password": "{{password}}"}"#
+                .to_string(),
+            refresh_body_template: r#"{"refresh_token": "{{refresh_token}}"}"#.to_string(),
+            access_token_path: String::new(),
+            refresh_token_path: String::new(),
+            expiry_path: String::new(),
+            default_ttl_secs: 3600,
+        }
+    }
+}
+
+/// Which field of `AuthRefreshConfig` a `Message::EnvAuthFieldChanged` edits.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum EnvAuthField {
+    LoginEndpoint,
+    RefreshEndpoint,
+    LoginBodyTemplate,
+    RefreshBodyTemplate,
+    AccessTokenVar,
+    RefreshTokenVar,
+    AccessTokenPath,
+    RefreshTokenPath,
+    ExpiryPath,
+    DefaultTtlSecs,
+}
+
+/// Result of a successful login/refresh call, ready to be written into the
+/// owning environment's variables.
+#[derive(Debug, Clone)]
+struct AuthRefreshOutcome {
+    access_token: String,
+    refresh_token: Option<String>,
+    /// Unix millis when the access token should be considered stale.
+    expires_at: Option<i64>,
+}
+
+/// A candidate field found while auto-scanning a login response, offered to
+/// the user as a one-click "use this as X" suggestion during setup.
+#[derive(Debug, Clone, PartialEq)]
+struct FieldSuggestion {
+    path: String,
+    kind: SuggestionKind,
+    sample_value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuggestionKind {
+    AccessToken,
+    RefreshToken,
+    Expiry,
+    LooksLikeJwt,
+}
+
+impl std::fmt::Display for SuggestionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SuggestionKind::AccessToken => write!(f, "access token"),
+            SuggestionKind::RefreshToken => write!(f, "refresh token"),
+            SuggestionKind::Expiry => write!(f, "expiry"),
+            SuggestionKind::LooksLikeJwt => write!(f, "looks like a JWT"),
+        }
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// Resolves a dotted/bracketed path (e.g. "data.tokens[0].access_token")
+/// against a `serde_json::Value`. Returns `None` if any segment is missing
+/// or is the wrong shape (e.g. indexing into an object).
+fn resolve_json_path(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    enum Seg {
+        Key(String),
+        Index(usize),
+    }
+    fn split_path(path: &str) -> Vec<Seg> {
+        let mut segments = Vec::new();
+        for dot_part in path.split('.') {
+            if dot_part.is_empty() {
+                continue;
+            }
+            let mut rest = dot_part;
+            if let Some(bracket_pos) = rest.find('[') {
+                let key = &rest[..bracket_pos];
+                if !key.is_empty() {
+                    segments.push(Seg::Key(key.to_string()));
+                }
+                rest = &rest[bracket_pos..];
+                while let Some(close) = rest.find(']') {
+                    if let Ok(idx) = rest[1..close].parse::<usize>() {
+                        segments.push(Seg::Index(idx));
+                    }
+                    rest = &rest[close + 1..];
+                    if !rest.starts_with('[') {
+                        break;
+                    }
+                }
+            } else {
+                segments.push(Seg::Key(rest.to_string()));
+            }
+        }
+        segments
+    }
+
+    let mut current = root;
+    for seg in split_path(path) {
+        current = match seg {
+            Seg::Key(k) => current.get(&k)?,
+            Seg::Index(i) => current.get(i)?,
+        };
+    }
+    Some(current.clone())
+}
+
+/// Recursively scans a login/refresh response and flags fields that look
+/// like an access token, refresh token, or expiry, purely by key-name and
+/// shape heuristics. Used only to speed up initial setup (`Test Login`
+/// button) — the resolved path the user confirms is what actually gets
+/// stored and used at runtime, never these heuristics themselves.
+fn suggest_token_fields(root: &serde_json::Value) -> Vec<FieldSuggestion> {
+    fn looks_like_jwt(s: &str) -> bool {
+        let parts: Vec<&str> = s.split('.').collect();
+        parts.len() == 3
+            && parts.iter().all(|p| {
+                !p.is_empty()
+                    && p.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+    }
+
+    fn classify(key: &str, value: &serde_json::Value, path: &str, out: &mut Vec<FieldSuggestion>) {
+        let lk = key.to_lowercase();
+        let is_str = value.is_string();
+        const ACCESS: &[&str] = &[
+            "token",
+            "access_token",
+            "accesstoken",
+            "jwt",
+            "authtoken",
+            "bearer",
+        ];
+        const REFRESH: &[&str] = &["refresh_token", "refreshtoken"];
+        const EXPIRY: &[&str] = &[
+            "expires_in",
+            "expiresin",
+            "expiry",
+            "expires_at",
+            "expiresat",
+            "exp",
+            "ttl",
+        ];
+
+        if is_str && REFRESH.contains(&lk.as_str()) {
+            out.push(FieldSuggestion {
+                path: path.to_string(),
+                kind: SuggestionKind::RefreshToken,
+                sample_value: value.as_str().unwrap_or_default().to_string(),
+            });
+        } else if is_str && ACCESS.contains(&lk.as_str()) {
+            out.push(FieldSuggestion {
+                path: path.to_string(),
+                kind: SuggestionKind::AccessToken,
+                sample_value: value.as_str().unwrap_or_default().to_string(),
+            });
+        } else if (value.is_number() || is_str) && EXPIRY.contains(&lk.as_str()) {
+            out.push(FieldSuggestion {
+                path: path.to_string(),
+                kind: SuggestionKind::Expiry,
+                sample_value: value.to_string(),
+            });
+        } else if is_str && looks_like_jwt(value.as_str().unwrap_or_default()) {
+            out.push(FieldSuggestion {
+                path: path.to_string(),
+                kind: SuggestionKind::LooksLikeJwt,
+                sample_value: value.as_str().unwrap_or_default().to_string(),
+            });
+        }
+    }
+
+    fn walk(value: &serde_json::Value, path: String, out: &mut Vec<FieldSuggestion>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let child = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    classify(k, v, &child, out);
+                    walk(v, child, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for (i, v) in arr.iter().enumerate() {
+                    walk(v, format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, String::new(), &mut out);
+    out
+}
+
+/// Calls the configured login (or refresh) endpoint and extracts the
+/// access/refresh tokens and expiry from the JSON response.
+///
+/// - `ReLogin`: always POSTs `{username, password}` to `login_endpoint`.
+/// - `RefreshToken`: POSTs `{refresh_token}` to `refresh_endpoint` if a
+///   refresh token is already stored, otherwise falls back to a full
+///   username/password login (first run, or the refresh token itself died).
+/// Resolves {{var}} substitution against the environment, then parses the
+/// result as JSON. This is what makes the request body shape general: the
+/// user writes exactly the JSON their endpoint expects, referencing
+/// whichever env vars they want by name — no fixed set of named fields to
+/// outgrow.
+fn build_body_from_template(
+    env: &Environment,
+    template: &str,
+) -> Result<serde_json::Value, String> {
+    if template.trim().is_empty() {
+        return Err("Request body template is empty".to_string());
+    }
+    let resolved = env.resolve_own_vars(template);
+    serde_json::from_str(&resolved).map_err(|e| {
+        format!(
+            "Request body template isn't valid JSON after substituting variables: {e}\n\nResolved to: {resolved}"
+        )
+    })
+}
+
+async fn perform_auth_refresh(
+    client: &reqwest::Client,
+    env: &Environment,
+) -> Result<AuthRefreshOutcome, String> {
+    let cfg = env
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| "Auto-refresh is not configured for this environment".to_string())?;
+
+    if cfg.mode == AuthRefreshMode::None {
+        return Err("Auto-refresh is turned off for this environment".to_string());
+    }
+
+    let get_var = |name: &str| -> String {
+        if name.is_empty() {
+            return String::new();
+        }
+        env.get_var(name).unwrap_or_default()
+    };
+
+    let (endpoint, body) = match cfg.mode {
+        AuthRefreshMode::None => unreachable!(),
+        AuthRefreshMode::ReLogin => {
+            if cfg.login_endpoint.trim().is_empty() {
+                return Err("No login endpoint configured".to_string());
+            }
+            (
+                cfg.login_endpoint.clone(),
+                build_body_from_template(env, &cfg.login_body_template)?,
+            )
+        }
+        AuthRefreshMode::RefreshToken => {
+            let refresh_token = get_var(&cfg.refresh_token_var);
+            if refresh_token.is_empty() {
+                // No refresh token yet (first run, or it expired/was revoked) —
+                // fall back to a full login instead of failing outright.
+                if cfg.login_endpoint.trim().is_empty() {
+                    return Err(
+                        "No refresh token stored yet and no login endpoint configured".to_string(),
+                    );
+                }
+                (
+                    cfg.login_endpoint.clone(),
+                    build_body_from_template(env, &cfg.login_body_template)?,
+                )
+            } else {
+                let endpoint = if cfg.refresh_endpoint.trim().is_empty() {
+                    cfg.login_endpoint.clone()
+                } else {
+                    cfg.refresh_endpoint.clone()
+                };
+                if endpoint.trim().is_empty() {
+                    return Err("No refresh endpoint configured".to_string());
+                }
+                (
+                    endpoint,
+                    build_body_from_template(env, &cfg.refresh_body_template)?,
+                )
+            }
+        }
+    };
+
+    let resp = client
+        .post(env.resolve_own_vars(&endpoint))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Auth refresh request failed: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Auth refresh endpoint returned {status}"));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Auth refresh response wasn't valid JSON: {e}"))?;
+
+    let access_token = resolve_json_path(&json, &cfg.access_token_path)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .ok_or_else(|| {
+            format!(
+                "Couldn't find an access token at path '{}' in the response",
+                cfg.access_token_path
+            )
+        })?;
+
+    let refresh_token =
+        if cfg.mode == AuthRefreshMode::RefreshToken && !cfg.refresh_token_path.is_empty() {
+            resolve_json_path(&json, &cfg.refresh_token_path)
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        } else {
+            None
+        };
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let expires_at = if !cfg.expiry_path.is_empty() {
+        resolve_json_path(&json, &cfg.expiry_path)
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            })
+            .map(|secs_from_now| now_ms + secs_from_now * 1000)
+    } else if cfg.default_ttl_secs > 0 {
+        Some(now_ms + cfg.default_ttl_secs * 1000)
+    } else {
+        None
+    };
+
+    Ok(AuthRefreshOutcome {
+        access_token,
+        refresh_token,
+        expires_at,
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 struct HttpResponse {
     status: String,
@@ -6813,6 +7763,19 @@ struct Environment {
     id: usize,
     name: String,
     variables: Vec<EnvVar>,
+
+    #[serde(default)]
+    auth_config: Option<AuthRefreshConfig>,
+    /// Unix millis when the current access token should be considered
+    /// stale. `None` means "unknown" (e.g. API gave no expiry and no
+    /// default TTL was set) — treated as "not expired" until a 401 proves
+    /// otherwise.
+    #[serde(default)]
+    token_expires_at: Option<i64>,
+    /// Last auto-refresh error, surfaced in the environment panel so a
+    /// dead refresh token or changed password doesn't fail silently.
+    #[serde(default, skip_serializing)]
+    auth_last_error: Option<String>,
 }
 
 impl Environment {
@@ -6821,7 +7784,66 @@ impl Environment {
             id,
             name: name.into(),
             variables: vec![EnvVar::new()],
+            auth_config: None,
+            token_expires_at: None,
+            auth_last_error: None,
         }
+    }
+
+    fn get_var(&self, key: &str) -> Option<String> {
+        self.variables
+            .iter()
+            .find(|v| v.enabled && v.key == key)
+            .map(|v| v.value.clone())
+    }
+
+    /// Writes a value into a named variable, creating it (enabled) if it
+    /// doesn't exist yet. Used by the auth-refresh flow to write back the
+    /// resolved access/refresh tokens.
+    fn set_var(&mut self, key: &str, value: String) {
+        if key.is_empty() {
+            return;
+        }
+        if let Some(existing) = self.variables.iter_mut().find(|v| v.key == key) {
+            existing.value = value;
+            existing.enabled = true;
+        } else {
+            self.variables.push(EnvVar {
+                key: key.to_string(),
+                value,
+                enabled: true,
+            });
+        }
+    }
+
+    /// True if the stored token is known to have expired (or is about to,
+    /// within `buffer_secs`). An unknown expiry is treated as not-expired —
+    /// the reactive 401 retry is the backstop for that case.
+    fn is_token_expired(&self, buffer_secs: i64) -> bool {
+        match self.token_expires_at {
+            Some(expires_at) => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                now_ms + buffer_secs * 1000 >= expires_at
+            }
+            None => false,
+        }
+    }
+
+    /// Substitutes {{var}} against this environment's own variables. Used
+    /// for the auth-refresh login/refresh endpoint fields specifically,
+    /// since e.g. `{{b}}/auth/login` should reuse the same base-url var as
+    /// the rest of the environment rather than needing the full URL typed
+    /// out a second time.
+    fn resolve_own_vars(&self, input: &str) -> String {
+        if !input.contains("{{") {
+            return input.to_string();
+        }
+        VAR_RE
+            .replace_all(input, |caps: &regex::Captures| {
+                self.get_var(&caps[1])
+                    .unwrap_or_else(|| caps[0].to_string())
+            })
+            .to_string()
     }
 }
 
