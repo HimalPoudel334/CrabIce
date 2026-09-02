@@ -3187,6 +3187,7 @@ impl CrabiPie {
                         .iter()
                         .enumerate()
                         .map(|(idx, var)| {
+                            let is_password = var.key.to_ascii_lowercase().contains("password");
                             row![
                                 checkbox(var.enabled)
                                     .on_toggle(move |_| Message::EnvVarToggled(env_id, idx)),
@@ -3195,6 +3196,7 @@ impl CrabiPie {
                                     .width(Length::FillPortion(2)),
                                 text_input("value", &var.value)
                                     .on_input(move |v| Message::EnvVarValueChanged(env_id, idx, v))
+                                    .secure(is_password)
                                     .width(Length::FillPortion(3)),
                                 button(text("❌").shaping(text::Shaping::Advanced))
                                     .style(button::subtle)
@@ -3211,8 +3213,8 @@ impl CrabiPie {
                     column![
                         header,
                         Column::with_children(var_rows).spacing(6),
-                        rule::horizontal(1),
                         auth_section,
+                        rule::horizontal(1),
                     ]
                     .spacing(8)
                     .into()
@@ -4300,17 +4302,14 @@ impl CrabiPie {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok());
 
-                // Threshold for large responses (5 MB)
-                const LARGE_RESPONSE_THRESHOLD: u64 = 5 * 1024 * 1024;
-
                 let is_explicit_stream = content_type.contains("text/event-stream")
                     || content_type.contains("application/x-ndjson")
                     || content_type.contains("application/json-seq");
 
-                let is_large_body =
-                    content_length.map_or(false, |len| len > LARGE_RESPONSE_THRESHOLD);
+                // let is_large_body =
+                //     content_length.map_or(false, |len| len > LARGE_RESPONSE_THRESHOLD);
 
-                let should_stream = is_explicit_stream || is_chunked || is_large_body;
+                let should_stream = is_explicit_stream || is_chunked;
 
                 // ── 2. Binary Handling Path ─────────────────────────────────────
                 let is_binary = content_type.starts_with("image/")
