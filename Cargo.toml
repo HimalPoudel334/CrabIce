@@ -24,6 +24,8 @@ futures-util = "0.3.32"
 flate2 = "1.1.9"
 regex = "1.13.1"
 base64 = "0.23.0"
+uuid = { version = "1.18.1", features = ["v4"] }
+rand = "0.8.5"
 
 # Add GStreamer crates
 gstreamer = "0.23"
