@@ -108,6 +108,8 @@ enum Message {
     EnvAuthModeChanged(usize, AuthRefreshMode),
     EnvAuthAutoRefreshToggled(usize),
     EnvAuthFieldChanged(usize, EnvAuthField, String),
+    EnvAuthMethodChanged(usize, AuthRequestKind, AuthHttpMethod),
+    EnvAuthBodyFormatChanged(usize, AuthRequestKind, AuthBodyFormat),
     EnvAuthTestLogin(usize),
     EnvAuthTestLoginResult(usize, Result<Vec<FieldSuggestion>, String>),
     EnvAuthApplySuggestion(usize, SuggestionKind, String),
@@ -3035,6 +3037,23 @@ impl CrabiPie {
             el
         };
 
+        // Method + body-format pickers for the login / refresh request.
+        let style_row = |kind: AuthRequestKind, method: AuthHttpMethod, format: AuthBodyFormat| {
+            let el: Element<'_, Message> = row![
+                text("Request").width(Length::Fixed(150.0)),
+                pick_list(&AuthHttpMethod::ALL[..], Some(method), move |m| {
+                    Message::EnvAuthMethodChanged(env_id, kind, m)
+                }),
+                pick_list(&AuthBodyFormat::ALL[..], Some(format), move |f| {
+                    Message::EnvAuthBodyFormatChanged(env_id, kind, f)
+                }),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into();
+            el
+        };
+
         let mut fields_col: Vec<Element<'_, Message>> = vec![field_row(
             "Login endpoint",
             &cfg.login_endpoint,
@@ -3049,8 +3068,16 @@ impl CrabiPie {
             ));
         }
 
+        fields_col.push(style_row(
+            AuthRequestKind::Login,
+            cfg.login_method,
+            cfg.login_body_format,
+        ));
         fields_col.push(field_row(
-            "Login body (JSON)",
+            match cfg.login_body_format {
+                AuthBodyFormat::Json => "Login body (JSON)",
+                AuthBodyFormat::FormUrlEncoded => "Login body (form)",
+            },
             &cfg.login_body_template,
             EnvAuthField::LoginBodyTemplate,
         ));
@@ -3066,8 +3093,16 @@ impl CrabiPie {
                 &cfg.refresh_token_var,
                 EnvAuthField::RefreshTokenVar,
             ));
+            fields_col.push(style_row(
+                AuthRequestKind::Refresh,
+                cfg.refresh_method,
+                cfg.refresh_body_format,
+            ));
             fields_col.push(field_row(
-                "Refresh body (JSON)",
+                match cfg.refresh_body_format {
+                    AuthBodyFormat::Json => "Refresh body (JSON)",
+                    AuthBodyFormat::FormUrlEncoded => "Refresh body (form)",
+                },
                 &cfg.refresh_body_template,
                 EnvAuthField::RefreshBodyTemplate,
             ));
@@ -5228,6 +5263,36 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
             }
             app.save_task()
         }
+        Message::EnvAuthMethodChanged(env_id, kind, method) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                let cfg = env
+                    .auth_config
+                    .get_or_insert_with(AuthRefreshConfig::default);
+                match kind {
+                    AuthRequestKind::Login => cfg.login_method = method,
+                    AuthRequestKind::Refresh => cfg.refresh_method = method,
+                }
+            }
+            app.save_task()
+        }
+        Message::EnvAuthBodyFormatChanged(env_id, kind, format) => {
+            if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
+                let cfg = env
+                    .auth_config
+                    .get_or_insert_with(AuthRefreshConfig::default);
+                // Swap in the matching default template only if the user
+                // hasn't customised the current one.
+                let (tpl, fmt) = match kind {
+                    AuthRequestKind::Login => (&mut cfg.login_body_template, &mut cfg.login_body_format),
+                    AuthRequestKind::Refresh => (&mut cfg.refresh_body_template, &mut cfg.refresh_body_format),
+                };
+                if tpl.as_str() == default_auth_template(kind, *fmt) {
+                    *tpl = default_auth_template(kind, format).to_string();
+                }
+                *fmt = format;
+            }
+            app.save_task()
+        }
         Message::EnvAuthAutoRefreshToggled(env_id) => {
             if let Some(env) = app.environments.iter_mut().find(|e| e.id == env_id) {
                 let cfg = env
@@ -5277,11 +5342,15 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                     if endpoint.trim().is_empty() {
                         return Err("No login endpoint set".to_string());
                     }
-                    let body = build_body_from_template(&env_clone, &cfg.login_body_template)?;
-                    let resp = client
-                        .post(env_clone.resolve_own_vars(&endpoint))
-                        .json(&body)
-                        .send()
+                    let resp = build_auth_request(
+                        &client,
+                        &env_clone,
+                        &endpoint,
+                        cfg.login_method,
+                        cfg.login_body_format,
+                        &cfg.login_body_template,
+                    )?
+                    .send()
                         .await
                         .map_err(|e| format!("Request failed: {e}"))?;
                     let status = resp.status();
@@ -7057,6 +7126,91 @@ impl AuthRefreshMode {
     ];
 }
 
+/// HTTP method used for the login / refresh request.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum AuthHttpMethod {
+    #[default]
+    Post,
+    Put,
+    Patch,
+    /// Only valid with form-urlencoded; fields are sent as the query string.
+    Get,
+}
+
+impl AuthHttpMethod {
+    const ALL: [AuthHttpMethod; 4] = [
+        AuthHttpMethod::Post,
+        AuthHttpMethod::Put,
+        AuthHttpMethod::Patch,
+        AuthHttpMethod::Get,
+    ];
+
+    fn to_reqwest(self) -> reqwest::Method {
+        match self {
+            AuthHttpMethod::Post => reqwest::Method::POST,
+            AuthHttpMethod::Put => reqwest::Method::PUT,
+            AuthHttpMethod::Patch => reqwest::Method::PATCH,
+            AuthHttpMethod::Get => reqwest::Method::GET,
+        }
+    }
+}
+
+impl std::fmt::Display for AuthHttpMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthHttpMethod::Post => write!(f, "POST"),
+            AuthHttpMethod::Put => write!(f, "PUT"),
+            AuthHttpMethod::Patch => write!(f, "PATCH"),
+            AuthHttpMethod::Get => write!(f, "GET"),
+        }
+    }
+}
+
+/// Body encoding for the login / refresh request.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum AuthBodyFormat {
+    #[default]
+    Json,
+    FormUrlEncoded,
+}
+
+impl AuthBodyFormat {
+    const ALL: [AuthBodyFormat; 2] = [AuthBodyFormat::Json, AuthBodyFormat::FormUrlEncoded];
+}
+
+impl std::fmt::Display for AuthBodyFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthBodyFormat::Json => write!(f, "JSON"),
+            AuthBodyFormat::FormUrlEncoded => write!(f, "x-www-form-urlencoded"),
+        }
+    }
+}
+
+/// Which of the two auth requests a message/helper refers to.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum AuthRequestKind {
+    Login,
+    Refresh,
+}
+
+fn default_auth_template(kind: AuthRequestKind, format: AuthBodyFormat) -> &'static str {
+    match (kind, format) {
+        (AuthRequestKind::Login, AuthBodyFormat::Json) => {
+            r#"{"username": "{{username}}", "password": "{{password}}"}"#
+        }
+        (AuthRequestKind::Login, AuthBodyFormat::FormUrlEncoded) => {
+            "grant_type=password&username={{username}}&password={{password}}"
+        }
+        (AuthRequestKind::Refresh, AuthBodyFormat::Json) => {
+            r#"{"refresh_token": "{{refresh_token}}"}"#
+        }
+        (AuthRequestKind::Refresh, AuthBodyFormat::FormUrlEncoded) => {
+            "grant_type=refresh_token&refresh_token={{refresh_token}}"
+        }
+    }
+}
+
 /// Where in the login/refresh response body a value should be read from,
 /// expressed as a dotted/bracketed JSON path, e.g. "data.tokens[0].access_token".
 type FieldPath = String;
@@ -7093,6 +7247,18 @@ struct AuthRefreshConfig {
     /// stored. Falls back to `login_body_template` when none is stored yet.
     refresh_body_template: String,
 
+    /// HTTP method + body encoding for the login / refresh requests. OAuth2
+    /// token endpoints want `application/x-www-form-urlencoded`, not JSON.
+    /// `#[serde(default)]` keeps previously saved environments loading (POST + JSON).
+    #[serde(default)]
+    login_method: AuthHttpMethod,
+    #[serde(default)]
+    login_body_format: AuthBodyFormat,
+    #[serde(default)]
+    refresh_method: AuthHttpMethod,
+    #[serde(default)]
+    refresh_body_format: AuthBodyFormat,
+
     /// JSON paths into the login/refresh response body.
     access_token_path: FieldPath,
     refresh_token_path: FieldPath,
@@ -7115,6 +7281,10 @@ impl Default for AuthRefreshConfig {
             login_body_template: r#"{"username": "{{username}}", "password": "{{password}}"}"#
                 .to_string(),
             refresh_body_template: r#"{"refresh_token": "{{refresh_token}}"}"#.to_string(),
+            login_method: AuthHttpMethod::default(),
+            login_body_format: AuthBodyFormat::default(),
+            refresh_method: AuthHttpMethod::default(),
+            refresh_body_format: AuthBodyFormat::default(),
             access_token_path: String::new(),
             refresh_token_path: String::new(),
             expiry_path: String::new(),
@@ -7329,8 +7499,8 @@ fn suggest_token_fields(root: &serde_json::Value) -> Vec<FieldSuggestion> {
 /// Calls the configured login (or refresh) endpoint and extracts the
 /// access/refresh tokens and expiry from the JSON response.
 ///
-/// - `ReLogin`: always POSTs `{username, password}` to `login_endpoint`.
-/// - `RefreshToken`: POSTs `{refresh_token}` to `refresh_endpoint` if a
+/// - `ReLogin`: sends the login request (method/body format from config) to `login_endpoint`.
+/// - `RefreshToken`: sends the refresh request to `refresh_endpoint` if a
 ///   refresh token is already stored, otherwise falls back to a full
 ///   username/password login (first run, or the refresh token itself died).
 /// Resolves {{var}} substitution against the environment, then parses the
@@ -7353,6 +7523,61 @@ fn build_body_from_template(
     })
 }
 
+/// Parses a form template (`k=v&k2=v2`, or one pair per line) into pairs, then
+/// resolves `{{var}}` in each key/value *separately*. Substituting first and
+/// splitting afterwards would break on values containing `&` or `=`; reqwest
+/// percent-encodes the pairs when sending.
+fn build_form_pairs(env: &Environment, template: &str) -> Result<Vec<(String, String)>, String> {
+    let mut pairs = Vec::new();
+    for raw in template.split(|c| c == '&' || c == '\n') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (k, v) = raw.split_once('=').unwrap_or((raw, ""));
+        pairs.push((
+            env.resolve_own_vars(k.trim()),
+            env.resolve_own_vars(v.trim()),
+        ));
+    }
+    if pairs.is_empty() {
+        Err("Request body template is empty".to_string())
+    } else {
+        Ok(pairs)
+    }
+}
+
+/// Builds the login/refresh request with the configured method and body encoding.
+fn build_auth_request(
+    client: &reqwest::Client,
+    env: &Environment,
+    endpoint: &str,
+    method: AuthHttpMethod,
+    format: AuthBodyFormat,
+    template: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    let rb = client.request(method.to_reqwest(), env.resolve_own_vars(endpoint));
+    match format {
+        AuthBodyFormat::Json => {
+            if method == AuthHttpMethod::Get {
+                return Err(
+                    "GET can't carry a JSON body; use form-urlencoded (sent as query string) or POST"
+                        .to_string(),
+                );
+            }
+            Ok(rb.json(&build_body_from_template(env, template)?))
+        }
+        AuthBodyFormat::FormUrlEncoded => {
+            let pairs = build_form_pairs(env, template)?;
+            Ok(if method == AuthHttpMethod::Get {
+                rb.query(&pairs)
+            } else {
+                rb.form(&pairs)
+            })
+        }
+    }
+}
+
 async fn perform_auth_refresh(
     client: &reqwest::Client,
     env: &Environment,
@@ -7373,7 +7598,7 @@ async fn perform_auth_refresh(
         env.get_var(name).unwrap_or_default()
     };
 
-    let (endpoint, body) = match cfg.mode {
+    let (endpoint, method, format, template) = match cfg.mode {
         AuthRefreshMode::None => unreachable!(),
         AuthRefreshMode::ReLogin => {
             if cfg.login_endpoint.trim().is_empty() {
@@ -7381,7 +7606,9 @@ async fn perform_auth_refresh(
             }
             (
                 cfg.login_endpoint.clone(),
-                build_body_from_template(env, &cfg.login_body_template)?,
+                cfg.login_method,
+                cfg.login_body_format,
+                cfg.login_body_template.clone(),
             )
         }
         AuthRefreshMode::RefreshToken => {
@@ -7396,7 +7623,9 @@ async fn perform_auth_refresh(
                 }
                 (
                     cfg.login_endpoint.clone(),
-                    build_body_from_template(env, &cfg.login_body_template)?,
+                    cfg.login_method,
+                    cfg.login_body_format,
+                    cfg.login_body_template.clone(),
                 )
             } else {
                 let endpoint = if cfg.refresh_endpoint.trim().is_empty() {
@@ -7409,15 +7638,15 @@ async fn perform_auth_refresh(
                 }
                 (
                     endpoint,
-                    build_body_from_template(env, &cfg.refresh_body_template)?,
+                    cfg.refresh_method,
+                    cfg.refresh_body_format,
+                    cfg.refresh_body_template.clone(),
                 )
             }
         }
     };
 
-    let resp = client
-        .post(env.resolve_own_vars(&endpoint))
-        .json(&body)
+    let resp = build_auth_request(client, env, &endpoint, method, format, &template)?
         .send()
         .await
         .map_err(|e| format!("Auth refresh request failed: {e}"))?;
