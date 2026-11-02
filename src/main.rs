@@ -29,6 +29,7 @@ enum Message {
     AddNewTab,
     TabSelected(usize),
     CloseTab(usize),
+    TabDuplicate(usize),
     TabBodyLoaded {
         id: usize,
         saved: Option<SavedState>,
@@ -2316,8 +2317,10 @@ impl CrabiPie {
 
         for (index, tab) in self.tabs.iter().enumerate() {
             let is_active = index == self.active_tab;
+            let tab_title = tab.metadata().title.clone();
 
-            let button_or_space: Element<'_, Message> = if self.tabs.len() > 1 {
+            // Build the tab label (title + close button, as before)
+            let close_btn: Element<'_, Message> = if self.tabs.len() > 1 {
                 button(text("❌").size(8).shaping(text::Shaping::Advanced))
                     .style(button::text)
                     .on_press(Message::CloseTab(index))
@@ -2325,9 +2328,9 @@ impl CrabiPie {
             } else {
                 space::horizontal().width(Length::Shrink).into()
             };
-            let tab_title = tab.metadata().title.clone();
+
             let tab_button = button(
-                row![text(tab_title), button_or_space]
+                row![text(tab_title), close_btn]
                     .spacing(5)
                     .align_y(Alignment::Center),
             )
@@ -2336,6 +2339,34 @@ impl CrabiPie {
                 button::primary
             } else {
                 button::secondary
+            });
+
+            // Right-click context menu
+            let tab_button = iced_aw::ContextMenu::new(tab_button, move || {
+                let menu = column![
+                    button(row![text("⧉").size(12), text(" Duplicate").size(13)].spacing(4))
+                        .style(button::text)
+                        .width(Length::Fill)
+                        .on_press(Message::TabDuplicate(index)),
+                    button(row![text("❌").size(12), text(" Close").size(13)].spacing(4))
+                        .style(button::text)
+                        .width(Length::Fill)
+                        .on_press(Message::CloseTab(index)),
+                ]
+                .padding(4);
+
+                container(menu)
+                    .style(|theme: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(theme.palette().background)),
+                        border: Border {
+                            width: 1.0,
+                            color: theme.extended_palette().background.weak.color,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .width(Length::Fixed(160.0))
+                    .into()
             });
 
             tab_bar = tab_bar.push(tab_button);
@@ -4736,6 +4767,88 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 }
             }
             iced::Task::none()
+        }
+        Message::TabDuplicate(index) => {
+            // 1. Flush current editors into the active tab IF we're duplicating it.
+            //    Do this FIRST, before borrowing tabs, so the borrow checker is happy
+            //    and the snapshot below sees the up-to-date body.
+            if index == app.active_tab {
+                let req_body = app.request_body_content.text();
+                let raw_form = app.raw_form_content.text();
+                let gql_query = app.graphql_query_content.text();
+                let gql_vars = app.graphql_variables_content.text();
+                if let Some(t) = app.current_tab_mut() {
+                    t.request_body = std::sync::Arc::from(req_body.as_str());
+                    t.raw_form_content = std::sync::Arc::from(raw_form.as_str());
+                    t.graphql_query = std::sync::Arc::from(gql_query.as_str());
+                    t.graphql_variables = std::sync::Arc::from(gql_vars.as_str());
+                }
+            }
+
+            // 2. Snapshot source tab: either its SavedState (Loaded) or its metadata.
+            //    The scoped block ensures `slot` is dropped before we mutate app.tabs.
+            let (saved, meta) = {
+                let Some(slot) = app.tabs.get(index) else {
+                    return iced::Task::none();
+                };
+                let saved = match slot {
+                    TabLoadState::Loaded(t) => {
+                        Some(t.to_saved(&app.json_theme.to_string(), &app.app_theme.to_string()))
+                    }
+                    _ => None,
+                };
+                let meta = slot.metadata().clone();
+                (saved, meta)
+            }; // <-- slot borrow ends here
+
+            // 3. Create the new tab.
+            let new_id = app.next_tab_id;
+            app.next_tab_id += 1;
+
+            let new_tab = match saved {
+                Some(mut s) => {
+                    s.id = new_id;
+                    s.title = format!("{} (copy)", s.title);
+                    TabLoadState::Loaded(Box::new(TabState::from_saved(s)))
+                }
+                None => {
+                    let mut fresh = TabState::new(new_id, app.active_environment_id);
+                    fresh.title = format!("{} (copy)", meta.title);
+                    fresh.metadata.title = fresh.title.clone();
+                    fresh.url = meta.url.clone();
+                    fresh.method = meta.method.clone();
+                    fresh.request_type = meta.request_type.clone();
+                    fresh.metadata.url = meta.url.clone();
+                    fresh.metadata.method = meta.method.clone();
+                    fresh.metadata.request_type = meta.request_type.clone();
+                    TabLoadState::Loaded(Box::new(fresh))
+                }
+            };
+
+            // 4. Insert after source, activate it.
+            app.tabs.insert(index + 1, new_tab);
+            app.active_tab = index + 1;
+
+            // 5. Reload shared editors from the new active tab.
+            if let Some(tab) = app.current_tab() {
+                let req_body = tab.request_body.clone();
+                let raw_headers = tab.raw_headers_content.clone();
+                let raw_form = tab.raw_form_content.clone();
+                let gql_query = tab.graphql_query.clone();
+                let gql_vars = tab.graphql_variables.clone();
+                let res_body = tab.response_body.clone();
+                let res_headers = tab.response_headers.clone();
+
+                app.request_body_content = text_editor::Content::with_text(&req_body);
+                app.raw_headers_content = text_editor::Content::with_text(&raw_headers);
+                app.raw_form_content = text_editor::Content::with_text(&raw_form);
+                app.graphql_query_content = text_editor::Content::with_text(&gql_query);
+                app.graphql_variables_content = text_editor::Content::with_text(&gql_vars);
+                app.response_body_content = text_editor::Content::with_text(&res_body);
+                app.response_headers_content = text_editor::Content::with_text(&res_headers);
+            }
+
+            app.save_task()
         }
         Message::RequestTypeSelected(req_type) => {
             let Some(tab) = app.current_tab_mut() else {
