@@ -5283,8 +5283,12 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 // Swap in the matching default template only if the user
                 // hasn't customised the current one.
                 let (tpl, fmt) = match kind {
-                    AuthRequestKind::Login => (&mut cfg.login_body_template, &mut cfg.login_body_format),
-                    AuthRequestKind::Refresh => (&mut cfg.refresh_body_template, &mut cfg.refresh_body_format),
+                    AuthRequestKind::Login => {
+                        (&mut cfg.login_body_template, &mut cfg.login_body_format)
+                    }
+                    AuthRequestKind::Refresh => {
+                        (&mut cfg.refresh_body_template, &mut cfg.refresh_body_format)
+                    }
                 };
                 if tpl.as_str() == default_auth_template(kind, *fmt) {
                     *tpl = default_auth_template(kind, format).to_string();
@@ -5351,8 +5355,8 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                         &cfg.login_body_template,
                     )?
                     .send()
-                        .await
-                        .map_err(|e| format!("Request failed: {e}"))?;
+                    .await
+                    .map_err(|e| format!("Request failed: {e}"))?;
                     let status = resp.status();
                     if !status.is_success() {
                         return Err(format!("Login endpoint returned {status}"));
@@ -6128,6 +6132,19 @@ fn update(app: &mut CrabiPie, message: Message) -> iced::Task<Message> {
                 };
                 match key_event {
                     KeyEvent::KeyPressed { key, modifiers, .. } if modifiers.control() => {
+                        if matches!(key, Key::Named(iced::keyboard::key::Named::Tab)) {
+                            if app.save_modal_open || app.env_panel_open || app.cookie_jar_open {
+                                return iced::Task::none();
+                            }
+                            let n = app.tabs.len();
+                            if n > 1 {
+                                let delta: isize = if modifiers.shift() { -1 } else { 1 };
+                                let next = (app.active_tab as isize + delta).rem_euclid(n as isize)
+                                    as usize;
+                                return iced::Task::done(Message::TabSelected(next));
+                            }
+                            return iced::Task::none();
+                        }
                         if let Key::Character(c) = &key {
                             if c.as_str() == "l" {
                                 return iced::widget::operation::focus(tab.url_id.clone()).chain(
