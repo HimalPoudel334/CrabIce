@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crabipie-core"]
+
 [package]
 name = "CrabiPie"
 version = "0.1.0"
