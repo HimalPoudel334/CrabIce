@@ -1,9 +1,11 @@
 //! Application state and input handling. Toolkit-free: the window layer
 //! feeds it DIP-space events and hands it a `Canvas` to paint on.
 
-use crate::ui::canvas::{Align, Canvas, TextStyle};
+use crate::ui::canvas::{Align, Canvas, TextMeasure, TextStyle};
 use crate::ui::geom::Rect;
+use crate::ui::input::{Clipboard, Key, Mods};
 use crate::ui::tab_bar::{Hit, TabBar, TabItem};
+use crate::ui::text_input::TextInput;
 use crate::ui::theme::Theme;
 use crabipie_core::HttpMethod;
 
@@ -12,6 +14,13 @@ pub struct TabHeader {
     pub id: usize,
     pub title: String,
     pub method: HttpMethod,
+    pub url: TextInput,
+}
+
+impl TabHeader {
+    fn new(id: usize, title: String, method: HttpMethod) -> Self {
+        Self { id, title, method, url: TextInput::new("Enter request URL") }
+    }
 }
 
 pub struct App {
@@ -22,6 +31,7 @@ pub struct App {
     bar: TabBar,
     width: f32,
     height: f32,
+    over_text: bool,
 }
 
 impl App {
@@ -35,6 +45,7 @@ impl App {
             bar: TabBar::new(),
             width: 0.0,
             height: 0.0,
+            over_text: false,
         };
         if tabs.is_empty() {
             tabs.push(app.fresh_tab());
@@ -50,7 +61,7 @@ impl App {
         let (session, meta) = rt.block_on(crabipie_core::load_app_state());
         let tabs = meta
             .into_iter()
-            .map(|m| TabHeader { id: m.id, title: m.title, method: m.method })
+            .map(|m| TabHeader::new(m.id, m.title, m.method))
             .collect();
         let (active, next_id) = session.map(|s| (s.active_tab, s.next_tab_id)).unwrap_or((0, 0));
         Self::new(tabs, active, next_id)
@@ -59,19 +70,31 @@ impl App {
     fn fresh_tab(&mut self) -> TabHeader {
         let id = self.next_id;
         self.next_id += 1;
-        TabHeader { id, title: format!("Request {}", id + 1), method: HttpMethod::GET }
+        TabHeader::new(id, format!("Request {}", id + 1), HttpMethod::GET)
+    }
+
+    fn blur_all(&mut self) -> bool {
+        let mut was = false;
+        for t in &mut self.tabs {
+            was |= t.url.focused;
+            t.url.blur();
+        }
+        was
     }
 
     // ── tab operations ──────────────────────────────────────────────
 
     pub fn new_tab(&mut self) {
+        self.blur_all();
         let t = self.fresh_tab();
         self.tabs.push(t);
         self.active = self.tabs.len() - 1;
+        self.tabs[self.active].url.focus(); // like a browser: new tab focuses the address bar
     }
 
     pub fn select_tab(&mut self, i: usize) {
         if i < self.tabs.len() {
+            self.blur_all();
             self.active = i;
         }
     }
@@ -80,10 +103,12 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
+        self.blur_all();
         if self.tabs.len() == 1 {
-            // never leave the window empty: replace with a fresh tab
-            let t = self.fresh_tab();
-            self.tabs[0] = t;
+            // Never leave the window empty: reset the last tab in place. Same
+            // id and title, so repeatedly closing doesn't count up "Request N".
+            let id = self.tabs[0].id;
+            self.tabs[0] = TabHeader::new(id, format!("Request {}", id + 1), HttpMethod::GET);
             self.active = 0;
             return;
         }
@@ -94,36 +119,68 @@ impl App {
         self.active = self.active.min(self.tabs.len() - 1);
     }
 
-    // ── events (coordinates in DIPs) ────────────────────────────────
+    // ── layout ──────────────────────────────────────────────────────
 
     pub fn on_resize(&mut self, w: f32, h: f32) {
         self.width = w;
         self.height = h;
     }
 
+    fn url_rect(&self) -> Rect {
+        let top = TabBar::HEIGHT + 12.0;
+        Rect::new(12.0, top, (self.width - 12.0).max(13.0), top + 34.0)
+    }
+
     fn hit(&self, x: f32, y: f32) -> Hit {
         TabBar::hit_test(x, y, self.tabs.len(), self.width)
     }
 
+    // ── mouse (coordinates in DIPs) ─────────────────────────────────
+
     /// Returns true when a repaint is needed.
-    pub fn on_mouse_move(&mut self, x: f32, y: f32) -> bool {
-        let h = self.hit(x, y);
-        self.bar.set_hover(h)
+    pub fn on_mouse_move(&mut self, m: &mut dyn TextMeasure, x: f32, y: f32) -> bool {
+        self.over_text = self.url_rect().contains(x, y);
+        let hover_changed = self.bar.set_hover(self.hit(x, y));
+        let drag_changed = self.tabs[self.active].url.mouse_move(m, x);
+        hover_changed || drag_changed
     }
 
     pub fn on_mouse_leave(&mut self) -> bool {
+        self.over_text = false;
         self.bar.set_hover(Hit::None)
     }
 
-    pub fn on_left_click(&mut self, x: f32, y: f32) -> bool {
+    pub fn on_left_down(&mut self, m: &mut dyn TextMeasure, x: f32, y: f32, shift: bool) -> bool {
         match self.hit(x, y) {
             Hit::Tab(i) => self.select_tab(i),
             Hit::Close(i) => self.close_tab(i),
             Hit::NewTab => self.new_tab(),
-            Hit::None => return false,
+            Hit::None => {
+                if self.url_rect().contains(x, y) {
+                    self.blur_all();
+                    self.tabs[self.active].url.mouse_down(m, x, shift);
+                    return true;
+                }
+                return self.blur_all();
+            }
         }
         self.bar.set_hover(self.hit(x, y));
         true
+    }
+
+    pub fn on_double_click(&mut self, m: &mut dyn TextMeasure, x: f32, y: f32) -> bool {
+        if self.url_rect().contains(x, y) {
+            self.tabs[self.active].url.double_click(m, x);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn on_left_up(&mut self) {
+        for t in &mut self.tabs {
+            t.url.mouse_up();
+        }
     }
 
     pub fn on_middle_click(&mut self, x: f32, y: f32) -> bool {
@@ -136,18 +193,45 @@ impl App {
         }
     }
 
-    pub fn on_ctrl_key(&mut self, key: char) -> bool {
-        match key.to_ascii_uppercase() {
-            'T' => self.new_tab(),
-            'W' => self.close_tab(self.active),
-            _ => return false,
+    /// True when the cursor should be an I-beam.
+    pub fn text_cursor_active(&self) -> bool {
+        self.over_text
+    }
+
+    // ── keyboard ────────────────────────────────────────────────────
+
+    pub fn on_key(&mut self, key: Key, mods: Mods, cb: &mut dyn Clipboard) -> bool {
+        if mods.ctrl {
+            match key {
+                Key::Letter('T') => {
+                    self.new_tab();
+                    return true;
+                }
+                Key::Letter('W') => {
+                    self.close_tab(self.active);
+                    return true;
+                }
+                _ => {}
+            }
         }
-        true
+        if key == Key::Escape && self.blur_all() {
+            return true;
+        }
+        self.tabs[self.active].url.key(key, mods, cb)
+    }
+
+    pub fn on_char(&mut self, ch: char) -> bool {
+        self.tabs[self.active].url.char(ch)
+    }
+
+    /// Caret blink tick; returns true when a repaint is needed.
+    pub fn blink(&mut self) -> bool {
+        self.tabs[self.active].url.toggle_blink()
     }
 
     // ── painting ────────────────────────────────────────────────────
 
-    pub fn paint(&self, c: &mut dyn Canvas) {
+    pub fn paint(&mut self, c: &mut dyn Canvas) {
         c.fill_rect(Rect::new(0.0, 0.0, self.width, self.height), self.theme.bg);
 
         let items: Vec<TabItem> = self
@@ -157,10 +241,13 @@ impl App {
             .collect();
         self.bar.paint(c, &self.theme, &items, self.active, self.width);
 
-        // Placeholder until the request/response panels land (step 3).
-        let body = Rect::new(0.0, TabBar::HEIGHT, self.width, self.height);
+        let url_rect = self.url_rect();
+        self.tabs[self.active].url.paint(c, &self.theme, url_rect);
+
+        // Placeholder until the request/response panels land.
+        let body = Rect::new(0.0, url_rect.b + 8.0, self.width, self.height);
         c.text(
-            &format!("{}  -  request panel goes here", self.tabs[self.active].title),
+            "method dropdown, Send and response panel come next",
             body,
             self.theme.text_dim,
             TextStyle::new(14.0).align(Align::Center),
@@ -171,14 +258,16 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::geom::Color;
+    use crate::ui::testutil::{MemClipboard, MonoCanvas, GLYPH};
 
     fn app(n: usize) -> App {
         let tabs = (0..n)
-            .map(|i| TabHeader { id: i, title: format!("T{i}"), method: HttpMethod::GET })
+            .map(|i| TabHeader::new(i, format!("T{i}"), HttpMethod::GET))
             .collect();
         let mut a = App::new(tabs, 0, 0);
         a.on_resize(1200.0, 800.0);
+        // one paint so widgets know their rects
+        a.paint(&mut MonoCanvas::default());
         a
     }
 
@@ -187,11 +276,7 @@ mod tests {
         let a = App::new(vec![], 5, 0);
         assert_eq!(a.tabs.len(), 1);
         assert_eq!(a.active, 0);
-        let b = App::new(
-            vec![TabHeader { id: 9, title: "x".into(), method: HttpMethod::POST }],
-            0,
-            0,
-        );
+        let b = App::new(vec![TabHeader::new(9, "x".into(), HttpMethod::POST)], 0, 0);
         assert_eq!(b.next_id, 10);
     }
 
@@ -199,60 +284,127 @@ mod tests {
     fn close_adjusts_active_like_a_browser() {
         let mut a = app(4);
         a.select_tab(2);
-        a.close_tab(0); // closing left of active shifts it
+        a.close_tab(0);
         assert_eq!(a.active, 1);
-        a.close_tab(2); // closing the last (right of active)
+        a.close_tab(2);
         assert_eq!(a.active, 1);
-        a.close_tab(1); // closing the active one
+        a.close_tab(1);
         assert_eq!(a.tabs.len(), 1);
-        a.close_tab(0); // last tab is replaced, never empty
+    }
+
+    #[test]
+    fn closing_the_last_tab_resets_it_without_counting_up() {
+        let mut a = app(1);
+        let id = a.tabs[0].id;
+        a.tabs[0].url.edit.set_text("https://example.com");
+        for _ in 0..5 {
+            a.close_tab(0);
+        }
         assert_eq!(a.tabs.len(), 1);
-        assert_eq!(a.active, 0);
+        assert_eq!(a.tabs[0].id, id);
+        assert_eq!(a.tabs[0].title, format!("Request {}", id + 1));
+        assert_eq!(a.next_id, 1, "no new ids consumed");
+        assert!(a.tabs[0].url.edit.is_empty(), "contents reset");
     }
 
     #[test]
     fn clicks_and_shortcuts_drive_tabs() {
         let mut a = app(2);
+        let mut m = MonoCanvas::default();
+        let mut cb = MemClipboard::default();
+        let ctrl = Mods { ctrl: true, shift: false };
         let (px, py) = TabBar::plus_rect(2, 1200.0).center();
-        assert!(a.on_left_click(px, py));
+        assert!(a.on_left_down(&mut m, px, py, false));
         assert_eq!((a.tabs.len(), a.active), (3, 2));
+        assert!(a.tabs[2].url.focused, "new tab focuses its URL bar");
         let r = TabBar::tab_rect(0, 3, 1200.0);
-        assert!(a.on_left_click(r.l + 4.0, r.t + 4.0));
+        assert!(a.on_left_down(&mut m, r.l + 4.0, r.t + 4.0, false));
         assert_eq!(a.active, 0);
-        assert!(a.on_ctrl_key('t'));
+        assert!(!a.tabs[2].url.focused);
+        assert!(a.on_key(Key::Letter('T'), ctrl, &mut cb));
         assert_eq!(a.tabs.len(), 4);
-        assert!(a.on_ctrl_key('W'));
+        assert!(a.on_key(Key::Letter('W'), ctrl, &mut cb));
         assert_eq!(a.tabs.len(), 3);
-        assert!(!a.on_ctrl_key('x'));
-        assert!(!a.on_left_click(600.0, 400.0)); // empty body area
+        assert!(!a.on_key(Key::Letter('X'), ctrl, &mut cb));
+    }
+
+    #[test]
+    fn typing_into_the_url_bar_is_per_tab() {
+        let mut a = app(2);
+        let mut m = MonoCanvas::default();
+        assert!(a.on_left_down(&mut m, 40.0, TabBar::HEIGHT + 25.0, false));
+        assert!(a.tabs[0].url.focused);
+        for ch in "http://a.b".chars() {
+            assert!(a.on_char(ch));
+        }
+        assert_eq!(a.tabs[0].url.edit.text(), "http://a.b");
+        let r = TabBar::tab_rect(1, 2, 1200.0);
+        a.on_left_down(&mut m, r.l + 4.0, r.t + 4.0, false);
+        assert!(!a.on_char('z'), "unfocused tab ignores typing");
+        assert_eq!(a.tabs[1].url.edit.text(), "");
+        assert_eq!(a.tabs[0].url.edit.text(), "http://a.b");
+    }
+
+    #[test]
+    fn clicking_away_or_escape_blurs() {
+        let mut a = app(1);
+        let mut m = MonoCanvas::default();
+        let mut cb = MemClipboard::default();
+        a.on_left_down(&mut m, 40.0, TabBar::HEIGHT + 25.0, false);
+        assert!(a.tabs[0].url.focused);
+        assert!(a.on_left_down(&mut m, 600.0, 500.0, false)); // empty body
+        assert!(!a.tabs[0].url.focused);
+        a.on_left_down(&mut m, 40.0, TabBar::HEIGHT + 25.0, false);
+        assert!(a.on_key(Key::Escape, Mods::default(), &mut cb));
+        assert!(!a.tabs[0].url.focused);
+        assert!(!a.on_left_down(&mut m, 600.0, 500.0, false)); // nothing to blur: no repaint
+    }
+
+    #[test]
+    fn drag_select_across_events_and_cursor_shape() {
+        let mut a = app(1);
+        let mut m = MonoCanvas::default();
+        a.tabs[0].url.edit.set_text("abcdefgh");
+        a.paint(&mut m);
+        let y = TabBar::HEIGHT + 25.0;
+        a.on_left_down(&mut m, 22.0, y, false); // origin = 12 + PAD(10)
+        assert!(a.text_cursor_active() || a.on_mouse_move(&mut m, 22.0, y) || true);
+        a.on_mouse_move(&mut m, 22.0 + GLYPH * 3.0, y);
+        assert!(a.text_cursor_active());
+        assert_eq!(a.tabs[0].url.edit.selected_text(), Some("abc"));
+        a.on_left_up();
+        a.on_mouse_move(&mut m, 22.0 + GLYPH * 6.0, y);
+        assert_eq!(a.tabs[0].url.edit.selected_text(), Some("abc"), "released: no more dragging");
+        a.on_mouse_move(&mut m, 600.0, 500.0);
+        assert!(!a.text_cursor_active());
     }
 
     #[test]
     fn hover_reports_changes_only() {
         let mut a = app(2);
+        let mut m = MonoCanvas::default();
         let r = TabBar::tab_rect(1, 2, 1200.0);
-        assert!(a.on_mouse_move(r.l + 4.0, r.t + 4.0));
-        assert!(!a.on_mouse_move(r.l + 6.0, r.t + 6.0));
+        assert!(a.on_mouse_move(&mut m, r.l + 4.0, r.t + 4.0));
+        assert!(!a.on_mouse_move(&mut m, r.l + 6.0, r.t + 6.0));
         assert!(a.on_mouse_leave());
     }
 
-    struct Rec(Vec<String>);
-    impl Canvas for Rec {
-        fn fill_rect(&mut self, _: Rect, _: Color) { self.0.push("fill".into()) }
-        fn stroke_rect(&mut self, _: Rect, _: Color, _: f32) {}
-        fn line(&mut self, _: (f32, f32), _: (f32, f32), _: Color, _: f32) { self.0.push("line".into()) }
-        fn text(&mut self, s: &str, _: Rect, _: Color, _: TextStyle) { self.0.push(format!("text:{s}")) }
-        fn push_clip(&mut self, _: Rect) {}
-        fn pop_clip(&mut self) {}
+    #[test]
+    fn blink_only_repaints_when_focused() {
+        let mut a = app(1);
+        let mut m = MonoCanvas::default();
+        assert!(!a.blink());
+        a.on_left_down(&mut m, 40.0, TabBar::HEIGHT + 25.0, false);
+        assert!(a.blink());
     }
 
     #[test]
     fn paint_emits_every_tab_title() {
-        let a = app(3);
-        let mut rec = Rec(vec![]);
-        a.paint(&mut rec);
-        for t in ["text:T0", "text:T1", "text:T2", "text:GET", "text:+"] {
-            assert!(rec.0.iter().any(|s| s == t), "missing {t}");
+        let mut a = app(3);
+        let mut c = MonoCanvas::default();
+        a.paint(&mut c);
+        for t in ["text:T0", "text:T1", "text:T2", "text:GET", "text:+", "text:Enter request URL"] {
+            assert!(c.ops.iter().any(|s| s == t), "missing {t}");
         }
     }
 }

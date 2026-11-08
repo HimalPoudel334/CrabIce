@@ -11,21 +11,29 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT,
+    VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::app::App;
+use crate::platform::clipboard::WinClipboard;
 use crate::render::Renderer;
+use crate::ui::input::{Key, Mods};
 
 // Not in the bindings I target (WM_MOUSELEAVE lives behind the Controls feature).
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const BLINK_TIMER: usize = 1;
+const BLINK_MS: u32 = 530;
 
 struct Window {
     hwnd: HWND,
     renderer: Renderer,
     app: App,
     tracking_mouse: bool,
+    /// First half of a UTF-16 surrogate pair delivered by WM_CHAR.
+    high_surrogate: Option<u16>,
     // Kept alive for the window's lifetime; the async bridge (step 4) uses it.
     _rt: tokio::runtime::Runtime,
 }
@@ -51,6 +59,12 @@ impl Window {
         self.app.paint(&mut self.renderer);
         self.renderer.end_draw();
     }
+
+    /// Mouse position from an lparam, converted to DIPs.
+    fn pos(&self, lparam: LPARAM) -> (f32, f32) {
+        let s = self.scale();
+        (get_x(lparam) / s, get_y(lparam) / s)
+    }
 }
 
 fn get_x(lparam: LPARAM) -> f32 {
@@ -58,6 +72,25 @@ fn get_x(lparam: LPARAM) -> f32 {
 }
 fn get_y(lparam: LPARAM) -> f32 {
     ((lparam.0 >> 16) & 0xFFFF) as i16 as f32
+}
+
+fn key_down(vk: i32) -> bool {
+    unsafe { GetKeyState(vk) < 0 }
+}
+
+fn map_key(vk: u16) -> Option<Key> {
+    match vk {
+        v if v == VK_LEFT.0 => Some(Key::Left),
+        v if v == VK_RIGHT.0 => Some(Key::Right),
+        v if v == VK_HOME.0 => Some(Key::Home),
+        v if v == VK_END.0 => Some(Key::End),
+        v if v == VK_BACK.0 => Some(Key::Backspace),
+        v if v == VK_DELETE.0 => Some(Key::Delete),
+        v if v == VK_RETURN.0 => Some(Key::Enter),
+        v if v == VK_ESCAPE.0 => Some(Key::Escape),
+        0x41..=0x5A => Some(Key::Letter(vk as u8 as char)),
+        _ => None,
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -70,7 +103,7 @@ pub fn run() -> Result<()> {
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
@@ -97,11 +130,12 @@ pub fn run() -> Result<()> {
             renderer: Renderer::new()?,
             app,
             tracking_mouse: false,
+            high_surrogate: None,
             _rt: rt,
         });
         let ptr = Box::into_raw(window);
 
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
             w!("CrabiPie"),
@@ -116,9 +150,12 @@ pub fn run() -> Result<()> {
             Some(ptr as *const c_void),
         )?;
 
+        // caret blink
+        SetTimer(hwnd, BLINK_TIMER, BLINK_MS, None);
+
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg); // generates WM_CHAR from WM_KEYDOWN
             DispatchMessageW(&msg);
         }
         Ok(())
@@ -185,8 +222,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = TrackMouseEvent(&mut t);
                     win.tracking_mouse = true;
                 }
-                let s = win.scale();
-                if win.app.on_mouse_move(get_x(lparam) / s, get_y(lparam) / s) {
+                let (x, y) = win.pos(lparam);
+                if win.app.on_mouse_move(&mut win.renderer, x, y) {
                     win.invalidate();
                 }
                 LRESULT(0)
@@ -199,32 +236,86 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                let s = win.scale();
-                if win.app.on_left_click(get_x(lparam) / s, get_y(lparam) / s) {
+                // Capture so drag-selecting keeps working outside the window.
+                SetCapture(hwnd);
+                let (x, y) = win.pos(lparam);
+                let shift = key_down(VK_SHIFT.0 as i32);
+                if win.app.on_left_down(&mut win.renderer, x, y, shift) {
                     win.invalidate();
                 }
+                LRESULT(0)
+            }
+            WM_LBUTTONDBLCLK => {
+                SetCapture(hwnd);
+                let (x, y) = win.pos(lparam);
+                if win.app.on_double_click(&mut win.renderer, x, y) {
+                    win.invalidate();
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                win.app.on_left_up();
                 LRESULT(0)
             }
             WM_MBUTTONUP => {
-                let s = win.scale();
-                if win.app.on_middle_click(get_x(lparam) / s, get_y(lparam) / s) {
+                let (x, y) = win.pos(lparam);
+                if win.app.on_middle_click(x, y) {
                     win.invalidate();
                 }
                 LRESULT(0)
             }
-            WM_KEYDOWN => {
-                let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
-                if ctrl {
-                    if let Some(ch) = char::from_u32(wparam.0 as u32) {
-                        if win.app.on_ctrl_key(ch) {
-                            win.invalidate();
-                            return LRESULT(0);
-                        }
+            WM_SETCURSOR => {
+                if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && win.app.text_cursor_active() {
+                    if let Ok(c) = LoadCursorW(None, IDC_IBEAM) {
+                        let _ = SetCursor(c);
+                        return LRESULT(1);
                     }
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
+            WM_KEYDOWN => {
+                if let Some(key) = map_key(wparam.0 as u16) {
+                    let mods = Mods {
+                        ctrl: key_down(VK_CONTROL.0 as i32),
+                        shift: key_down(VK_SHIFT.0 as i32),
+                    };
+                    let mut cb = WinClipboard { hwnd };
+                    if win.app.on_key(key, mods, &mut cb) {
+                        win.invalidate();
+                        return LRESULT(0);
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_CHAR => {
+                let unit = wparam.0 as u16;
+                let ch = if (0xD800..0xDC00).contains(&unit) {
+                    win.high_surrogate = Some(unit); // wait for the low half
+                    return LRESULT(0);
+                } else if (0xDC00..0xE000).contains(&unit) {
+                    win.high_surrogate
+                        .take()
+                        .and_then(|hi| char::decode_utf16([hi, unit]).next())
+                        .and_then(|r| r.ok())
+                } else {
+                    char::from_u32(unit as u32)
+                };
+                if let Some(ch) = ch {
+                    if win.app.on_char(ch) {
+                        win.invalidate();
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                if wparam.0 == BLINK_TIMER && win.app.blink() {
+                    win.invalidate();
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
+                let _ = KillTimer(hwnd, BLINK_TIMER);
                 PostQuitMessage(0);
                 LRESULT(0)
             }

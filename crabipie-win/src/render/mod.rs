@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use windows::core::{Result, HRESULT};
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
     D2D_SIZE_U,
@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
+    IDWriteTextLayout, DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_METRICS,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
@@ -30,7 +31,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-use crate::ui::canvas::{Align, Canvas, TextStyle};
+use crate::ui::canvas::{Align, Canvas, TextMeasure, TextStyle};
 use crate::ui::geom::{Color, Rect};
 
 // Not exposed by the bindings: EndDraw returns this when the device is lost
@@ -217,6 +218,55 @@ impl Renderer {
             unsafe { brush.SetColor(&col) };
             f(rt, brush);
         }
+    }
+}
+
+impl Renderer {
+    /// A throwaway layout for measuring. Works outside a paint pass.
+    fn layout(&mut self, s: &str, style: TextStyle) -> Option<IDWriteTextLayout> {
+        let fmt = self.format(style)?;
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        unsafe { self.dwrite.CreateTextLayout(&wide, &fmt, 100_000.0, 1_000.0).ok() }
+    }
+}
+
+impl TextMeasure for Renderer {
+    fn text_width(&mut self, s: &str, style: TextStyle) -> f32 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let Some(layout) = self.layout(s, style) else { return 0.0 };
+        let mut m: DWRITE_TEXT_METRICS = unsafe { std::mem::zeroed() };
+        if unsafe { layout.GetMetrics(&mut m) }.is_err() {
+            return 0.0;
+        }
+        m.widthIncludingTrailingWhitespace
+    }
+
+    fn text_index_at(&mut self, s: &str, style: TextStyle, x: f32) -> usize {
+        if s.is_empty() {
+            return 0;
+        }
+        let Some(layout) = self.layout(s, style) else { return 0 };
+        let mut trailing = BOOL(0);
+        let mut inside = BOOL(0);
+        let mut hm: DWRITE_HIT_TEST_METRICS = unsafe { std::mem::zeroed() };
+        if unsafe { layout.HitTestPoint(x, 0.0, &mut trailing, &mut inside, &mut hm) }.is_err() {
+            return 0;
+        }
+        // DirectWrite counts UTF-16 units; convert to a byte index.
+        let mut target = hm.textPosition as usize;
+        if trailing.as_bool() {
+            target += hm.length as usize;
+        }
+        let mut units = 0usize;
+        for (byte, ch) in s.char_indices() {
+            if units >= target {
+                return byte;
+            }
+            units += ch.len_utf16();
+        }
+        s.len()
     }
 }
 

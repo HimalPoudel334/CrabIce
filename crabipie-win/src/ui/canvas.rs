@@ -1,5 +1,5 @@
 //! The drawing surface the UI talks to. `render::Renderer` implements it
-//! with Direct2D; tests implement it with a recorder.
+//! with Direct2D/DirectWrite; tests implement it with a recorder.
 
 use super::geom::{Color, Rect};
 
@@ -29,7 +29,16 @@ impl TextStyle {
     }
 }
 
-pub trait Canvas {
+/// Text metrics. Usable outside a paint pass (event handlers need it for
+/// click-to-caret), so it is its own trait.
+pub trait TextMeasure {
+    /// Advance width of `s` in DIPs, including trailing spaces.
+    fn text_width(&mut self, s: &str, style: TextStyle) -> f32;
+    /// Byte index of the caret position nearest to `x` (DIPs from the start of `s`).
+    fn text_index_at(&mut self, s: &str, style: TextStyle, x: f32) -> usize;
+}
+
+pub trait Canvas: TextMeasure {
     fn fill_rect(&mut self, r: Rect, c: Color);
     fn stroke_rect(&mut self, r: Rect, c: Color, width: f32);
     fn line(&mut self, a: (f32, f32), b: (f32, f32), c: Color, width: f32);

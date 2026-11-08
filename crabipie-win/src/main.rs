@@ -7,6 +7,8 @@ mod ui;
 
 // Windows-only: the thin layer that owns the HWND and Direct2D/DirectWrite.
 #[cfg(windows)]
+mod platform;
+#[cfg(windows)]
 mod render;
 #[cfg(windows)]
 mod window;
