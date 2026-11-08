@@ -1050,6 +1050,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabipie-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.0",
+ "chrono",
+ "flate2",
+ "futures",
+ "futures-util",
+ "once_cell",
+ "rand 0.8.8",
+ "regex",
+ "reqwest",
+ "reqwest-websocket",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "crabipie-win"
+version = "0.1.0"
+dependencies = [
+ "crabipie-core",
+ "tokio",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
