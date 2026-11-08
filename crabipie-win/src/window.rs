@@ -1,6 +1,7 @@
 //! Win32 window: class registration, message loop, WndProc. Translates raw
 //! messages into DIP-space calls on `App` and paints through `Renderer`.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::core::{w, Error, Result};
@@ -12,7 +13,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT,
+    VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_TAB, VK_UP, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT,
     VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -21,11 +22,29 @@ use crate::app::App;
 use crate::platform::clipboard::WinClipboard;
 use crate::render::Renderer;
 use crate::ui::input::{Key, Mods};
+use crabipie_core::{build_request, execute_request, HttpMethod, ResponseEvent};
 
 // Not in the bindings I target (WM_MOUSELEAVE lives behind the Controls feature).
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Posted by the async runtime; lparam owns a `Box<BridgeMsg>`.
+const WM_APP_RESPONSE: u32 = 0x8001; // WM_APP + 1
 const BLINK_TIMER: usize = 1;
 const BLINK_MS: u32 = 530;
+
+struct BridgeMsg {
+    tab_id: usize,
+    ev: ResponseEvent,
+}
+
+/// Called from tokio worker threads: hands an engine event to the UI thread.
+fn post_to_ui(hwnd_raw: isize, tab_id: usize, ev: ResponseEvent) {
+    let ptr = Box::into_raw(Box::new(BridgeMsg { tab_id, ev }));
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+    if unsafe { PostMessageW(hwnd, WM_APP_RESPONSE, WPARAM(0), LPARAM(ptr as isize)) }.is_err() {
+        // window already gone: reclaim the message
+        drop(unsafe { Box::from_raw(ptr) });
+    }
+}
 
 struct Window {
     hwnd: HWND,
@@ -34,8 +53,7 @@ struct Window {
     tracking_mouse: bool,
     /// First half of a UTF-16 surrogate pair delivered by WM_CHAR.
     high_surrogate: Option<u16>,
-    // Kept alive for the window's lifetime; the async bridge (step 4) uses it.
-    _rt: tokio::runtime::Runtime,
+    rt: tokio::runtime::Runtime,
 }
 
 impl Window {
@@ -60,6 +78,22 @@ impl Window {
         self.renderer.end_draw();
     }
 
+    /// Starts any request the app queued (Send button / Enter).
+    fn dispatch_sends(&mut self) {
+        while let Some(job) = self.app.take_send() {
+            let hwnd_raw = self.hwnd.0 as isize;
+            let (tab_id, cancel) = (job.tab_id, job.cancel.clone());
+            let is_head = job.state.method == HttpMethod::HEAD;
+            let (request, url) = build_request(&job.state, None, &HashMap::new());
+            self.rt.spawn(async move {
+                execute_request(request, url, is_head, cancel, move |ev| {
+                    post_to_ui(hwnd_raw, tab_id, ev)
+                })
+                .await;
+            });
+        }
+    }
+
     /// Mouse position from an lparam, converted to DIPs.
     fn pos(&self, lparam: LPARAM) -> (f32, f32) {
         let s = self.scale();
@@ -82,6 +116,9 @@ fn map_key(vk: u16) -> Option<Key> {
     match vk {
         v if v == VK_LEFT.0 => Some(Key::Left),
         v if v == VK_RIGHT.0 => Some(Key::Right),
+        v if v == VK_UP.0 => Some(Key::Up),
+        v if v == VK_DOWN.0 => Some(Key::Down),
+        v if v == VK_TAB.0 => Some(Key::Tab),
         v if v == VK_HOME.0 => Some(Key::Home),
         v if v == VK_END.0 => Some(Key::End),
         v if v == VK_BACK.0 => Some(Key::Backspace),
@@ -131,7 +168,7 @@ pub fn run() -> Result<()> {
             app,
             tracking_mouse: false,
             high_surrogate: None,
-            _rt: rt,
+            rt,
         });
         let ptr = Box::into_raw(window);
 
@@ -243,6 +280,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if win.app.on_left_down(&mut win.renderer, x, y, shift) {
                     win.invalidate();
                 }
+                win.dispatch_sends();
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
@@ -283,6 +321,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let mut cb = WinClipboard { hwnd };
                     if win.app.on_key(key, mods, &mut cb) {
                         win.invalidate();
+                        win.dispatch_sends();
                         return LRESULT(0);
                     }
                 }
@@ -305,6 +344,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if win.app.on_char(ch) {
                         win.invalidate();
                     }
+                }
+                LRESULT(0)
+            }
+            WM_APP_RESPONSE => {
+                let m = Box::from_raw(lparam.0 as *mut BridgeMsg);
+                if win.app.on_response(m.tab_id, m.ev) {
+                    win.invalidate();
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let notches = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / 120.0;
+                if win.app.on_wheel(notches) {
+                    win.invalidate();
                 }
                 LRESULT(0)
             }

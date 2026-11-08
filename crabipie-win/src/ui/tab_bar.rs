@@ -83,7 +83,7 @@ impl TabBar {
         changed
     }
 
-    fn method_color(theme: &Theme, m: HttpMethod) -> Color {
+    pub fn method_color(theme: &Theme, m: HttpMethod) -> Color {
         match m {
             HttpMethod::GET => theme.method_get,
             HttpMethod::POST => theme.method_post,

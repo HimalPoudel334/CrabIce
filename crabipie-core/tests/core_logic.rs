@@ -137,3 +137,81 @@ fn saved_state_gzip_roundtrip_on_disk() {
         assert_eq!(back.url, "https://roundtrip.test");
     });
 }
+
+// ───────────── engine: Send-ness + end-to-end against a local server ─────────────
+
+use std::io::{Read, Write};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
+fn serve_once(response: Vec<u8>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(&response);
+        }
+    });
+    format!("http://{addr}/x")
+}
+
+fn run_engine(url: &str) -> Vec<ResponseEvent> {
+    let mut st = SavedState::default();
+    st.url = url.into();
+    let (rb, final_url) = build_request(&st, None, &HashMap::new());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(execute_request(rb, final_url, false, Arc::new(AtomicBool::new(false)), move |e| {
+        sink.lock().unwrap().push(e)
+    }));
+    let v = events.lock().unwrap().clone();
+    v
+}
+
+#[test]
+fn engine_future_is_send_so_the_ui_can_spawn_it() {
+    fn is_send<T: Send>(_: &T) {}
+    let (rb, url) = build_request(&SavedState::default(), None, &HashMap::new());
+    let fut = execute_request(rb, url, false, Arc::new(AtomicBool::new(false)), |_e| {});
+    is_send(&fut);
+}
+
+#[test]
+fn engine_buffered_json_response() {
+    let body = r#"{"ok":true}"#;
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    let evs = run_engine(&serve_once(resp.into_bytes()));
+    assert_eq!(evs.len(), 2);
+    match &evs[0] {
+        ResponseEvent::Response(r) => {
+            assert_eq!(r.status, "200 OK");
+            assert_eq!(r.body, body);
+            assert!(!r.is_streaming && r.response_time.is_some());
+        }
+        e => panic!("unexpected {e:?}"),
+    }
+    assert!(matches!(evs[1], ResponseEvent::Done));
+}
+
+#[test]
+fn engine_streams_chunked_event_stream() {
+    let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\ndata: 1\n\r\n8\r\ndata: 2\n\r\n0\r\n\r\n";
+    let evs = run_engine(&serve_once(resp.as_bytes().to_vec()));
+    assert!(matches!(&evs[0], ResponseEvent::Response(r) if r.is_streaming));
+    let text: String = evs.iter().filter_map(|e| if let ResponseEvent::Chunk(s) = e { Some(s.as_str()) } else { None }).collect();
+    assert_eq!(text, "data: 1\ndata: 2\n");
+    assert!(matches!(evs.last(), Some(ResponseEvent::Done)));
+}
+
+#[test]
+fn engine_reports_connection_errors_without_hanging() {
+    let evs = run_engine("http://127.0.0.1:1/nothing"); // nothing listens on port 1
+    assert_eq!(evs.len(), 1);
+    assert!(matches!(&evs[0], ResponseEvent::Response(r) if r.status == "Error" && r.body.starts_with("Request failed")));
+}

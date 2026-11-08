@@ -19,16 +19,18 @@ pub struct LineEdit {
     anchor: usize,
     undo: Vec<Snap>,
     redo: Vec<Snap>,
+    multiline: bool,
 }
 
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// A single line cannot contain line breaks; tabs become spaces.
-fn sanitize(s: &str) -> String {
+/// Single-line edits drop line breaks; multiline keeps '\n'. CRs are always
+/// dropped and tabs become spaces.
+fn sanitize(s: &str, multiline: bool) -> String {
     s.chars()
-        .filter(|c| *c != '\r' && *c != '\n')
+        .filter(|c| *c != '\r' && (multiline || *c != '\n'))
         .map(|c| if c == '\t' { ' ' } else { c })
         .collect()
 }
@@ -36,6 +38,10 @@ fn sanitize(s: &str) -> String {
 impl LineEdit {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn multiline() -> Self {
+        Self { multiline: true, ..Self::default() }
     }
 
     pub fn text(&self) -> &str {
@@ -50,7 +56,7 @@ impl LineEdit {
 
     /// Programmatic replace (e.g. loading a saved URL). Clears undo history.
     pub fn set_text(&mut self, s: &str) {
-        self.text = sanitize(s);
+        self.text = sanitize(s, self.multiline);
         self.caret = self.text.len();
         self.anchor = self.caret;
         self.undo.clear();
@@ -155,7 +161,7 @@ impl LineEdit {
     // ── editing ─────────────────────────────────────────────────────
 
     pub fn insert(&mut self, s: &str) -> bool {
-        let s = sanitize(s);
+        let s = sanitize(s, self.multiline);
         if s.is_empty() && self.selection().is_none() {
             return false;
         }

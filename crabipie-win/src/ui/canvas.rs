@@ -15,14 +15,18 @@ pub struct TextStyle {
     pub size: f32,
     pub bold: bool,
     pub align: Align,
+    pub mono: bool,
 }
 
 impl TextStyle {
     pub const fn new(size: f32) -> Self {
-        Self { size, bold: false, align: Align::Left }
+        Self { size, bold: false, align: Align::Left, mono: false }
     }
     pub const fn bold(self) -> Self {
         Self { bold: true, ..self }
+    }
+    pub const fn mono(self) -> Self {
+        Self { mono: true, ..self }
     }
     pub const fn align(self, align: Align) -> Self {
         Self { align, ..self }

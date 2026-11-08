@@ -1076,6 +1076,7 @@ name = "crabipie-win"
 version = "0.1.0"
 dependencies = [
  "crabipie-core",
+ "serde_json",
  "tokio",
  "windows 0.58.0",
 ]

@@ -52,7 +52,7 @@ pub struct Renderer {
     hwnd: HWND,
     rt: Option<ID2D1HwndRenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
-    formats: HashMap<(u32, bool, Align), IDWriteTextFormat>,
+    formats: HashMap<(u32, bool, Align, bool), IDWriteTextFormat>,
 }
 
 impl Renderer {
@@ -173,7 +173,7 @@ impl Renderer {
     }
 
     fn format(&mut self, style: TextStyle) -> Option<IDWriteTextFormat> {
-        let key = ((style.size * 10.0) as u32, style.bold, style.align);
+        let key = ((style.size * 10.0) as u32, style.bold, style.align, style.mono);
         if let Some(f) = self.formats.get(&key) {
             return Some(f.clone());
         }
@@ -182,7 +182,11 @@ impl Renderer {
             let fmt = self
                 .dwrite
                 .CreateTextFormat(
-                    windows::core::w!("Segoe UI"),
+                    if style.mono {
+                        windows::core::w!("Consolas")
+                    } else {
+                        windows::core::w!("Segoe UI")
+                    },
                     None::<&IDWriteFontCollection>,
                     weight,
                     DWRITE_FONT_STYLE_NORMAL,
