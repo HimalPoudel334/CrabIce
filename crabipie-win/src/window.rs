@@ -1,7 +1,6 @@
 //! Win32 window: class registration, message loop, WndProc. Translates raw
 //! messages into DIP-space calls on `App` and paints through `Renderer`.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::core::{w, Error, Result};
@@ -84,7 +83,7 @@ impl Window {
             let hwnd_raw = self.hwnd.0 as isize;
             let (tab_id, cancel) = (job.tab_id, job.cancel.clone());
             let is_head = job.state.method == HttpMethod::HEAD;
-            let (request, url) = build_request(&job.state, None, &HashMap::new());
+            let (request, url) = build_request(&job.state, None, &job.jar);
             self.rt.spawn(async move {
                 execute_request(request, url, is_head, cancel, move |ev| {
                     post_to_ui(hwnd_raw, tab_id, ev)

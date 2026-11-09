@@ -59,7 +59,12 @@ pub async fn execute_request(
         .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
         .collect();
 
-    let headers_text = format!("{:#?}", hm);
+    // "name: value" per line (the iced app showed Rust's debug dump).
+    let headers_text = hm
+        .iter()
+        .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("<binary>")))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // ── content inspection ──────────────────────────────────────────────
     let content_type = hm

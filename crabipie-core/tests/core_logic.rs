@@ -192,6 +192,7 @@ fn engine_buffered_json_response() {
         ResponseEvent::Response(r) => {
             assert_eq!(r.status, "200 OK");
             assert_eq!(r.body, body);
+            assert!(r.headers.contains("content-type: application/json"));
             assert!(!r.is_streaming && r.response_time.is_some());
         }
         e => panic!("unexpected {e:?}"),

@@ -54,6 +54,12 @@ impl LineEdit {
         self.text.is_empty()
     }
 
+    /// Streaming append; leaves caret and selection alone.
+    pub fn append(&mut self, s: &str) {
+        let s = sanitize(s, self.multiline);
+        self.text.push_str(&s);
+    }
+
     /// Programmatic replace (e.g. loading a saved URL). Clears undo history.
     pub fn set_text(&mut self, s: &str) {
         self.text = sanitize(s, self.multiline);

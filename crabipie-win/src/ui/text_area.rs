@@ -21,6 +21,7 @@ pub struct TextArea {
     dragging: bool,
     caret_visible: bool,
     follow: bool, // scroll the caret into view on next paint
+    readonly: bool,
 }
 
 /// Byte ranges of each line (excluding the '\n').
@@ -52,7 +53,33 @@ impl TextArea {
             dragging: false,
             caret_visible: true,
             follow: false,
+            readonly: false,
         }
+    }
+
+    /// Selectable and copyable, not editable (response viewer).
+    pub fn readonly(placeholder: &str) -> Self {
+        Self { readonly: true, ..Self::new(placeholder) }
+    }
+
+    /// Replaces the content and scrolls to the top (read-only viewers).
+    pub fn set_text(&mut self, s: &str) {
+        self.edit.set_text(s);
+        self.edit.set_caret(0, false);
+        self.scroll = 0.0;
+    }
+
+    pub fn append(&mut self, s: &str) {
+        self.edit.append(s);
+    }
+
+    pub fn line_count(&self) -> usize {
+        line_ranges(self.edit.text()).len()
+    }
+
+    pub fn line(&self, i: usize) -> Option<&str> {
+        let t = self.edit.text();
+        line_ranges(t).get(i).map(|&(s, e)| &t[s..e])
     }
 
     fn origin_x(&self) -> f32 {
@@ -126,7 +153,7 @@ impl TextArea {
     }
 
     pub fn char(&mut self, ch: char) -> bool {
-        if !self.focused || ch.is_control() {
+        if !self.focused || self.readonly || ch.is_control() {
             return false;
         }
         let mut b = [0u8; 4];
@@ -154,6 +181,13 @@ impl TextArea {
 
     pub fn key(&mut self, key: Key, mods: Mods, cb: &mut dyn Clipboard) -> bool {
         if !self.focused {
+            return false;
+        }
+        let navigation = matches!(
+            key,
+            Key::Left | Key::Right | Key::Up | Key::Down | Key::Home | Key::End | Key::Letter('A') | Key::Letter('C')
+        );
+        if self.readonly && !navigation {
             return false;
         }
         let (ctrl, shift) = (mods.ctrl, mods.shift);
@@ -250,7 +284,7 @@ impl TextArea {
                 c.text(line, Rect::new(x0, y, x1, y + LINE_H), theme.text, STYLE);
             }
         }
-        if self.focused && self.caret_visible && sel.is_none() {
+        if self.focused && !self.readonly && self.caret_visible && sel.is_none() {
             let x = x0 + c.text_width(&text[r[cl].0..caret], STYLE);
             let y = top + cl as f32 * LINE_H;
             c.line((x, y + 2.0), (x, y + LINE_H - 2.0), theme.text, 1.2);

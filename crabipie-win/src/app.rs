@@ -1,6 +1,7 @@
 //! Application state and input handling. Toolkit-free: the window layer
 //! feeds it DIP-space events and hands it a `Canvas` to paint on.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,10 +14,10 @@ use crate::ui::json_fmt;
 use crate::ui::tab_bar::{Hit, TabBar, TabItem};
 use crate::ui::text_area::TextArea;
 use crate::ui::text_input::TextInput;
-use crate::ui::text_view::TextView;
 use crate::ui::theme::Theme;
 use crabipie_core::{
-    format_duration, raw_to_headers, ContentType, HttpMethod, HttpResponse, ResponseEvent, SavedState,
+    format_duration, merge_set_cookies, raw_to_headers, ContentType, CookieEntry, HttpMethod, HttpResponse,
+    ResponseEvent, SavedState,
 };
 
 pub const DEFAULT_URL: &str = "https://jsonplaceholder.typicode.com/posts";
@@ -32,6 +33,14 @@ pub struct SendJob {
     pub tab_id: usize,
     pub state: SavedState,
     pub cancel: Arc<AtomicBool>,
+    pub jar: HashMap<String, Vec<CookieEntry>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RespTab {
+    Body,
+    Headers,
+    Cookies,
 }
 
 #[derive(Clone, Debug)]
@@ -39,7 +48,36 @@ pub struct RespState {
     pub status: String,
     pub elapsed: Option<Duration>,
     pub size: usize,
-    pub view: TextView,
+    pub tab: RespTab,
+    pub body: TextArea,
+    pub headers: TextArea,
+    pub cookies: TextArea,
+}
+
+impl RespState {
+    fn empty(status: &str) -> Self {
+        Self {
+            status: status.into(),
+            elapsed: None,
+            size: 0,
+            tab: RespTab::Body,
+            body: TextArea::readonly("(empty body)"),
+            headers: TextArea::readonly("(no headers)"),
+            cookies: TextArea::readonly("(this response set no cookies)"),
+        }
+    }
+
+    fn area_mut(&mut self) -> &mut TextArea {
+        match self.tab {
+            RespTab::Body => &mut self.body,
+            RespTab::Headers => &mut self.headers,
+            RespTab::Cookies => &mut self.cookies,
+        }
+    }
+
+    fn areas_mut(&mut self) -> [&mut TextArea; 3] {
+        [&mut self.body, &mut self.headers, &mut self.cookies]
+    }
 }
 
 fn human_size(n: usize) -> String {
@@ -63,6 +101,7 @@ pub struct TabHeader {
     pub streaming: bool,
     pub resp: Option<RespState>,
     send_requested: bool,
+    sent_url: String,
     cancel: Arc<AtomicBool>,
 }
 
@@ -89,6 +128,7 @@ impl TabHeader {
             streaming: false,
             resp: None,
             send_requested: false,
+            sent_url: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -105,6 +145,7 @@ pub struct App {
     over_text: bool,
     dd: MethodDropdown,
     mouse: (f32, f32),
+    jar: HashMap<String, Vec<CookieEntry>>,
 }
 
 impl App {
@@ -121,6 +162,7 @@ impl App {
             over_text: false,
             dd: MethodDropdown::default(),
             mouse: (0.0, 0.0),
+            jar: HashMap::new(),
         };
         if tabs.is_empty() {
             tabs.push(app.fresh_tab());
@@ -155,6 +197,12 @@ impl App {
             t.url.blur();
             t.headers.blur();
             t.body.blur();
+            if let Some(r) = t.resp.as_mut() {
+                for a in r.areas_mut() {
+                    was |= a.focused;
+                    a.blur();
+                }
+            }
         }
         was
     }
@@ -227,6 +275,10 @@ impl App {
         let t = self.req_strip_top() + 28.0;
         Rect::new(12.0, t, (self.width - 12.0).max(13.0), t + 140.0)
     }
+    fn resp_tab_rect(&self, i: usize) -> Rect {
+        let right = (self.width - 12.0).max(300.0);
+        Rect::xywh(right - 3.0 * 84.0 + i as f32 * 84.0, self.status_rect().t - 2.0, 84.0, 26.0)
+    }
     fn status_rect(&self) -> Rect {
         let t = self.editor_rect().b + 10.0;
         Rect::new(12.0, t, (self.width - 12.0).max(13.0), t + 22.0)
@@ -245,10 +297,14 @@ impl App {
     /// Returns true when a repaint is needed.
     pub fn on_mouse_move(&mut self, m: &mut dyn TextMeasure, x: f32, y: f32) -> bool {
         self.mouse = (x, y);
-        self.over_text = self.url_rect().contains(x, y) || self.editor_rect().contains(x, y);
+        self.over_text = self.url_rect().contains(x, y)
+            || self.editor_rect().contains(x, y)
+            || self.body_rect().contains(x, y);
         let hover_changed = self.bar.set_hover(self.hit(x, y));
         let t = &mut self.tabs[self.active];
-        let drag_changed = t.url.mouse_move(m, x) | t.area_mut().mouse_move(m, x, y);
+        let drag_changed = t.url.mouse_move(m, x)
+            | t.area_mut().mouse_move(m, x, y)
+            | t.resp.as_mut().map_or(false, |r| r.area_mut().mouse_move(m, x, y));
         let dd_hover = match self.dd.hit(self.method_rect(), x, y) {
             DdHit::Item(i) => Some(i),
             _ => None,
@@ -290,6 +346,20 @@ impl App {
                     self.tabs[self.active].area_mut().mouse_down(m, x, y, shift);
                     return true;
                 }
+                if self.tabs[self.active].resp.is_some() {
+                    for (i, tab) in [RespTab::Body, RespTab::Headers, RespTab::Cookies].into_iter().enumerate() {
+                        if self.resp_tab_rect(i).contains(x, y) {
+                            self.blur_all();
+                            self.tabs[self.active].resp.as_mut().unwrap().tab = tab;
+                            return true;
+                        }
+                    }
+                    if self.body_rect().contains(x, y) {
+                        self.blur_all();
+                        self.tabs[self.active].resp.as_mut().unwrap().area_mut().mouse_down(m, x, y, shift);
+                        return true;
+                    }
+                }
                 if self.method_rect().contains(x, y) {
                     self.blur_all();
                     self.dd.open = true;
@@ -320,6 +390,9 @@ impl App {
         } else if self.editor_rect().contains(x, y) {
             self.tabs[self.active].area_mut().double_click(m, x, y);
             true
+        } else if self.body_rect().contains(x, y) && self.tabs[self.active].resp.is_some() {
+            self.tabs[self.active].resp.as_mut().unwrap().area_mut().double_click(m, x, y);
+            true
         } else {
             false
         }
@@ -330,6 +403,11 @@ impl App {
             t.url.mouse_up();
             t.headers.mouse_up();
             t.body.mouse_up();
+            if let Some(r) = t.resp.as_mut() {
+                for a in r.areas_mut() {
+                    a.mouse_up();
+                }
+            }
         }
     }
 
@@ -376,7 +454,9 @@ impl App {
             return true;
         }
         let t = &mut self.tabs[self.active];
-        t.url.key(key, mods, cb) || t.area_mut().key(key, mods, cb)
+        t.url.key(key, mods, cb)
+            || t.area_mut().key(key, mods, cb)
+            || t.resp.as_mut().map_or(false, |r| r.area_mut().key(key, mods, cb))
     }
 
     pub fn on_char(&mut self, ch: char) -> bool {
@@ -407,7 +487,7 @@ impl App {
         t.send_requested = true;
         t.sending = true;
         t.streaming = false;
-        t.resp = Some(RespState { status: "Sending…".into(), elapsed: None, size: 0, view: TextView::new() });
+        t.resp = Some(RespState::empty("Sending…"));
     }
 
     /// The window layer polls this after each input event.
@@ -423,26 +503,35 @@ impl App {
             content_type: ContentType::Json,
             ..SavedState::default()
         };
-        Some(SendJob { tab_id: t.id, state, cancel: t.cancel.clone() })
+        let mut u = state.url.clone();
+        if !u.contains("://") {
+            u = format!("https://{u}");
+        }
+        t.sent_url = u;
+        Some(SendJob { tab_id: t.id, state, cancel: t.cancel.clone(), jar: self.jar.clone() })
     }
 
     /// Engine events arrive here (posted from the runtime to the UI thread).
     /// Returns true when a repaint is needed. Events for closed tabs are dropped.
     pub fn on_response(&mut self, tab_id: usize, ev: ResponseEvent) -> bool {
-        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return false };
+        let Some(ix) = self.tabs.iter().position(|t| t.id == tab_id) else { return false };
         match ev {
             ResponseEvent::Response(r) => {
+                let url = self.tabs[ix].sent_url.clone();
+                merge_set_cookies(&mut self.jar, &url, &r.set_cookies);
+                let t = &mut self.tabs[ix];
                 t.sending = r.is_streaming;
                 t.streaming = r.is_streaming;
                 t.resp = Some(Self::resp_state(&r));
             }
             ResponseEvent::Chunk(s) => {
-                if let Some(rs) = t.resp.as_mut() {
+                if let Some(rs) = self.tabs[ix].resp.as_mut() {
                     rs.size += s.len();
-                    rs.view.append(&s);
+                    rs.body.append(&s);
                 }
             }
             ResponseEvent::Done => {
+                let t = &mut self.tabs[ix];
                 t.sending = false;
                 t.streaming = false;
             }
@@ -451,12 +540,18 @@ impl App {
     }
 
     fn resp_state(r: &HttpResponse) -> RespState {
-        let is_json = r.content_type.contains("json");
-        let text = if is_json { json_fmt::pretty(&r.body).unwrap_or_else(|| r.body.clone()) } else { r.body.clone() };
-        let mut view = TextView::new();
-        view.set_text(&text);
-        let size = if r.is_binary { r.bytes.len() } else { r.body.len() };
-        RespState { status: r.status.clone(), elapsed: r.response_time, size, view }
+        let text = if r.content_type.contains("json") {
+            json_fmt::pretty(&r.body).unwrap_or_else(|| r.body.clone())
+        } else {
+            r.body.clone()
+        };
+        let mut rs = RespState::empty(&r.status);
+        rs.body.set_text(&text);
+        rs.headers.set_text(&r.headers);
+        rs.cookies.set_text(&r.set_cookies.join("\n"));
+        rs.elapsed = r.response_time;
+        rs.size = if r.is_binary { r.bytes.len() } else { r.body.len() };
+        rs
     }
 
     pub fn on_wheel(&mut self, notches: f32) -> bool {
@@ -464,7 +559,7 @@ impl App {
             return self.tabs[self.active].area_mut().wheel(notches);
         }
         match self.tabs[self.active].resp.as_mut() {
-            Some(rs) => rs.view.wheel(notches),
+            Some(rs) => rs.area_mut().wheel(notches),
             None => false,
         }
     }
@@ -484,6 +579,7 @@ impl App {
         let (method_rect, url_rect, send_rect) = (self.method_rect(), self.url_rect(), self.send_rect());
         let (status_rect, body_rect, editor_rect) = (self.status_rect(), self.body_rect(), self.editor_rect());
         let strips = [self.req_tab_rect(0), self.req_tab_rect(1)];
+        let resp_tabs = [self.resp_tab_rect(0), self.resp_tab_rect(1), self.resp_tab_rect(2)];
         let tab = &mut self.tabs[self.active];
         self.dd.paint_button(c, &self.theme, method_rect, tab.method);
         tab.url.paint(c, &self.theme, url_rect);
@@ -525,12 +621,21 @@ impl App {
                 if rs.size > 0 {
                     line = format!("{line}    {}", human_size(rs.size));
                 }
-                c.text(&line, status_rect, col, TextStyle::new(13.0).bold());
-                rs.view.paint(c, &self.theme, body_rect, "(empty body)");
+                let status_w = Rect::new(status_rect.l, status_rect.t, resp_tabs[0].l - 8.0, status_rect.b);
+                c.text(&line, status_w, col, TextStyle::new(13.0).bold());
+                for (r, (label, which)) in resp_tabs.iter().zip([("Body", RespTab::Body), ("Headers", RespTab::Headers), ("Cookies", RespTab::Cookies)]) {
+                    let on = rs.tab == which;
+                    c.text(label, *r, if on { self.theme.text } else { self.theme.text_dim }, TextStyle::new(13.0).bold().align(Align::Center));
+                    if on {
+                        c.fill_rect(Rect::new(r.l + 12.0, r.b - 2.0, r.r - 12.0, r.b), self.theme.accent);
+                    }
+                }
+                rs.area_mut().paint(c, &self.theme, body_rect);
             }
             None => {
-                let mut empty = TextView::new();
-                empty.paint(c, &self.theme, body_rect, "Enter a URL and press Send");
+                c.fill_rect(body_rect, self.theme.bar_bg);
+                c.stroke_rect(body_rect.inset(0.5), self.theme.border, 1.0);
+                c.text("Enter a URL and press Send", body_rect, self.theme.text_dim, TextStyle::new(13.0).align(Align::Center));
             }
         }
 
@@ -668,7 +773,7 @@ mod tests {
         a.on_left_up();
         a.on_mouse_move(&mut m, x0 + GLYPH * 6.0, y);
         assert_eq!(a.tabs[0].url.edit.selected_text(), Some("abc"), "released: no more dragging");
-        a.on_mouse_move(&mut m, 600.0, 500.0);
+        a.on_mouse_move(&mut m, 600.0, 5.0); // empty part of the tab bar
         assert!(!a.text_cursor_active());
     }
 
@@ -766,8 +871,8 @@ mod tests {
         assert!(!a.tabs[0].sending);
         let rs = a.tabs[0].resp.as_ref().unwrap();
         assert_eq!(rs.status, "200 OK");
-        assert!(rs.view.line_count() > 3, "pretty-printed over several lines");
-        assert_eq!(rs.view.line(1), Some("  \"b\": 1,"));
+        assert!(rs.body.line_count() > 3, "pretty-printed over several lines");
+        assert_eq!(rs.body.line(1), Some("  \"b\": 1,"));
         let mut c = MonoCanvas::default();
         a.paint(&mut c);
         assert!(c.ops.iter().any(|o| o.starts_with("text:200 OK")));
@@ -789,7 +894,7 @@ mod tests {
         assert!(a.tabs[0].sending && a.tabs[0].streaming);
         a.on_response(0, ResponseEvent::Chunk("data: 1\nda".into()));
         a.on_response(0, ResponseEvent::Chunk("ta: 2\n".into()));
-        assert_eq!(a.tabs[0].resp.as_ref().unwrap().view.line(1), Some("data: 2"));
+        assert_eq!(a.tabs[0].resp.as_ref().unwrap().body.line(1), Some("data: 2"));
         let (sx, sy) = a.send_rect().center(); // "Stop"
         a.on_left_down(&mut m, sx, sy, false);
         assert!(job.cancel.load(Ordering::Relaxed));
@@ -860,5 +965,52 @@ mod tests {
         a.on_char('b');
         assert_eq!(a.tabs[0].body.edit.text(), "a\nb");
         assert!(a.take_send().is_none());
+    }
+
+    #[test]
+    fn response_tabs_show_headers_and_cookies_and_feed_the_jar() {
+        let mut a = app(1);
+        let mut m = MonoCanvas::default();
+        type_url(&mut a, &mut m, "x.dev");
+        a.on_key(Key::Enter, Mods::default(), &mut MemClipboard::default());
+        a.take_send();
+        let mut r = resp("hi", "text/plain");
+        r.headers = "a: 1\nb: 2".into();
+        r.set_cookies = vec!["sid=9; Path=/".into()];
+        a.on_response(0, ResponseEvent::Response(r));
+        a.paint(&mut MonoCanvas::default());
+        let (hx, hy) = a.resp_tab_rect(1).center();
+        a.on_left_down(&mut m, hx, hy, false);
+        assert_eq!(a.tabs[0].resp.as_ref().unwrap().headers.line_count(), 2);
+        let (cx, cy) = a.resp_tab_rect(2).center();
+        a.on_left_down(&mut m, cx, cy, false);
+        assert_eq!(a.tabs[0].resp.as_ref().unwrap().cookies.line(0), Some("sid=9; Path=/"));
+        // the cookie rides along on the next request
+        a.on_key(Key::Enter, Mods::default(), &mut MemClipboard::default());
+        a.tabs[0].url.focus();
+        a.on_key(Key::Enter, Mods::default(), &mut MemClipboard::default());
+        let job = a.take_send().unwrap();
+        assert!(job.jar.values().flatten().any(|c| c.name == "sid" && c.value == "9"));
+    }
+
+    #[test]
+    fn response_body_is_selectable_and_copyable_but_not_editable() {
+        let mut a = app(1);
+        let mut m = MonoCanvas::default();
+        let mut cb = MemClipboard::default();
+        let ctrl = Mods { ctrl: true, shift: false };
+        type_url(&mut a, &mut m, "x.dev");
+        a.on_key(Key::Enter, Mods::default(), &mut cb);
+        a.take_send();
+        a.on_response(0, ResponseEvent::Response(resp("hello world", "text/plain")));
+        a.paint(&mut MonoCanvas::default());
+        let (bx, by) = a.body_rect().center();
+        a.on_left_down(&mut m, bx, by, false);
+        assert!(!a.on_char('x'));
+        assert!(!a.on_key(Key::Backspace, Mods::default(), &mut cb));
+        assert!(a.on_key(Key::Letter('A'), ctrl, &mut cb));
+        assert!(a.on_key(Key::Letter('C'), ctrl, &mut cb));
+        assert_eq!(cb.0.as_deref(), Some("hello world"));
+        assert_eq!(a.tabs[0].resp.as_ref().unwrap().body.edit.text(), "hello world");
     }
 }
