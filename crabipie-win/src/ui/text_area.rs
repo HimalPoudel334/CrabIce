@@ -22,6 +22,7 @@ pub struct TextArea {
     caret_visible: bool,
     follow: bool, // scroll the caret into view on next paint
     readonly: bool,
+    highlight: bool,
 }
 
 /// Byte ranges of each line (excluding the '\n').
@@ -54,7 +55,17 @@ impl TextArea {
             caret_visible: true,
             follow: false,
             readonly: false,
+            highlight: false,
         }
+    }
+
+    pub fn json(mut self) -> Self {
+        self.highlight = true;
+        self
+    }
+
+    pub fn set_highlight(&mut self, on: bool) {
+        self.highlight = on;
     }
 
     /// Selectable and copyable, not editable (response viewer).
@@ -264,6 +275,7 @@ impl TextArea {
             c.text(&self.placeholder, Rect::new(x0, rect.t + 6.0, x1, rect.t + 6.0 + LINE_H), theme.text_dim, STYLE);
         }
         let sel = self.edit.selection();
+        let gw = if self.highlight { c.text_width("0", STYLE) } else { 0.0 };
         let first = (self.scroll / LINE_H) as usize;
         let n = (h / LINE_H) as usize + 2;
         for li in first..(first + n).min(r.len()) {
@@ -280,7 +292,13 @@ impl TextArea {
                     c.fill_rect(Rect::new(xa, y, xb, y + LINE_H), theme.accent.alpha(0.35));
                 }
             }
-            if !line.is_empty() {
+            if self.highlight && !line.is_empty() {
+                for (a, b, tok) in super::json_color::tokenize(line) {
+                    let xx = x0 + gw * line[..a].chars().count() as f32;
+                    let ww = gw * line[a..b].chars().count() as f32 + 6.0;
+                    c.text(&line[a..b], Rect::new(xx, y, xx + ww, y + LINE_H), super::json_color::color(tok), STYLE);
+                }
+            } else if !line.is_empty() {
                 c.text(line, Rect::new(x0, y, x1, y + LINE_H), theme.text, STYLE);
             }
         }

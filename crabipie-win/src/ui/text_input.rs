@@ -7,7 +7,7 @@ use super::input::{Clipboard, Key, Mods};
 use super::text_edit::LineEdit;
 use super::theme::Theme;
 
-pub const TEXT: TextStyle = TextStyle::new(13.0);
+pub const TEXT: TextStyle = TextStyle::new(14.0);
 const PAD: f32 = 10.0;
 
 #[derive(Clone, Debug)]

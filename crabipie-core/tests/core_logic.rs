@@ -216,3 +216,103 @@ fn engine_reports_connection_errors_without_hanging() {
     assert_eq!(evs.len(), 1);
     assert!(matches!(&evs[0], ResponseEvent::Response(r) if r.status == "Error" && r.body.starts_with("Request failed")));
 }
+
+// ───────────── auth flow: login-first and retry-on-401 against a local server ─────────────
+
+fn auth_server() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for _ in 0..6 {
+            let Ok((mut s, _)) = listener.accept() else { return };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 2048];
+            let mut want = None;
+            loop {
+                let n = s.read(&mut chunk).unwrap_or(0);
+                if n == 0 { break; }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len = text.to_lowercase().split("content-length:").nth(1)
+                        .and_then(|r| r.split("\r\n").next()).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                    want = Some(h + 4 + len);
+                }
+                if want.map_or(false, |w| buf.len() >= w) { break; }
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
+            let (status, body) = if req.starts_with("POST /login") {
+                ("200 OK", r#"{"access_token":"T1"}"#)
+            } else if req.to_lowercase().contains("authorization: bearer t1") {
+                ("200 OK", r#"{"ok":true}"#)
+            } else {
+                ("401 Unauthorized", r#"{"error":"nope"}"#)
+            };
+            let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn auth_env(base: &str, token: &str, expires: Option<i64>) -> Environment {
+    let mut e = Environment::new(1, "dev");
+    e.variables.push(EnvVar { key: "access_token".into(), value: token.into(), enabled: true });
+    e.token_expires_at = expires;
+    e.auth_config = Some(AuthRefreshConfig {
+        mode: AuthRefreshMode::ReLogin,
+        auto_refresh_enabled: true,
+        login_endpoint: format!("{base}/login"),
+        login_body_template: "{}".into(),
+        access_token_path: "access_token".into(),
+        ..Default::default()
+    });
+    e
+}
+
+fn run_flow(base: &str, env: Environment) -> Vec<FlowEvent> {
+    let mut st = SavedState::default();
+    st.url = format!("{base}/data");
+    st.auth_type = AuthType::Bearer;
+    st.bearer_token = "{{access_token}}".into();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(run_request(st, Some(env), HashMap::new(), Arc::new(AtomicBool::new(false)), move |e| {
+        sink.lock().unwrap().push(e)
+    }));
+    let v = events.lock().unwrap().clone();
+    v
+}
+
+fn final_status(evs: &[FlowEvent]) -> String {
+    evs.iter().rev().find_map(|e| match e {
+        FlowEvent::Net(ResponseEvent::Response(r)) => Some(r.status.clone()),
+        _ => None,
+    }).unwrap_or_default()
+}
+
+#[test]
+fn flow_logs_in_first_when_there_is_no_token() {
+    let base = auth_server();
+    let evs = run_flow(&base, auth_env(&base, "", None));
+    assert!(matches!(&evs[0], FlowEvent::Token(Ok(o)) if o.access_token == "T1"));
+    assert_eq!(final_status(&evs), "200 OK");
+}
+
+#[test]
+fn flow_retries_once_after_401_and_hides_the_first_failure() {
+    let base = auth_server();
+    // stale token that looks valid (far-future expiry): the server rejects it
+    let evs = run_flow(&base, auth_env(&base, "OLD", Some(i64::MAX / 2)));
+    let statuses: Vec<_> = evs.iter().filter_map(|e| match e {
+        FlowEvent::Net(ResponseEvent::Response(r)) => Some(r.status.clone()), _ => None }).collect();
+    assert_eq!(statuses, vec!["200 OK"], "the 401 must not reach the UI");
+    assert!(evs.iter().any(|e| matches!(e, FlowEvent::Token(Ok(_)))));
+}
+
+#[test]
+fn flow_future_is_send_so_the_ui_can_spawn_it() {
+    fn is_send<T: Send>(_: &T) {}
+    let fut = run_request(SavedState::default(), None, HashMap::new(), Arc::new(AtomicBool::new(false)), |_e| {});
+    is_send(&fut);
+}

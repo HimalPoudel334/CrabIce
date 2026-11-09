@@ -19,9 +19,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::app::App;
 use crate::platform::clipboard::WinClipboard;
+use crate::platform::file_dialog::pick_file;
 use crate::render::Renderer;
 use crate::ui::input::{Key, Mods};
-use crabipie_core::{build_request, execute_request, HttpMethod, ResponseEvent};
+use crabipie_core::{run_request, AuthRefreshOutcome, FlowEvent, ResponseEvent};
 
 // Not in the bindings I target (WM_MOUSELEAVE lives behind the Controls feature).
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -30,14 +31,14 @@ const WM_APP_RESPONSE: u32 = 0x8001; // WM_APP + 1
 const BLINK_TIMER: usize = 1;
 const BLINK_MS: u32 = 530;
 
-struct BridgeMsg {
-    tab_id: usize,
-    ev: ResponseEvent,
+enum BridgeMsg {
+    Net { tab_id: usize, ev: ResponseEvent },
+    Token { env_id: usize, res: std::result::Result<AuthRefreshOutcome, String> },
 }
 
 /// Called from tokio worker threads: hands an engine event to the UI thread.
-fn post_to_ui(hwnd_raw: isize, tab_id: usize, ev: ResponseEvent) {
-    let ptr = Box::into_raw(Box::new(BridgeMsg { tab_id, ev }));
+fn post_to_ui(hwnd_raw: isize, msg: BridgeMsg) {
+    let ptr = Box::into_raw(Box::new(msg));
     let hwnd = HWND(hwnd_raw as *mut c_void);
     if unsafe { PostMessageW(hwnd, WM_APP_RESPONSE, WPARAM(0), LPARAM(ptr as isize)) }.is_err() {
         // window already gone: reclaim the message
@@ -81,12 +82,16 @@ impl Window {
     fn dispatch_sends(&mut self) {
         while let Some(job) = self.app.take_send() {
             let hwnd_raw = self.hwnd.0 as isize;
-            let (tab_id, cancel) = (job.tab_id, job.cancel.clone());
-            let is_head = job.state.method == HttpMethod::HEAD;
-            let (request, url) = build_request(&job.state, None, &job.jar);
+            let tab_id = job.tab_id;
+            let env_id = job.env.as_ref().map(|e| e.id);
             self.rt.spawn(async move {
-                execute_request(request, url, is_head, cancel, move |ev| {
-                    post_to_ui(hwnd_raw, tab_id, ev)
+                run_request(job.state, job.env, job.jar, job.cancel, move |fe| match fe {
+                    FlowEvent::Net(ev) => post_to_ui(hwnd_raw, BridgeMsg::Net { tab_id, ev }),
+                    FlowEvent::Token(res) => {
+                        if let Some(env_id) = env_id {
+                            post_to_ui(hwnd_raw, BridgeMsg::Token { env_id, res })
+                        }
+                    }
                 })
                 .await;
             });
@@ -276,10 +281,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 SetCapture(hwnd);
                 let (x, y) = win.pos(lparam);
                 let shift = key_down(VK_SHIFT.0 as i32);
-                if win.app.on_left_down(&mut win.renderer, x, y, shift) {
+                let mut cb = WinClipboard { hwnd };
+                if win.app.on_left_down(&mut win.renderer, &mut cb, x, y, shift) {
                     win.invalidate();
                 }
                 win.dispatch_sends();
+                if let Some(row) = win.app.take_file_request() {
+                    if let Some(path) = pick_file(hwnd) {
+                        win.app.set_form_file(row, path);
+                        win.invalidate();
+                    }
+                }
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
@@ -347,8 +359,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_APP_RESPONSE => {
-                let m = Box::from_raw(lparam.0 as *mut BridgeMsg);
-                if win.app.on_response(m.tab_id, m.ev) {
+                let repaint = match *Box::from_raw(lparam.0 as *mut BridgeMsg) {
+                    BridgeMsg::Net { tab_id, ev } => win.app.on_response(tab_id, ev),
+                    BridgeMsg::Token { env_id, res } => win.app.on_token(env_id, res),
+                };
+                if repaint {
                     win.invalidate();
                 }
                 LRESULT(0)
