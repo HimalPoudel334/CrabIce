@@ -10,17 +10,12 @@ pub fn resolve_vars(input: &str, env: Option<&Environment>) -> String {
     if !input.contains("{{") {
         return input.to_string();
     }
-    VAR_RE
-        .replace_all(input, |caps: &regex::Captures| {
-            let name = &caps[1];
-            if let Some(resolved) = resolve_dynamic_var(name) {
-                return resolved;
-            }
+    replace_vars(input, |name| {
+        resolve_dynamic_var(name).or_else(|| {
             env.and_then(|e| e.variables.iter().find(|v| v.enabled && v.key == name))
                 .map(|v| v.value.clone())
-                .unwrap_or_else(|| caps[0].to_string())
         })
-        .to_string()
+    })
 }
 
 /// Builds the request for one tab. Returns the builder and the final URL

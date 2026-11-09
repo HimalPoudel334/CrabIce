@@ -316,3 +316,41 @@ fn flow_future_is_send_so_the_ui_can_spawn_it() {
     let fut = run_request(SavedState::default(), None, HashMap::new(), Arc::new(AtomicBool::new(false)), |_e| {});
     is_send(&fut);
 }
+
+#[test]
+fn replace_vars_matches_the_old_regex_on_random_inputs() {
+    let re = regex::Regex::new(r"\{\{([\w$:+-]+)\}\}").unwrap();
+    let alphabet = ["{", "}", "{{", "}}", "a", "B", "_", "$", ":", "+", "-", " ", "é", "1", "日"];
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    for _ in 0..20_000 {
+        let mut s = String::new();
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let len = (seed % 14) as usize;
+        for _ in 0..len {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            s.push_str(alphabet[(seed % alphabet.len() as u64) as usize]);
+        }
+        let expected = re.replace_all(&s, "<$1>").to_string();
+        let got = replace_vars(&s, |n| Some(format!("<{n}>")));
+        assert_eq!(got, expected, "input {s:?}");
+        // unresolved names must be kept verbatim
+        assert_eq!(replace_vars(&s, |_| None), s);
+    }
+}
+
+#[test]
+fn graphql_requests_post_query_variables_and_operation_as_json() {
+    let mut st = SavedState::default();
+    st.url = "x.dev/graphql".into();
+    st.request_type = RequestType::GraphQL;
+    st.graphql_query = "{ me }".into();
+    st.graphql_variables = r#"{"id":1}"#.into();
+    st.graphql_operation = "Q1".into();
+    let (rb, _) = build_request(&st, None, &HashMap::new());
+    let req = rb.build().unwrap();
+    assert_eq!(req.method(), reqwest::Method::POST);
+    let body: serde_json::Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+    assert_eq!(body["query"], "{ me }");
+    assert_eq!(body["variables"]["id"], 1);
+    assert_eq!(body["operationName"], "Q1");
+}

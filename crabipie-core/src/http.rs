@@ -79,7 +79,7 @@ impl RequestHeaders {
     }
 }
 
-pub static HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
+pub static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()

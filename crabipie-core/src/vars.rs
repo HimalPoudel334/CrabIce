@@ -1,6 +1,30 @@
 
-pub static VAR_RE: once_cell::sync::Lazy<regex::Regex> =
-    once_cell::sync::Lazy::new(|| regex::Regex::new(r"\{\{([\w$:+-]+)\}\}").unwrap());
+/// Replaces each `{{name}}` (name = 1+ of alphanumeric, '_', '$', ':', '+', '-')
+/// with `f(name)`; when `f` returns None the original text is kept.
+/// Hand-rolled instead of a regex: the regex engine cost ~460 KiB of binary for this one job.
+pub fn replace_vars(input: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let end = after
+            .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$' | ':' | '+' | '-')))
+            .unwrap_or(after.len());
+        if end > 0 && after[end..].starts_with("}}") {
+            out.push_str(&rest[..start]);
+            match f(&after[..end]) {
+                Some(v) => out.push_str(&v),
+                None => out.push_str(&rest[start..start + end + 4]),
+            }
+            rest = &after[end + 2..];
+        } else {
+            out.push_str(&rest[..start + 1]);
+            rest = &rest[start + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// Built-in dynamic variables, evaluated fresh every time they're resolved
 pub enum DynamicVar {

@@ -1058,7 +1058,6 @@ dependencies = [
  "flate2",
  "futures",
  "futures-util",
- "once_cell",
  "rand 0.8.8",
  "regex",
  "reqwest",

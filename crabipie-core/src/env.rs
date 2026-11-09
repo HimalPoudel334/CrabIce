@@ -81,14 +81,7 @@ impl Environment {
         if !input.contains("{{") {
             return input.to_string();
         }
-        VAR_RE
-            .replace_all(input, |caps: &regex::Captures| {
-                let name = &caps[1];
-                resolve_dynamic_var(name)
-                    .or_else(|| self.get_var(name))
-                    .unwrap_or_else(|| caps[0].to_string())
-            })
-            .to_string()
+        replace_vars(input, |name| resolve_dynamic_var(name).or_else(|| self.get_var(name)))
     }
 }
 

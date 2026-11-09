@@ -40,9 +40,9 @@ pub enum RowKind { Param, Header, Form, EnvVar }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CfgField { LoginEndpoint, RefreshEndpoint, AccessVar, RefreshVar, AccessPath, RefreshPath, ExpiryPath, Ttl }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InputId { EnvName, Cfg(CfgField), Url, Key(RowKind, usize), Val(RowKind, usize), Bearer, User, Pass, ApiName, ApiVal }
+pub enum InputId { GqlOp, EnvName, Cfg(CfgField), Url, Key(RowKind, usize), Val(RowKind, usize), Bearer, User, Pass, ApiName, ApiVal }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AreaId { Body, RawHeaders, RawForm, Resp, LoginBody, RefreshBody }
+pub enum AreaId { GqlQuery, GqlVars, Body, RawHeaders, RawForm, Resp, LoginBody, RefreshBody }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerKind { TabEnv, EnvSelect, AuthMode, LoginMethod, LoginFormat, RefreshMethod, RefreshFormat, ReqType, Method, Content, AuthType, ApiPos, HeadersView, FieldType(usize) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +160,9 @@ pub struct Tab {
     pub headers_area: TextArea,
     pub content_type: ContentType,
     pub body: TextArea,
+    pub gql_query: TextArea,
+    pub gql_vars: TextArea,
+    pub gql_op: TextInput,
     pub form: Vec<KvRow>,
     pub form_raw: bool,
     pub form_area: TextArea,
@@ -200,6 +203,9 @@ impl Tab {
             headers_area: TextArea::new("Header: Value"),
             content_type: ContentType::Json,
             body: TextArea::new("Request body").json(),
+            gql_query: TextArea::new("query { ... }"),
+            gql_vars: TextArea::new("{ \"id\": 1 }").json(),
+            gql_op: input("Operation name (optional)"),
             form: vec![KvRow::empty()],
             form_raw: false,
             form_area: TextArea::new(RAW_FORM_PLACEHOLDER),
@@ -219,6 +225,13 @@ impl Tab {
         };
         t.params_from_url();
         t
+    }
+
+    /// Tab strip label: the URL without its scheme, like a browser tab.
+    pub fn label(&self) -> String {
+        let u = self.url.edit.text().trim();
+        let u = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")).unwrap_or(u);
+        if u.is_empty() { self.title.clone() } else { u.to_string() }
     }
 
     fn rows_mut(&mut self, k: RowKind) -> &mut Vec<KvRow> {
@@ -463,6 +476,7 @@ impl App {
             InputId::Pass => Some(&mut t.password),
             InputId::ApiName => Some(&mut t.api_name),
             InputId::ApiVal => Some(&mut t.api_val),
+            InputId::GqlOp => Some(&mut t.gql_op),
             InputId::EnvName | InputId::Cfg(_) => None, // handled above
         }
     }
@@ -471,6 +485,8 @@ impl App {
         let t = &mut self.tabs[self.active];
         match id {
             AreaId::Body => Some(&mut t.body),
+            AreaId::GqlQuery => Some(&mut t.gql_query),
+            AreaId::GqlVars => Some(&mut t.gql_vars),
             AreaId::RawHeaders => Some(&mut t.headers_area),
             AreaId::RawForm => Some(&mut t.form_area),
             AreaId::Resp => t.resp.as_mut().map(|r| r.area_mut()),
@@ -699,7 +715,7 @@ impl App {
         if t.url.edit.text().trim().is_empty() {
             return;
         }
-        if t.request_type != RequestType::HTTP {
+        if t.request_type == RequestType::WebSocket {
             let mut rs = RespState::empty("Not available yet");
             rs.body.set_text(&format!("{} requests arrive in a later step.", t.request_type));
             t.resp = Some(rs);
@@ -722,6 +738,10 @@ impl App {
         let state = SavedState {
             url: t.url.edit.text().trim().to_string(),
             method: t.method,
+            request_type: t.request_type,
+            graphql_query: t.gql_query.edit.text().to_string(),
+            graphql_variables: t.gql_vars.edit.text().to_string(),
+            graphql_operation: t.gql_op.edit.text().to_string(),
             headers: t.header_list(),
             body: t.body.edit.text().to_string(),
             content_type: t.content_type,
@@ -1243,7 +1263,8 @@ impl App {
         self.paint_title(c, &th);
 
         // tab strip
-        let items: Vec<TabItem> = self.tabs.iter().map(|t| TabItem { title: &t.title, method: t.method }).collect();
+        let labels: Vec<String> = self.tabs.iter().map(|t| t.label()).collect();
+        let items: Vec<TabItem> = self.tabs.iter().zip(&labels).map(|(t, l)| TabItem { title: l, method: t.method }).collect();
         self.bar.paint(c, &th, &items, self.active, wd);
         let n = self.tabs.len();
         for i in 0..n {
@@ -1542,9 +1563,21 @@ impl App {
 
     fn paint_body(&mut self, c: &mut dyn Canvas, th: &Theme, a: Rect) -> f32 {
         let t = self.tab();
-        if t.request_type != RequestType::HTTP {
-            c.text("GraphQL / WebSocket editors arrive in a later step.", Rect::new(a.l, a.t, a.r, a.t + 28.0), th.text_dim, w::UI);
+        if t.request_type == RequestType::WebSocket {
+            c.text("WebSocket arrives in a later step.", Rect::new(a.l, a.t, a.r, a.t + 28.0), th.text_dim, w::UI);
             return a.t + 30.0;
+        }
+        if t.request_type == RequestType::GraphQL {
+            c.text("Operation:", Rect::new(a.l, a.t, a.l + 90.0, a.t + 32.0), th.text, w::UI);
+            self.paint_input(c, InputId::GqlOp, Rect::new(a.l + 94.0, a.t, a.r, a.t + 32.0));
+            let top = a.t + 42.0;
+            let qh = ((a.b - top - 62.0) * 0.6).max(60.0);
+            c.text("Query", Rect::new(a.l, top, a.l + 200.0, top + 24.0), th.accent, w::UI.bold());
+            self.paint_area(c, AreaId::GqlQuery, Rect::new(a.l, top + 28.0, a.r, top + 28.0 + qh));
+            let vy = top + 28.0 + qh + 8.0;
+            c.text("Variables (JSON)", Rect::new(a.l, vy, a.l + 240.0, vy + 24.0), th.accent, w::UI.bold());
+            self.paint_area(c, AreaId::GqlVars, Rect::new(a.l, vy + 28.0, a.r, (a.b).max(vy + 80.0)));
+            return a.b;
         }
         if !matches!(t.method, HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH) {
             c.text("Select POST, PUT, or PATCH to edit body.", Rect::new(a.l, a.t, a.r, a.t + 28.0), th.text, w::UI);
@@ -1579,7 +1612,7 @@ impl App {
         c.text("Type:", Rect::new(a.l, a.t, a.l + 90.0, a.t + 32.0), th.text, w::UI);
         self.paint_picker(c, PickerKind::AuthType, Rect::new(a.l + 94.0, a.t, a.l + 294.0, a.t + 32.0));
         let mut y = a.t + 46.0;
-        let field = |s: &mut Self, c: &mut dyn Canvas, label: &str, id: InputId, y: f32| {
+        let mut field = |s: &mut Self, c: &mut dyn Canvas, label: &str, id: InputId, y: f32| {
             c.text(label, Rect::new(a.l, y, a.l + 90.0, y + ROW_H), th.text, w::UI);
             s.paint_input(c, id, Rect::new(a.l + 94.0, y, a.r, y + ROW_H));
         };
@@ -1822,5 +1855,28 @@ mod tests {
         let out = AuthRefreshOutcome { access_token: "T".into(), refresh_token: None, expires_at: None };
         assert!(h.a.on_token(job.env.unwrap().id, Ok(out)));
         assert_eq!(h.a.envs[0].get_var("access_token").as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn tabs_are_named_after_their_url_and_graphql_requests_carry_their_editors() {
+        let mut h = H::new();
+        assert_eq!(h.a.tab().label(), "jsonplaceholder.typicode.com/posts");
+        h.type_into(InputId::Url, ""); // selects all, types nothing
+        h.a.on_key(Key::Backspace, Mods::default(), &mut h.cb);
+        assert_eq!(h.a.tab().label(), "Request 1");
+        h.type_into(InputId::Url, "http://x.dev/graphql");
+        assert_eq!(h.a.tab().label(), "x.dev/graphql");
+
+        h.pick(PickerKind::ReqType, "GraphQL");
+        h.click(Act::ReqTab(ReqTabKind::Body));
+        h.type_into(InputId::GqlOp, "Q1");
+        h.click(Act::Area(AreaId::GqlQuery));
+        for ch in "{ me }".chars() {
+            h.a.on_char(ch);
+        }
+        h.click(Act::Send);
+        let job = h.a.take_send().unwrap();
+        assert_eq!(job.state.request_type, RequestType::GraphQL);
+        assert_eq!((job.state.graphql_query.as_str(), job.state.graphql_operation.as_str()), ("{ me }", "Q1"));
     }
 }
