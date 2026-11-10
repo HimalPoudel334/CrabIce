@@ -1,6 +1,7 @@
 //! Win32 window: class registration, message loop, WndProc. Translates raw
 //! messages into DIP-space calls on `App` and paints through `Renderer`.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::core::{w, Error, Result};
@@ -22,7 +23,8 @@ use crate::platform::clipboard::WinClipboard;
 use crate::platform::file_dialog::pick_file;
 use crate::render::Renderer;
 use crate::ui::input::{Key, Mods};
-use crabipie_core::{run_request, AuthRefreshOutcome, FlowEvent, ResponseEvent};
+use crabipie_core::{run_request, websocket_stream, AuthRefreshOutcome, FlowEvent, ResponseEvent, WsEvent};
+use futures_util::StreamExt;
 
 // Not in the bindings I target (WM_MOUSELEAVE lives behind the Controls feature).
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -34,6 +36,8 @@ const BLINK_MS: u32 = 530;
 enum BridgeMsg {
     Net { tab_id: usize, ev: ResponseEvent },
     Token { env_id: usize, res: std::result::Result<AuthRefreshOutcome, String> },
+    Ws { tab_id: usize, ev: WsEvent },
+    WsEnded { tab_id: usize },
 }
 
 /// Called from tokio worker threads: hands an engine event to the UI thread.
@@ -54,6 +58,8 @@ struct Window {
     /// First half of a UTF-16 surrogate pair delivered by WM_CHAR.
     high_surrogate: Option<u16>,
     rt: tokio::runtime::Runtime,
+    /// One running socket task per WebSocket tab; aborting it closes the connection.
+    ws_tasks: HashMap<usize, tokio::task::JoinHandle<()>>,
 }
 
 impl Window {
@@ -79,7 +85,36 @@ impl Window {
     }
 
     /// Starts any request the app queued (Send button / Enter).
+    /// Starts/stops socket tasks the app asked for.
+    fn dispatch_ws(&mut self) {
+        use crate::app::WsCmd;
+        for cmd in self.app.take_ws_cmds() {
+            match cmd {
+                WsCmd::Connect { tab_id, url } => {
+                    if let Some(old) = self.ws_tasks.remove(&tab_id) {
+                        old.abort();
+                    }
+                    let hwnd_raw = self.hwnd.0 as isize;
+                    let handle = self.rt.spawn(async move {
+                        let mut stream = Box::pin(websocket_stream(url));
+                        while let Some(ev) = stream.next().await {
+                            post_to_ui(hwnd_raw, BridgeMsg::Ws { tab_id, ev });
+                        }
+                        post_to_ui(hwnd_raw, BridgeMsg::WsEnded { tab_id });
+                    });
+                    self.ws_tasks.insert(tab_id, handle);
+                }
+                WsCmd::Disconnect { tab_id } => {
+                    if let Some(h) = self.ws_tasks.remove(&tab_id) {
+                        h.abort();
+                    }
+                }
+            }
+        }
+    }
+
     fn dispatch_sends(&mut self) {
+        self.dispatch_ws();
         while let Some(job) = self.app.take_send() {
             let hwnd_raw = self.hwnd.0 as isize;
             let tab_id = job.tab_id;
@@ -164,7 +199,8 @@ pub fn run() -> Result<()> {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let app = App::from_disk(&rt);
+        let mut app = App::from_disk(&rt);
+        app.set_clock(crate::platform::clock::local_clock);
 
         let window = Box::new(Window {
             hwnd: HWND::default(),
@@ -173,6 +209,7 @@ pub fn run() -> Result<()> {
             tracking_mouse: false,
             high_surrogate: None,
             rt,
+            ws_tasks: HashMap::new(),
         });
         let ptr = Box::into_raw(window);
 
@@ -362,6 +399,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let repaint = match *Box::from_raw(lparam.0 as *mut BridgeMsg) {
                     BridgeMsg::Net { tab_id, ev } => win.app.on_response(tab_id, ev),
                     BridgeMsg::Token { env_id, res } => win.app.on_token(env_id, res),
+                    BridgeMsg::Ws { tab_id, ev } => win.app.on_ws_event(tab_id, ev),
+                    BridgeMsg::WsEnded { tab_id } => win.app.on_ws_ended(tab_id),
                 };
                 if repaint {
                     win.invalidate();

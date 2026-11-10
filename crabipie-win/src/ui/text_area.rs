@@ -23,6 +23,7 @@ pub struct TextArea {
     follow: bool, // scroll the caret into view on next paint
     readonly: bool,
     highlight: bool,
+    log_mode: bool,
 }
 
 /// Byte ranges of each line (excluding the '\n').
@@ -56,7 +57,14 @@ impl TextArea {
             follow: false,
             readonly: false,
             highlight: false,
+            log_mode: false,
         }
+    }
+
+    /// Color lines as WebSocket log entries (see `log_color`).
+    pub fn log(mut self) -> Self {
+        self.log_mode = true;
+        self
     }
 
     pub fn json(mut self) -> Self {
@@ -78,6 +86,11 @@ impl TextArea {
         self.edit.set_text(s);
         self.edit.set_caret(0, false);
         self.scroll = 0.0;
+    }
+
+    /// Jump to the bottom on the next paint (clamped there), e.g. a live log.
+    pub fn scroll_to_end(&mut self) {
+        self.scroll = f32::MAX;
     }
 
     pub fn append(&mut self, s: &str) {
@@ -275,7 +288,7 @@ impl TextArea {
             c.text(&self.placeholder, Rect::new(x0, rect.t + 6.0, x1, rect.t + 6.0 + LINE_H), theme.text_dim, STYLE);
         }
         let sel = self.edit.selection();
-        let gw = if self.highlight { c.text_width("0", STYLE) } else { 0.0 };
+        let gw = if self.highlight || self.log_mode { c.text_width("0", STYLE) } else { 0.0 };
         let first = (self.scroll / LINE_H) as usize;
         let n = (h / LINE_H) as usize + 2;
         for li in first..(first + n).min(r.len()) {
@@ -292,11 +305,20 @@ impl TextArea {
                     c.fill_rect(Rect::new(xa, y, xb, y + LINE_H), theme.accent.alpha(0.35));
                 }
             }
-            if self.highlight && !line.is_empty() {
-                for (a, b, tok) in super::json_color::tokenize(line) {
+            let colored: Option<Vec<(usize, usize, super::geom::Color)>> = if line.is_empty() {
+                None
+            } else if self.log_mode {
+                Some(super::log_color::tokens(line, theme))
+            } else if self.highlight {
+                Some(super::json_color::tokenize(line).into_iter().map(|(a, b, t)| (a, b, super::json_color::color(t))).collect())
+            } else {
+                None
+            };
+            if let Some(toks) = colored {
+                for (a, b, col) in toks {
                     let xx = x0 + gw * line[..a].chars().count() as f32;
                     let ww = gw * line[a..b].chars().count() as f32 + 6.0;
-                    c.text(&line[a..b], Rect::new(xx, y, xx + ww, y + LINE_H), super::json_color::color(tok), STYLE);
+                    c.text(&line[a..b], Rect::new(xx, y, xx + ww, y + LINE_H), col, STYLE);
                 }
             } else if !line.is_empty() {
                 c.text(line, Rect::new(x0, y, x1, y + LINE_H), theme.text, STYLE);

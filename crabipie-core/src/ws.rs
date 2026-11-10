@@ -20,7 +20,7 @@ enum WebSocketState {
     Disconnected,
     Connected {
         websocket: reqwest_websocket::WebSocket,
-        receiver: futures::channel::mpsc::Receiver<String>,
+        receiver: futures::channel::mpsc::Receiver<WsOut>,
     },
     Failed,
 }
@@ -71,6 +71,10 @@ pub fn websocket_stream(url: String) -> impl futures::Stream<Item = WsEvent> {
                                     Some(WsEvent::MessageReceived(text)),
                                     (WebSocketState::Connected { websocket, receiver }, 0),
                                 )),
+                                Some(Ok(reqwest_websocket::Message::Binary(bytes))) => Some((
+                                    Some(WsEvent::BinaryReceived(bytes.to_vec())),
+                                    (WebSocketState::Connected { websocket, receiver }, 0),
+                                )),
                                 Some(Err(e)) => Some((
                                     Some(WsEvent::Disconnected(format!("{}", e))),
                                     (WebSocketState::Failed, 0),
@@ -86,7 +90,11 @@ pub fn websocket_stream(url: String) -> impl futures::Stream<Item = WsEvent> {
                             }
                         }
                         Some(message) = receiver.next() => {
-                            match websocket.send(reqwest_websocket::Message::Text(message)).await {
+                            let frame = match message {
+                                WsOut::Text(t) => reqwest_websocket::Message::Text(t),
+                                WsOut::Binary(b) => reqwest_websocket::Message::Binary(b.into()),
+                            };
+                            match websocket.send(frame).await {
                                 // A successful send produces no event.
                                 Ok(_) => Some((
                                     None,

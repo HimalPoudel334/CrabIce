@@ -3,6 +3,7 @@ pub mod geom;
 pub mod input;
 pub mod json_color;
 pub mod json_fmt;
+pub mod log_color;
 pub mod tab_bar;
 pub mod text_area;
 pub mod text_edit;

@@ -354,3 +354,18 @@ fn graphql_requests_post_query_variables_and_operation_as_json() {
     assert_eq!(body["variables"]["id"], 1);
     assert_eq!(body["operationName"], "Q1");
 }
+
+#[test]
+fn ws_payloads_follow_the_chosen_message_type() {
+    use WsBinaryMessageType::*;
+    use WsMessageType::*;
+    assert_eq!(encode_ws_payload(Text, Base64, "hi").unwrap(), WsPayload::Text("hi".into()));
+    assert_eq!(encode_ws_payload(HTML, Base64, "<b>x</b>").unwrap(), WsPayload::Text("<b>x</b>".into()));
+    assert!(encode_ws_payload(Json, Base64, "{bad").unwrap_err().starts_with("Invalid JSON"));
+    assert_eq!(encode_ws_payload(Json, Base64, r#"{"a":1}"#).unwrap(), WsPayload::Text(r#"{"a":1}"#.into()));
+    assert_eq!(encode_ws_payload(Binary, Base64, "SGk=").unwrap(), WsPayload::Binary(vec![72, 105]));
+    assert_eq!(encode_ws_payload(Binary, HexaDecimal, "0x48 69").unwrap(), WsPayload::Binary(vec![72, 105]));
+    assert!(encode_ws_payload(Binary, HexaDecimal, "4").is_err());
+    assert!(encode_ws_payload(Binary, HexaDecimal, "zz").is_err());
+    assert_eq!(hex_dump(&[1, 2, 255], 2), "01 02 …");
+}

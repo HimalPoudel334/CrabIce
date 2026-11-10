@@ -18,10 +18,11 @@ use crate::ui::text_input::TextInput;
 use crate::ui::theme::Theme;
 use crate::ui::widgets as w;
 use crabipie_core::{
-    apply_auth_refresh_outcome, form_data_to_raw, format_duration, headers_to_raw, merge_set_cookies, parse_url_query, raw_to_form_data,
+    apply_auth_refresh_outcome, extract_domain, form_data_to_raw, format_duration, headers_to_raw, merge_set_cookies, parse_url_query, raw_to_form_data,
     raw_to_headers, rebuild_url, ApiKeyPosition, AuthType, ContentType, CookieEntry, FormField, FormFieldType,
     AuthBodyFormat, AuthHttpMethod, AuthRefreshConfig, AuthRefreshMode, AuthRefreshOutcome, EnvVar, Environment,
-    HttpMethod, HttpResponse, QueryParam, RequestHeaders, RequestType, ResponseEvent, SavedState,
+    HttpMethod, HttpResponse, QueryParam, WsBinaryMessageType, WsConnection, WsEvent, WsMessageType, WsPayload,
+    encode_ws_payload, hex_dump, RequestHeaders, RequestType, ResponseEvent, SavedState,
     RAW_FORM_PLACEHOLDER,
 };
 
@@ -40,11 +41,11 @@ pub enum RowKind { Param, Header, Form, EnvVar }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CfgField { LoginEndpoint, RefreshEndpoint, AccessVar, RefreshVar, AccessPath, RefreshPath, ExpiryPath, Ttl }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InputId { GqlOp, EnvName, Cfg(CfgField), Url, Key(RowKind, usize), Val(RowKind, usize), Bearer, User, Pass, ApiName, ApiVal }
+pub enum InputId { CkDomain, CkName, CkValue, WsMsg, GqlOp, EnvName, Cfg(CfgField), Url, Key(RowKind, usize), Val(RowKind, usize), Bearer, User, Pass, ApiName, ApiVal }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AreaId { GqlQuery, GqlVars, Body, RawHeaders, RawForm, Resp, LoginBody, RefreshBody }
+pub enum AreaId { WsLog, GqlQuery, GqlVars, Body, RawHeaders, RawForm, Resp, LoginBody, RefreshBody }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PickerKind { TabEnv, EnvSelect, AuthMode, LoginMethod, LoginFormat, RefreshMethod, RefreshFormat, ReqType, Method, Content, AuthType, ApiPos, HeadersView, FieldType(usize) }
+pub enum PickerKind { AppTheme, WsType, WsBin, TabEnv, EnvSelect, AuthMode, LoginMethod, LoginFormat, RefreshMethod, RefreshFormat, ReqType, Method, Content, AuthType, ApiPos, HeadersView, FieldType(usize) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus { None, Input(InputId), Area(AreaId) }
 
@@ -69,6 +70,13 @@ pub enum Act {
     PrettifyResp,
     ClearResp,
     ChooseFile(usize),
+    WsSend,
+    OpenCookies,
+    CloseCookies,
+    CookieAdd,
+    CookiesClear,
+    CookieCheck(usize, usize),
+    CookieRemove(usize, usize),
     OpenEnv,
     CloseEnv,
     NewEnv,
@@ -79,13 +87,28 @@ pub enum Act {
 
 struct Modal { sel: usize, auth_open: bool }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsState { Disconnected, Connecting, Connected }
+
+/// Work for the window layer, which owns the runtime and the socket tasks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsCmd {
+    Connect { tab_id: usize, url: String },
+    Disconnect { tab_id: usize },
+}
+
 struct Hot { rect: Rect, act: Act }
 
-struct Popup { kind: PickerKind, button: Rect, items: Vec<String>, current: usize, hover: Option<usize> }
+struct Popup { kind: PickerKind, button: Rect, items: Vec<String>, current: usize, hover: Option<usize>, up: bool }
 
 impl Popup {
     fn item_rect(&self, i: usize) -> Rect {
-        let t = self.button.b + 2.0 + i as f32 * 28.0;
+        let n = self.items.len() as f32;
+        let t = if self.up {
+            self.button.t - 2.0 - n * 28.0 + i as f32 * 28.0
+        } else {
+            self.button.b + 2.0 + i as f32 * 28.0
+        };
         Rect::new(self.button.l, t, self.button.l + self.button.width().max(130.0), t + 28.0)
     }
     fn hit(&self, x: f32, y: f32) -> Option<usize> {
@@ -163,6 +186,14 @@ pub struct Tab {
     pub gql_query: TextArea,
     pub gql_vars: TextArea,
     pub gql_op: TextInput,
+    pub ws_state: WsState,
+    pub ws_conn: Option<WsConnection>,
+    pub ws_log: TextArea,
+    pub ws_msg: TextInput,
+    pub ws_type: WsMessageType,
+    pub ws_bin: WsBinaryMessageType,
+    pub ws_sent: usize,
+    pub ws_recv: usize,
     pub form: Vec<KvRow>,
     pub form_raw: bool,
     pub form_area: TextArea,
@@ -206,6 +237,14 @@ impl Tab {
             gql_query: TextArea::new("query { ... }"),
             gql_vars: TextArea::new("{ \"id\": 1 }").json(),
             gql_op: input("Operation name (optional)"),
+            ws_state: WsState::Disconnected,
+            ws_conn: None,
+            ws_log: TextArea::readonly("(no messages yet)").log(),
+            ws_msg: input("Type message..."),
+            ws_type: WsMessageType::Text,
+            ws_bin: WsBinaryMessageType::Base64,
+            ws_sent: 0,
+            ws_recv: 0,
             form: vec![KvRow::empty()],
             form_raw: false,
             form_area: TextArea::new(RAW_FORM_PLACEHOLDER),
@@ -380,6 +419,19 @@ pub struct App {
     modal_scroll: f32,
     modal_content_h: f32,
     modal_view_h: f32,
+    ws_cmds: Vec<WsCmd>,
+    cookie_modal: bool,
+    ck_domain: TextInput,
+    ck_name: TextInput,
+    ck_value: TextInput,
+    clock: fn() -> (u8, u8, u8, u16),
+}
+
+/// Default clock (UTC); the window layer swaps in local time.
+fn utc_clock() -> (u8, u8, u8, u16) {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let s = d.as_secs() % 86_400;
+    ((s / 3600) as u8, ((s % 3600) / 60) as u8, (s % 60) as u8, d.subsec_millis() as u16)
 }
 
 impl App {
@@ -424,6 +476,12 @@ impl App {
             modal_scroll: 0.0,
             modal_content_h: 0.0,
             modal_view_h: 0.0,
+            ws_cmds: Vec::new(),
+            cookie_modal: false,
+            ck_domain: input("example.com"),
+            ck_name: input("name"),
+            ck_value: input("value"),
+            clock: utc_clock,
         }
     }
 
@@ -461,6 +519,9 @@ impl App {
     fn input_mut(&mut self, id: InputId) -> Option<&mut TextInput> {
         match id {
             InputId::EnvName => return Some(&mut self.env_name),
+            InputId::CkDomain => return Some(&mut self.ck_domain),
+            InputId::CkName => return Some(&mut self.ck_name),
+            InputId::CkValue => return Some(&mut self.ck_value),
             InputId::Cfg(f) => return self.cfg_in.get_mut(f as usize),
             InputId::Key(RowKind::EnvVar, i) => return self.env_rows.get_mut(i).map(|r| &mut r.key),
             InputId::Val(RowKind::EnvVar, i) => return self.env_rows.get_mut(i).map(|r| &mut r.value),
@@ -477,7 +538,8 @@ impl App {
             InputId::ApiName => Some(&mut t.api_name),
             InputId::ApiVal => Some(&mut t.api_val),
             InputId::GqlOp => Some(&mut t.gql_op),
-            InputId::EnvName | InputId::Cfg(_) => None, // handled above
+            InputId::WsMsg => Some(&mut t.ws_msg),
+            InputId::EnvName | InputId::Cfg(_) | InputId::CkDomain | InputId::CkName | InputId::CkValue => None, // handled above
         }
     }
 
@@ -486,6 +548,7 @@ impl App {
         match id {
             AreaId::Body => Some(&mut t.body),
             AreaId::GqlQuery => Some(&mut t.gql_query),
+            AreaId::WsLog => Some(&mut t.ws_log),
             AreaId::GqlVars => Some(&mut t.gql_vars),
             AreaId::RawHeaders => Some(&mut t.headers_area),
             AreaId::RawForm => Some(&mut t.form_area),
@@ -682,6 +745,7 @@ impl App {
         }
         self.set_focus(Focus::None);
         self.tabs[i].cancel.store(true, Ordering::Relaxed);
+        self.ws_disconnect_ix(i);
         if self.tabs.len() == 1 {
             // Never leave the window empty: reset in place (same id, no counting up).
             let id = self.tabs[0].id;
@@ -705,6 +769,10 @@ impl App {
     // ── requests ────────────────────────────────────────────────────
 
     fn trigger_send(&mut self) {
+        if self.tab().request_type == RequestType::WebSocket {
+            self.ws_toggle();
+            return;
+        }
         let t = self.tab_mut();
         if t.sending {
             if t.streaming {
@@ -715,9 +783,9 @@ impl App {
         if t.url.edit.text().trim().is_empty() {
             return;
         }
-        if t.request_type == RequestType::WebSocket {
+        if t.request_type == RequestType::GRPC {
             let mut rs = RespState::empty("Not available yet");
-            rs.body.set_text(&format!("{} requests arrive in a later step.", t.request_type));
+            rs.body.set_text("gRPC support is not implemented yet.");
             t.resp = Some(rs);
             return;
         }
@@ -801,6 +869,190 @@ impl App {
         rs
     }
 
+    // ── cookie manager ──────────────────────────────────────────────
+
+    fn any_modal(&self) -> bool {
+        self.modal.is_some() || self.cookie_modal
+    }
+
+    fn sorted_domains(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.jar.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn cookie_at(&mut self, d: usize, i: usize) -> Option<&mut CookieEntry> {
+        let dom = self.sorted_domains().get(d)?.clone();
+        self.jar.get_mut(&dom)?.get_mut(i)
+    }
+
+    /// Adds (or replaces, by name) a cookie for the typed domain.
+    fn cookie_add(&mut self) {
+        let raw = self.ck_domain.edit.text().trim().to_string();
+        let name = self.ck_name.edit.text().trim().to_string();
+        if raw.is_empty() || name.is_empty() {
+            return;
+        }
+        let domain = if raw.contains("://") {
+            extract_domain(&raw).unwrap_or_else(|| raw.clone())
+        } else {
+            raw.trim_matches('/').to_string()
+        };
+        let entry = CookieEntry {
+            name: name.clone(),
+            value: self.ck_value.edit.text().to_string(),
+            enabled: true,
+            domain: domain.clone(),
+            path: "/".into(),
+            expires: None,
+        };
+        let list = self.jar.entry(domain).or_default();
+        match list.iter_mut().find(|c| c.name == name) {
+            Some(existing) => *existing = entry,
+            None => list.push(entry),
+        }
+        self.ck_name.edit.set_text("");
+        self.ck_value.edit.set_text("");
+    }
+
+    // ── websocket ───────────────────────────────────────────────────
+
+    pub fn set_clock(&mut self, f: fn() -> (u8, u8, u8, u16)) {
+        self.clock = f;
+    }
+
+    fn stamp(&self) -> String {
+        let (h, m, s, ms) = (self.clock)();
+        format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+    }
+
+    fn log_line(t: &mut Tab, line: &str) {
+        t.ws_log.append(line);
+        t.ws_log.append("\n");
+        t.ws_log.scroll_to_end();
+    }
+
+    fn ws_toggle(&mut self) {
+        let ix = self.active;
+        if self.tabs[ix].ws_state != WsState::Disconnected {
+            self.ws_disconnect_ix(ix);
+            return;
+        }
+        let raw = self.tabs[ix].url.edit.text().trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        let url = if raw.contains("://") { raw } else { format!("wss://{raw}") };
+        let ts = self.stamp();
+        let t = &mut self.tabs[ix];
+        t.ws_state = WsState::Connecting;
+        Self::log_line(t, &format!("{ts} … Connecting to {url}"));
+        let tab_id = t.id;
+        self.ws_cmds.push(WsCmd::Connect { tab_id, url });
+    }
+
+    fn ws_disconnect_ix(&mut self, ix: usize) {
+        if self.tabs[ix].ws_state == WsState::Disconnected {
+            return;
+        }
+        let ts = self.stamp();
+        let t = &mut self.tabs[ix];
+        t.ws_state = WsState::Disconnected;
+        t.ws_conn = None;
+        Self::log_line(t, &format!("{ts} ○ Disconnected"));
+        let tab_id = t.id;
+        self.ws_cmds.push(WsCmd::Disconnect { tab_id });
+    }
+
+    /// Sends the composer's text, encoded per the chosen message type.
+    fn ws_send(&mut self) {
+        let ts = self.stamp();
+        let t = self.tab_mut();
+        if t.ws_state != WsState::Connected {
+            return;
+        }
+        let text = t.ws_msg.edit.text().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let payload = match encode_ws_payload(t.ws_type, t.ws_bin, &text) {
+            Ok(p) => p,
+            Err(e) => {
+                Self::log_line(t, &format!("{ts} ! {e}"));
+                return;
+            }
+        };
+        let sent: Result<(), String> = match (&payload, t.ws_conn.as_mut()) {
+            (_, None) => Err("not connected".to_string()),
+            (WsPayload::Text(s), Some(c)) => c.send(s.clone()),
+            (WsPayload::Binary(b), Some(c)) => c.send_binary(b.clone()),
+        };
+        match sent {
+            Ok(()) => {
+                let shown = match &payload {
+                    WsPayload::Binary(b) => format!("[Binary] {} bytes: {}", b.len(), hex_dump(b, 32)),
+                    WsPayload::Text(s) => match t.ws_type {
+                        WsMessageType::Json => format!("[Json] {s}"),
+                        WsMessageType::HTML => format!("[HTML] {s}"),
+                        _ => s.clone(),
+                    },
+                };
+                Self::log_line(t, &format!("{ts} → {shown}"));
+                t.ws_sent += 1;
+                t.ws_msg.edit.set_text("");
+            }
+            Err(e) => Self::log_line(t, &format!("{ts} ! send failed: {e}")),
+        }
+    }
+
+    /// Socket commands the window layer must carry out.
+    pub fn take_ws_cmds(&mut self) -> Vec<WsCmd> {
+        std::mem::take(&mut self.ws_cmds)
+    }
+
+    /// Events from a socket task. Late events after a user disconnect are ignored.
+    pub fn on_ws_event(&mut self, tab_id: usize, ev: WsEvent) -> bool {
+        let ts = self.stamp();
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return false };
+        if t.ws_state == WsState::Disconnected {
+            return false;
+        }
+        match ev {
+            WsEvent::Connected(conn) => {
+                t.ws_state = WsState::Connected;
+                t.ws_conn = Some(conn);
+                Self::log_line(t, &format!("{ts} ● Connected"));
+            }
+            WsEvent::MessageReceived(s) => {
+                t.ws_recv += 1;
+                let body = json_fmt::pretty(&s).unwrap_or(s);
+                Self::log_line(t, &format!("{ts} ← {body}"));
+            }
+            WsEvent::BinaryReceived(b) => {
+                t.ws_recv += 1;
+                Self::log_line(t, &format!("{ts} ← [binary {} bytes] {}", b.len(), hex_dump(&b, 32)));
+            }
+            WsEvent::Disconnected(r) => {
+                t.ws_state = WsState::Disconnected;
+                t.ws_conn = None;
+                Self::log_line(t, &format!("{ts} ○ Disconnected: {r}"));
+            }
+            WsEvent::Error(e) => Self::log_line(t, &format!("{ts} ! {e}")),
+        }
+        true
+    }
+
+    /// The socket task finished (retries exhausted or connection closed).
+    pub fn on_ws_ended(&mut self, tab_id: usize) -> bool {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return false };
+        if t.ws_state == WsState::Disconnected {
+            return false;
+        }
+        t.ws_state = WsState::Disconnected;
+        t.ws_conn = None;
+        true
+    }
+
     pub fn take_file_request(&mut self) -> Option<usize> {
         self.file_request.take()
     }
@@ -825,6 +1077,9 @@ impl App {
             PickerKind::AuthType => (names(&AuthType::ALL), AuthType::ALL.iter().position(|x| *x == t.auth_type).unwrap_or(0)),
             PickerKind::ApiPos => (names(&ApiKeyPosition::ALL), ApiKeyPosition::ALL.iter().position(|x| *x == t.api_pos).unwrap_or(0)),
             PickerKind::HeadersView => (vec!["Formatted".into(), "Raw".into()], t.headers_raw as usize),
+            PickerKind::AppTheme => (Theme::NAMES.iter().map(|n| n.to_string()).collect(), Theme::NAMES.iter().position(|n| *n == self.theme.name).unwrap_or(0)),
+            PickerKind::WsType => (names(&WsMessageType::ALL), WsMessageType::ALL.iter().position(|x| *x == t.ws_type).unwrap_or(0)),
+            PickerKind::WsBin => (names(&WsBinaryMessageType::ALL), WsBinaryMessageType::ALL.iter().position(|x| *x == t.ws_bin).unwrap_or(0)),
             PickerKind::TabEnv => {
                 let mut v = vec!["No Environment".to_string()];
                 v.extend(self.envs.iter().map(|e| e.name.clone()));
@@ -846,9 +1101,30 @@ impl App {
 
     fn apply_picker(&mut self, k: PickerKind, idx: usize) {
         match k {
+            PickerKind::AppTheme => {
+                self.theme = Theme::named(Theme::NAMES[idx]);
+                return;
+            }
+            PickerKind::WsType => {
+                self.tab_mut().ws_type = WsMessageType::ALL[idx];
+                return;
+            }
+            PickerKind::WsBin => {
+                self.tab_mut().ws_bin = WsBinaryMessageType::ALL[idx];
+                return;
+            }
             PickerKind::TabEnv => {
                 let id = if idx == 0 { None } else { self.envs.get(idx - 1).map(|e| e.id) };
                 self.tab_mut().env_id = id;
+                return;
+            }
+            PickerKind::ReqType => {
+                let ix = self.active;
+                let new = RequestType::ALL[idx];
+                if self.tabs[ix].request_type == RequestType::WebSocket && new != RequestType::WebSocket {
+                    self.ws_disconnect_ix(ix);
+                }
+                self.tabs[ix].request_type = new;
                 return;
             }
             PickerKind::EnvSelect => {
@@ -898,7 +1174,8 @@ impl App {
             Act::NewTab => self.new_tab(),
             Act::Picker(k) => {
                 let (items, current) = self.picker_items(k);
-                self.popup = Some(Popup { kind: k, button: rect, items, current, hover: None });
+                let up = rect.b + 2.0 + items.len() as f32 * 28.0 > self.height;
+                self.popup = Some(Popup { kind: k, button: rect, items, current, hover: None, up });
             }
             Act::Send => self.trigger_send(),
             Act::ReqTab(k) => {
@@ -932,7 +1209,34 @@ impl App {
                 }
             }
             Act::Add(k) => self.rows_of(k).push(KvRow::empty()),
+            Act::WsSend => self.ws_send(),
+            Act::OpenCookies => {
+                self.modal = None;
+                self.cookie_modal = true;
+                self.modal_scroll = 0.0;
+            }
+            Act::CloseCookies => self.cookie_modal = false,
+            Act::CookieAdd => self.cookie_add(),
+            Act::CookiesClear => self.jar.clear(),
+            Act::CookieCheck(d, i) => {
+                if let Some(c) = self.cookie_at(d, i) {
+                    c.enabled = !c.enabled;
+                }
+            }
+            Act::CookieRemove(d, i) => {
+                if let Some(dom) = self.sorted_domains().get(d).cloned() {
+                    if let Some(v) = self.jar.get_mut(&dom) {
+                        if i < v.len() {
+                            v.remove(i);
+                        }
+                        if v.is_empty() {
+                            self.jar.remove(&dom);
+                        }
+                    }
+                }
+            }
             Act::OpenEnv => {
+                self.cookie_modal = false;
                 let sel = self.tab().env_id.and_then(|id| self.envs.iter().position(|e| e.id == id)).unwrap_or(0);
                 self.modal = Some(Modal { sel, auth_open: false });
                 self.modal_scroll = 0.0;
@@ -991,7 +1295,9 @@ impl App {
                 t.set_form_raw(raw);
             }
             Act::CopyResp => {
-                if let Some(r) = self.tab().resp.as_ref() {
+                if self.tab().request_type == RequestType::WebSocket {
+                    cb.set_text(self.tab().ws_log.edit.text());
+                } else if let Some(r) = self.tab().resp.as_ref() {
                     cb.set_text(r.body.edit.text());
                 }
             }
@@ -1005,7 +1311,11 @@ impl App {
             }
             Act::ClearResp => {
                 let t = self.tab_mut();
-                if !t.sending {
+                if t.request_type == RequestType::WebSocket {
+                    t.ws_log.set_text("");
+                    t.ws_sent = 0;
+                    t.ws_recv = 0;
+                } else if !t.sending {
                     t.resp = None;
                 }
             }
@@ -1016,7 +1326,7 @@ impl App {
     // ── mouse (coordinates in DIPs) ─────────────────────────────────
 
     fn hot_at(&self, x: f32, y: f32) -> Option<(Act, Rect)> {
-        let from = if self.modal.is_some() { self.modal_hot_from.min(self.hot.len()) } else { 0 };
+        let from = if self.any_modal() { self.modal_hot_from.min(self.hot.len()) } else { 0 };
         self.hot[from..].iter().rev().find(|h| h.rect.contains(x, y)).map(|h| (h.act, h.rect))
     }
 
@@ -1134,7 +1444,7 @@ impl App {
         if let Some((Act::Area(id), _)) = self.hot_at(x, y) {
             return self.area_mut(id).map_or(false, |a| a.wheel(notches));
         }
-        if self.modal.is_some() {
+        if self.any_modal() {
             let max = (self.modal_content_h - self.modal_view_h).max(0.0);
             let before = self.modal_scroll;
             self.modal_scroll = (self.modal_scroll - notches * 54.0).clamp(0.0, max);
@@ -1157,7 +1467,7 @@ impl App {
     // ── keyboard ────────────────────────────────────────────────────
 
     pub fn on_key(&mut self, key: Key, mods: Mods, cb: &mut dyn Clipboard) -> bool {
-        if mods.ctrl && self.modal.is_none() {
+        if mods.ctrl && !self.any_modal() {
             match key {
                 Key::Letter('T') => {
                     self.new_tab();
@@ -1175,13 +1485,18 @@ impl App {
             if self.popup.take().is_some() {
                 return true;
             }
-            if self.modal.is_some() {
+            if self.any_modal() {
                 if !self.set_focus(Focus::None) {
                     self.modal = None;
+                    self.cookie_modal = false;
                 }
                 return true;
             }
             return self.set_focus(Focus::None);
+        }
+        if key == Key::Enter && self.focus == Focus::Input(InputId::WsMsg) {
+            self.ws_send();
+            return true;
         }
         if key == Key::Enter && self.focus == Focus::Input(InputId::Url) {
             self.trigger_send();
@@ -1276,32 +1591,54 @@ impl App {
 
         // request row
         self.paint_picker(c, PickerKind::ReqType, Rect::xywh(10.0, 92.0, 110.0, 38.0));
-        self.paint_picker(c, PickerKind::Method, Rect::xywh(130.0, 92.0, 100.0, 38.0));
+        let ws = self.tab().request_type == RequestType::WebSocket;
+        if !ws {
+            self.paint_picker(c, PickerKind::Method, Rect::xywh(130.0, 92.0, 100.0, 38.0));
+        }
         let send = Rect::new((wd - 110.0).max(240.0), 92.0, (wd - 10.0).max(340.0), 130.0);
-        self.paint_input(c, InputId::Url, Rect::new(240.0, 92.0, (send.l - 10.0).max(250.0), 130.0));
-        let (label, primary) = match (self.tab().sending, self.tab().streaming) {
-            (true, true) => ("Cancel", false),
-            (true, false) => ("Sending…", false),
-            _ => ("Send", true),
+        let url_l = if ws { 130.0 } else { 240.0 };
+        self.paint_input(c, InputId::Url, Rect::new(url_l, 92.0, (send.l - 10.0).max(url_l + 10.0), 130.0));
+        let (label, primary) = if ws {
+            match self.tab().ws_state {
+                WsState::Disconnected => ("Connect", true),
+                WsState::Connecting => ("Connecting…", false),
+                WsState::Connected => ("Disconnect", false),
+            }
+        } else {
+            match (self.tab().sending, self.tab().streaming) {
+                (true, true) => ("Cancel", false),
+                (true, false) => ("Sending…", false),
+                _ => ("Send", true),
+            }
         };
-        w::button(c, &th, send, label, primary);
+        if ws && self.tab().ws_state == WsState::Connected {
+            c.fill_rect(send, th.danger);
+            c.text(label, send, th.on_accent, w::UI.align(Align::Center));
+        } else {
+            w::button(c, &th, send, label, primary);
+        }
         self.push_hot(send, Act::Send);
-
         // panels
         let (top, bottom, mid) = (142.0, (ht - 10.0).max(200.0), wd / 2.0);
         self.req_panel = Rect::new(10.0, top, (mid - 5.0).max(200.0), bottom);
         self.resp_panel = Rect::new((mid + 5.0).max(210.0), top, (wd - 10.0).max(400.0), bottom);
-        let (rp, sp) = (self.req_panel, self.resp_panel);
-        self.paint_request_panel(c, &th, rp);
-        self.paint_response_panel(c, &th, sp);
+        if ws {
+            self.paint_ws_view(c, &th);
+        } else {
+            let (rp, sp) = (self.req_panel, self.resp_panel);
+            self.paint_request_panel(c, &th, rp);
+            self.paint_response_panel(c, &th, sp);
+        }
 
         if self.modal.is_some() {
             self.paint_modal(c, &th);
+        } else if self.cookie_modal {
+            self.paint_cookie_modal(c, &th);
         }
 
         // popup last, on top of everything
         if let Some(p) = &self.popup {
-            let all = Rect::new(p.item_rect(0).l, p.button.b + 2.0, p.item_rect(0).r, p.button.b + 2.0 + p.items.len() as f32 * 28.0);
+            let all = Rect::new(p.item_rect(0).l, p.item_rect(0).t, p.item_rect(0).r, p.item_rect(p.items.len() - 1).b);
             c.fill_rect(all, th.surface);
             for (i, name) in p.items.iter().enumerate() {
                 let r = p.item_rect(i);
@@ -1438,6 +1775,105 @@ impl App {
         y
     }
 
+    /// Full-width WebSocket view: big log, counters, compact composer at the bottom.
+    fn paint_cookie_modal(&mut self, c: &mut dyn Canvas, th: &Theme) {
+        let (wd, ht) = (self.width, self.height);
+        c.fill_rect(Rect::new(0.0, 0.0, wd, ht), Color::hex(0x000000).alpha(0.6));
+        let dw = (wd - 80.0).clamp(480.0, 900.0);
+        let dh = (ht - 80.0).clamp(300.0, 720.0);
+        let d = Rect::xywh((wd - dw) / 2.0, (ht - dh) / 2.0, dw, dh);
+        self.modal_hot_from = self.hot.len();
+        self.push_hot(d, Act::Stub);
+        c.fill_rect(d, th.bg);
+        c.stroke_rect(d.inset(0.5), th.accent, 1.0);
+        c.text("Cookies", Rect::new(d.l + 14.0, d.t + 10.0, d.l + 300.0, d.t + 38.0), th.text, TextStyle::new(16.0).bold());
+        let close = Rect::new(d.r - 92.0, d.t + 8.0, d.r - 12.0, d.t + 38.0);
+        w::button(c, th, close, "Close", false);
+        self.push_hot(close, Act::CloseCookies);
+        let clear = Rect::new(d.r - 204.0, d.t + 8.0, d.r - 100.0, d.t + 38.0);
+        c.fill_rect(clear, th.surface);
+        c.text("Clear all", clear, th.danger, w::UI.align(Align::Center));
+        self.push_hot(clear, Act::CookiesClear);
+        w::rule(c, th, d.l + 8.0, d.r - 8.0, d.t + 48.0);
+
+        let y = d.t + 58.0;
+        c.text("Domain:", Rect::new(d.l + 14.0, y, d.l + 84.0, y + ROW_H), th.text, w::UI);
+        self.paint_input(c, InputId::CkDomain, Rect::new(d.l + 88.0, y, d.r - 14.0, y + ROW_H));
+        let y2 = y + ROW_STEP;
+        c.text("Name:", Rect::new(d.l + 14.0, y2, d.l + 70.0, y2 + ROW_H), th.text, w::UI);
+        self.paint_input(c, InputId::CkName, Rect::new(d.l + 74.0, y2, d.l + 300.0, y2 + ROW_H));
+        c.text("Value:", Rect::new(d.l + 310.0, y2, d.l + 366.0, y2 + ROW_H), th.text, w::UI);
+        let add = Rect::new(d.r - 94.0, y2, d.r - 14.0, y2 + ROW_H);
+        self.paint_input(c, InputId::CkValue, Rect::new(d.l + 370.0, y2, add.l - 8.0, y2 + ROW_H));
+        w::button(c, th, add, "Add", true);
+        self.push_hot(add, Act::CookieAdd);
+
+        let content = Rect::new(d.l + 14.0, y2 + 52.0, d.r - 14.0, d.b - 10.0);
+        self.modal_view_h = content.height();
+        c.push_clip(content);
+        self.clip = Some(content);
+        let top = content.t - self.modal_scroll;
+        let mut y = top;
+        let domains = self.sorted_domains();
+        if domains.is_empty() {
+            c.text("No cookies yet. Cookies set by responses appear here automatically.", Rect::new(content.l, y, content.r, y + 28.0), th.text_dim, w::UI);
+            y += 30.0;
+        }
+        for (di, dom) in domains.iter().enumerate() {
+            c.text(dom, Rect::new(content.l, y, content.r, y + 26.0), th.accent, w::UI.bold());
+            y += 28.0;
+            let list = self.jar.get(dom).cloned().unwrap_or_default();
+            for (i, ck) in list.iter().enumerate() {
+                let cb = Rect::xywh(content.l + 2.0, y + 9.0, 16.0, 16.0);
+                w::checkbox(c, th, cb, ck.enabled);
+                self.push_hot(cb.inset(-5.0), Act::CookieCheck(di, i));
+                let nw = (content.width() * 0.3).max(100.0);
+                let col = if ck.enabled { th.text } else { th.text_dim };
+                c.text(&ck.name, Rect::new(content.l + 26.0, y, content.l + 26.0 + nw, y + ROW_H), col, w::UI.bold());
+                c.text(&ck.value, Rect::new(content.l + 34.0 + nw, y, content.r - 34.0, y + ROW_H), col, w::UI);
+                let rm = Rect::new(content.r - 28.0, y + 5.0, content.r - 4.0, y + 29.0);
+                w::cross(c, rm, th.danger);
+                self.push_hot(rm, Act::CookieRemove(di, i));
+                y += ROW_H + 2.0;
+            }
+            y += 8.0;
+        }
+        self.modal_content_h = y - top;
+        self.clip = None;
+        c.pop_clip();
+    }
+
+    fn paint_ws_view(&mut self, c: &mut dyn Canvas, th: &Theme) {
+        let (wd, ht) = (self.width, self.height);
+        let bottom = (ht - 10.0).max(300.0);
+        let comp = Rect::new(10.0, bottom - 38.0, (wd - 10.0).max(300.0), bottom);
+        let stats = Rect::new(10.0, comp.t - 26.0, comp.r, comp.t - 4.0);
+        let log = Rect::new(10.0, 142.0, comp.r, stats.t - 4.0);
+        self.paint_area(c, AreaId::WsLog, log);
+        let (sent, recv) = (self.tab().ws_sent, self.tab().ws_recv);
+        c.text(&format!("Sent: {sent} | Received: {recv}"), stats, th.text_dim, TextStyle::new(12.0).align(Align::Center));
+        let mut ix = stats.r;
+        for (glyph, act) in [("⌫", Act::ClearResp), ("⧉", Act::CopyResp)] {
+            let r = Rect::new(ix - 30.0, stats.t - 4.0, ix, stats.b + 2.0);
+            c.text(glyph, r, th.text, TextStyle::new(15.0).align(Align::Center));
+            self.push_hot(r, act);
+            ix -= 34.0;
+        }
+
+        let mut x = comp.l;
+        self.paint_picker(c, PickerKind::WsType, Rect::new(x, comp.t, x + 96.0, comp.b));
+        x += 104.0;
+        if self.tab().ws_type == WsMessageType::Binary {
+            self.paint_picker(c, PickerKind::WsBin, Rect::new(x, comp.t, x + 130.0, comp.b));
+            x += 138.0;
+        }
+        let send = Rect::new(comp.r - 84.0, comp.t, comp.r, comp.b);
+        self.paint_input(c, InputId::WsMsg, Rect::new(x, comp.t, send.l - 8.0, comp.b));
+        let ready = self.tab().ws_state == WsState::Connected && !self.tab().ws_msg.edit.is_empty();
+        w::button(c, th, send, "Send", ready);
+        self.push_hot(send, Act::WsSend);
+    }
+
     fn paint_title(&mut self, c: &mut dyn Canvas, th: &Theme) {
         let wd = self.width;
         c.text("▶", Rect::xywh(10.0, 8.0, 26.0, 30.0), th.accent, TextStyle::new(14.0).align(Align::Center));
@@ -1452,10 +1888,9 @@ impl App {
             self.push_hot(r, Act::Stub);
             x -= 52.0;
         }
-        let theme = Rect::new(x - 180.0, 8.0, x, 38.0);
-        w::picker(c, th, theme, "Catppuccin Mocha", false);
-        self.push_hot(theme, Act::Stub);
-        x -= 188.0;
+        let theme = Rect::new(x - 200.0, 8.0, x, 38.0);
+        self.paint_picker(c, PickerKind::AppTheme, theme);
+        x -= 208.0;
         c.text("App theme", Rect::new(x - 80.0, 8.0, x, 38.0), th.text, w::UI);
         x -= 92.0;
         let gear = Rect::new(x - 26.0, 8.0, x, 38.0);
@@ -1470,8 +1905,8 @@ impl App {
         c.stroke_rect(p.inset(0.5), th.accent.alpha(0.6), 1.0);
         c.text("Request", Rect::new(p.l + 8.0, p.t + 6.0, p.l + 120.0, p.t + 30.0), th.text, w::UI);
         let cookie = Rect::new(p.r - 130.0, p.t + 6.0, p.r - 8.0, p.t + 30.0);
-        c.text("Add Cookie", cookie, th.text, w::UI.align(Align::Right));
-        self.push_hot(cookie, Act::Stub);
+        c.text("Add Cookie", cookie, th.accent, w::UI.align(Align::Right));
+        self.push_hot(cookie, Act::OpenCookies);
         w::rule(c, th, p.l + 5.0, p.r - 5.0, p.t + 36.0);
 
         let seg = Rect::new(p.l + 5.0, p.t + 46.0, p.r - 5.0, p.t + 86.0);
@@ -1878,5 +2313,76 @@ mod tests {
         let job = h.a.take_send().unwrap();
         assert_eq!(job.state.request_type, RequestType::GraphQL);
         assert_eq!((job.state.graphql_query.as_str(), job.state.graphql_operation.as_str()), ("{ me }", "Q1"));
+    }
+
+    #[test]
+    fn websocket_types_timestamps_and_counters() {
+        use crabipie_core::WsOut;
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "WebSocket");
+        h.type_into(InputId::Url, "echo.test/ws");
+        h.click(Act::Send);
+        assert_eq!(h.a.tab().ws_state, WsState::Connecting);
+        let cmds = h.a.take_ws_cmds();
+        assert!(matches!(&cmds[..], [WsCmd::Connect { url, .. }] if url == "wss://echo.test/ws"));
+
+        let id = h.a.tab().id;
+        let (tx, mut rx) = futures::channel::mpsc::channel::<WsOut>(8);
+        assert!(h.a.on_ws_event(id, WsEvent::Connected(WsConnection(tx))));
+        h.repaint();
+
+        h.type_into(InputId::WsMsg, "hi");
+        h.click(Act::WsSend);
+        assert!(matches!(rx.try_next(), Ok(Some(WsOut::Text(s))) if s == "hi"));
+        assert!(h.a.tab().ws_msg.edit.is_empty(), "input clears after sending");
+
+        h.pick(PickerKind::WsType, "Json");
+        h.type_into(InputId::WsMsg, "{bad");
+        h.click(Act::WsSend);
+        assert!(rx.try_next().is_err(), "invalid JSON is not sent");
+
+        h.pick(PickerKind::WsType, "Binary");
+        h.type_into(InputId::WsMsg, "SGk=");
+        h.click(Act::WsSend);
+        assert!(matches!(rx.try_next(), Ok(Some(WsOut::Binary(b))) if b == vec![72u8, 105]));
+
+        h.a.on_ws_event(id, WsEvent::MessageReceived(r#"{"a":1}"#.into()));
+        h.a.on_ws_event(id, WsEvent::BinaryReceived(vec![1, 2]));
+        assert_eq!((h.a.tab().ws_sent, h.a.tab().ws_recv), (2, 2));
+
+        let text = h.a.tab().ws_log.edit.text().to_string();
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| if l.len() >= 13 && l.as_bytes()[2] == b':' { l[13..].to_string() } else { l.to_string() })
+            .collect();
+        assert!(lines.iter().any(|l| l == "→ hi"));
+        assert!(lines.iter().any(|l| l.starts_with("! Invalid JSON")));
+        assert!(lines.iter().any(|l| l == "→ [Binary] 2 bytes: 48 69"));
+        assert!(lines.iter().any(|l| l == "← {"), "received JSON is pretty-printed");
+        assert!(lines.iter().any(|l| l == "← [binary 2 bytes] 01 02"));
+
+        h.click(Act::Send); // now says Disconnect
+        assert_eq!(h.a.tab().ws_state, WsState::Disconnected);
+        assert!(matches!(&h.a.take_ws_cmds()[..], [WsCmd::Disconnect { .. }]));
+        assert!(!h.a.on_ws_event(id, WsEvent::MessageReceived("late".into())));
+    }
+
+    #[test]
+    fn cookie_manager_and_theme_picker() {
+        let mut h = H::new();
+        h.pick(PickerKind::AppTheme, "Nord");
+        assert_eq!(h.a.theme.name, "Nord");
+        h.click(Act::OpenCookies);
+        h.type_into(InputId::CkDomain, "https://api.x.dev/path");
+        h.type_into(InputId::CkName, "sid");
+        h.type_into(InputId::CkValue, "42");
+        h.click(Act::CookieAdd);
+        assert_eq!(h.a.jar["api.x.dev"][0].value, "42");
+        h.click(Act::CookieCheck(0, 0));
+        assert!(!h.a.jar["api.x.dev"][0].enabled);
+        h.click(Act::CookieRemove(0, 0));
+        assert!(h.a.jar.is_empty());
+        h.click(Act::CloseCookies);
+        assert!(!h.a.cookie_modal);
     }
 }
