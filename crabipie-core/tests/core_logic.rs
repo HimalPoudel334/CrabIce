@@ -369,3 +369,24 @@ fn ws_payloads_follow_the_chosen_message_type() {
     assert!(encode_ws_payload(Binary, HexaDecimal, "zz").is_err());
     assert_eq!(hex_dump(&[1, 2, 255], 2), "01 02 …");
 }
+
+const GQL_SCHEMA: &str = r#"{"data":{"__schema":{"queryType":{"name":"Query"},"types":[
+ {"name":"Query","kind":"OBJECT","fields":[{"name":"users","type":{"name":null,"kind":"LIST","ofType":{"name":"User","kind":"OBJECT","ofType":null}},"args":[{"name":"first","type":{"name":"Int","kind":"SCALAR","ofType":null}}]}],"inputFields":null},
+ {"name":"User","kind":"OBJECT","fields":[{"name":"id","type":{"name":null,"kind":"NON_NULL","ofType":{"name":"Int","kind":"SCALAR","ofType":null}},"args":[]},{"name":"name","type":{"name":"String","kind":"SCALAR","ofType":null},"args":[]}],"inputFields":null},
+ {"name":"Int","kind":"SCALAR","fields":null,"inputFields":null},
+ {"name":"String","kind":"SCALAR","fields":null,"inputFields":null}]}}}"#;
+
+#[test]
+fn graphql_document_includes_selected_fields_arguments_and_variable_declarations() {
+    let schema = parse_graphql_schema(GQL_SCHEMA).unwrap();
+    let mut sel: std::collections::HashSet<String> = ["Query", "Query.users", "Query.users.id"].iter().map(|s| s.to_string()).collect();
+    let doc = build_graphql_document(&schema, &sel);
+    assert_eq!(doc, "query {\n  users {\n    id\n  }\n}");
+    assert!(variables_template(&schema, &sel).is_none());
+
+    sel.insert("Query.users.arg:first".into());
+    let doc = build_graphql_document(&schema, &sel);
+    assert!(doc.starts_with("query ($first: Int) {"), "{doc}");
+    assert!(doc.contains("users(first: $first) {"), "{doc}");
+    assert_eq!(variables_template(&schema, &sel).unwrap(), "{\n  \"first\": null\n}");
+}

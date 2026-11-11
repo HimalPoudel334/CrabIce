@@ -4,13 +4,14 @@
 //! Painting registers clickable regions (`hot`) as it goes; mouse events are
 //! resolved against that list, so layout lives in exactly one place.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ui::canvas::{Align, Canvas, TextMeasure, TextStyle};
 use crate::ui::geom::{Color, Rect};
 use crate::ui::input::{Clipboard, Key, Mods};
+use crate::ui::gql_tree::{self, TreeRow};
 use crate::ui::json_fmt;
 use crate::ui::tab_bar::{Hit, TabBar, TabItem};
 use crate::ui::text_area::TextArea;
@@ -22,7 +23,7 @@ use crabipie_core::{
     raw_to_headers, rebuild_url, ApiKeyPosition, AuthType, ContentType, CookieEntry, FormField, FormFieldType,
     AuthBodyFormat, AuthHttpMethod, AuthRefreshConfig, AuthRefreshMode, AuthRefreshOutcome, EnvVar, Environment,
     HttpMethod, HttpResponse, QueryParam, WsBinaryMessageType, WsConnection, WsEvent, WsMessageType, WsPayload,
-    encode_ws_payload, hex_dump, RequestHeaders, RequestType, ResponseEvent, SavedState,
+    build_graphql_document, encode_ws_payload, hex_dump, variables_template, GraphqlSchema, RequestHeaders, RequestType, ResponseEvent, SavedState,
     RAW_FORM_PLACEHOLDER,
 };
 
@@ -41,7 +42,7 @@ pub enum RowKind { Param, Header, Form, EnvVar }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CfgField { LoginEndpoint, RefreshEndpoint, AccessVar, RefreshVar, AccessPath, RefreshPath, ExpiryPath, Ttl }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InputId { CkDomain, CkName, CkValue, WsMsg, GqlOp, EnvName, Cfg(CfgField), Url, Key(RowKind, usize), Val(RowKind, usize), Bearer, User, Pass, ApiName, ApiVal }
+pub enum InputId { GqlSearch, CkDomain, CkName, CkValue, WsMsg, GqlOp, EnvName, Cfg(CfgField), Url, Key(RowKind, usize), Val(RowKind, usize), Bearer, User, Pass, ApiName, ApiVal }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AreaId { WsLog, GqlQuery, GqlVars, Body, RawHeaders, RawForm, Resp, LoginBody, RefreshBody }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +72,10 @@ pub enum Act {
     ClearResp,
     ChooseFile(usize),
     WsSend,
+    GqlFetch,
+    GqlCollapse,
+    GqlExpand(usize),
+    GqlCheck(usize),
     OpenCookies,
     CloseCookies,
     CookieAdd,
@@ -186,6 +191,14 @@ pub struct Tab {
     pub gql_query: TextArea,
     pub gql_vars: TextArea,
     pub gql_op: TextInput,
+    pub gql_schema: Option<GraphqlSchema>,
+    pub gql_loading: bool,
+    pub gql_error: Option<String>,
+    pub gql_expanded: HashSet<String>,
+    pub gql_selected: HashSet<String>,
+    pub gql_manual: HashSet<String>,
+    pub gql_search: TextInput,
+    pub gql_scroll: f32,
     pub ws_state: WsState,
     pub ws_conn: Option<WsConnection>,
     pub ws_log: TextArea,
@@ -236,7 +249,15 @@ impl Tab {
             body: TextArea::new("Request body").json(),
             gql_query: TextArea::new("query { ... }"),
             gql_vars: TextArea::new("{ \"id\": 1 }").json(),
-            gql_op: input("Operation name (optional)"),
+            gql_op: input("optional"),
+            gql_schema: None,
+            gql_loading: false,
+            gql_error: None,
+            gql_expanded: HashSet::new(),
+            gql_selected: HashSet::new(),
+            gql_manual: HashSet::new(),
+            gql_search: input("Search fields"),
+            gql_scroll: 0.0,
             ws_state: WsState::Disconnected,
             ws_conn: None,
             ws_log: TextArea::readonly("(no messages yet)").log(),
@@ -376,6 +397,14 @@ impl Tab {
     }
 }
 
+/// Introspection request for the schema browser (run by the window layer).
+pub struct GqlJob {
+    pub tab_id: usize,
+    pub state: SavedState,
+    pub env: Option<Environment>,
+    pub jar: HashMap<String, Vec<CookieEntry>>,
+}
+
 /// What the window layer must run: build + execute this request on the runtime.
 pub struct SendJob {
     pub tab_id: usize,
@@ -420,6 +449,9 @@ pub struct App {
     modal_content_h: f32,
     modal_view_h: f32,
     ws_cmds: Vec<WsCmd>,
+    gql_rows: Vec<TreeRow>,
+    gql_tree_rect: Rect,
+    gql_jobs: Vec<GqlJob>,
     cookie_modal: bool,
     ck_domain: TextInput,
     ck_name: TextInput,
@@ -477,6 +509,9 @@ impl App {
             modal_content_h: 0.0,
             modal_view_h: 0.0,
             ws_cmds: Vec::new(),
+            gql_rows: Vec::new(),
+            gql_tree_rect: Rect::default(),
+            gql_jobs: Vec::new(),
             cookie_modal: false,
             ck_domain: input("example.com"),
             ck_name: input("name"),
@@ -538,6 +573,7 @@ impl App {
             InputId::ApiName => Some(&mut t.api_name),
             InputId::ApiVal => Some(&mut t.api_val),
             InputId::GqlOp => Some(&mut t.gql_op),
+            InputId::GqlSearch => Some(&mut t.gql_search),
             InputId::WsMsg => Some(&mut t.ws_msg),
             InputId::EnvName | InputId::Cfg(_) | InputId::CkDomain | InputId::CkName | InputId::CkValue => None, // handled above
         }
@@ -867,6 +903,77 @@ impl App {
         rs.headers.set_text(&r.headers);
         rs.elapsed = r.response_time;
         rs
+    }
+
+    // ── graphql schema browser ──────────────────────────────────────
+
+    fn gql_fetch(&mut self) {
+        let ix = self.active;
+        if self.tabs[ix].gql_loading || self.tabs[ix].url.edit.text().trim().is_empty() {
+            return;
+        }
+        let env = self.tabs[ix].env_id.and_then(|id| self.envs.iter().find(|e| e.id == id).cloned());
+        let jar = self.jar.clone();
+        let t = &mut self.tabs[ix];
+        let state = SavedState {
+            url: t.url.edit.text().trim().to_string(),
+            method: HttpMethod::POST,
+            request_type: RequestType::GraphQL,
+            headers: t.header_list(),
+            auth_type: t.auth_type,
+            username: t.username.edit.text().to_string(),
+            password: t.password.edit.text().to_string(),
+            bearer_token: t.bearer.edit.text().to_string(),
+            api_key_name: t.api_name.edit.text().to_string(),
+            api_key: t.api_val.edit.text().to_string(),
+            api_key_position: t.api_pos,
+            ..SavedState::default()
+        };
+        t.gql_loading = true;
+        t.gql_error = None;
+        let tab_id = t.id;
+        self.gql_jobs.push(GqlJob { tab_id, state, env, jar });
+    }
+
+    pub fn take_gql_jobs(&mut self) -> Vec<GqlJob> {
+        std::mem::take(&mut self.gql_jobs)
+    }
+
+    /// Introspection finished. The root type starts expanded.
+    pub fn on_schema(&mut self, tab_id: usize, res: Result<GraphqlSchema, String>) -> bool {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return false };
+        t.gql_loading = false;
+        match res {
+            Ok(schema) => {
+                t.gql_expanded.clear();
+                t.gql_expanded.insert(schema.query_type.name.clone());
+                t.gql_selected.clear();
+                t.gql_manual.clear();
+                t.gql_scroll = 0.0;
+                t.gql_schema = Some(schema);
+                t.gql_error = None;
+            }
+            Err(e) => t.gql_error = Some(e),
+        }
+        true
+    }
+
+    /// A tree checkbox was clicked: update the selection and rewrite the query text.
+    fn gql_check(&mut self, i: usize) {
+        let Some(path) = self.gql_rows.get(i).map(|r| r.path.clone()) else { return };
+        let t = self.tab_mut();
+        gql_tree::toggle(&mut t.gql_selected, &mut t.gql_manual, &path);
+        let Some(schema) = t.gql_schema.as_ref() else { return };
+        let doc = build_graphql_document(schema, &t.gql_selected);
+        let vars = variables_template(schema, &t.gql_selected);
+        t.gql_query.edit.select_all();
+        t.gql_query.edit.insert(&doc);
+        // seed the Variables editor only when it is empty (never overwrite the user's values)
+        if let Some(v) = vars {
+            if t.gql_vars.edit.text().trim().is_empty() {
+                t.gql_vars.set_text(&v);
+            }
+        }
     }
 
     // ── cookie manager ──────────────────────────────────────────────
@@ -1210,6 +1317,26 @@ impl App {
             }
             Act::Add(k) => self.rows_of(k).push(KvRow::empty()),
             Act::WsSend => self.ws_send(),
+            Act::GqlFetch => self.gql_fetch(),
+            Act::GqlCollapse => {
+                let t = self.tab_mut();
+                t.gql_expanded.clear();
+                t.gql_scroll = 0.0;
+            }
+            Act::GqlExpand(i) => {
+                let path = if i == usize::MAX {
+                    self.tab().gql_schema.as_ref().map(|s| s.query_type.name.clone())
+                } else {
+                    self.gql_rows.get(i).map(|r| r.path.clone())
+                };
+                if let Some(path) = path {
+                    let t = self.tab_mut();
+                    if !t.gql_expanded.remove(&path) {
+                        t.gql_expanded.insert(path);
+                    }
+                }
+            }
+            Act::GqlCheck(i) => self.gql_check(i),
             Act::OpenCookies => {
                 self.modal = None;
                 self.cookie_modal = true;
@@ -1450,6 +1577,12 @@ impl App {
             self.modal_scroll = (self.modal_scroll - notches * 54.0).clamp(0.0, max);
             return before != self.modal_scroll;
         }
+        if self.gql_tree_rect.contains(x, y) {
+            let t = self.tab_mut();
+            let before = t.gql_scroll;
+            t.gql_scroll = (t.gql_scroll - notches * 66.0).max(0.0); // upper bound is clamped when painting
+            return before != t.gql_scroll;
+        }
         if self.req_panel.contains(x, y) {
             let max = (self.req_content_h - self.req_view_h).max(0.0);
             let before = self.req_scroll;
@@ -1571,6 +1704,7 @@ impl App {
     pub fn paint(&mut self, c: &mut dyn Canvas) {
         self.hot.clear();
         self.clip = None;
+        self.gql_tree_rect = Rect::default();
         let th = self.theme.clone();
         let (wd, ht) = (self.width, self.height);
         c.fill_rect(Rect::new(0.0, 0.0, wd, ht), th.bg);
@@ -1776,6 +1910,113 @@ impl App {
     }
 
     /// Full-width WebSocket view: big log, counters, compact composer at the bottom.
+    /// GraphQL body: schema tree on the left, Operation / Query / Variables on the right.
+    fn paint_gql(&mut self, c: &mut dyn Canvas, th: &Theme, a: Rect) {
+        let tw = (a.width() * 0.4).clamp(200.0, 270.0);
+        let left_r = a.l + tw;
+        self.paint_input(c, InputId::GqlSearch, Rect::new(a.l, a.t, left_r - 70.0, a.t + 32.0));
+        let mut x = left_r - 66.0;
+        for (glyph, act) in [("⇕", Act::GqlCollapse), ("↻", Act::GqlFetch)] {
+            let r = Rect::new(x, a.t, x + 30.0, a.t + 32.0);
+            c.text(glyph, r, th.text, TextStyle::new(16.0).align(Align::Center));
+            self.push_hot(r, act);
+            x += 34.0;
+        }
+        let tree = Rect::new(a.l, a.t + 40.0, left_r, a.b);
+        self.gql_tree_rect = tree;
+        self.paint_gql_tree(c, th, tree);
+        c.line((left_r + 5.0, a.t), (left_r + 5.0, a.b), th.border, 1.0);
+
+        let r = Rect::new(left_r + 12.0, a.t, a.r, a.b);
+        c.text("Operation:", Rect::new(r.l, r.t, r.l + 84.0, r.t + 32.0), th.text, w::UI);
+        self.paint_input(c, InputId::GqlOp, Rect::new(r.l + 88.0, r.t, r.r, r.t + 32.0));
+        let top = r.t + 40.0;
+        let qh = ((r.b - top - 60.0) * 0.6).max(60.0);
+        c.text("Query:", Rect::new(r.l, top, r.l + 200.0, top + 24.0), th.text, TextStyle::new(13.0));
+        self.paint_area(c, AreaId::GqlQuery, Rect::new(r.l, top + 26.0, r.r, top + 26.0 + qh));
+        let vy = top + 26.0 + qh + 8.0;
+        c.text("Variables (JSON):", Rect::new(r.l, vy, r.l + 240.0, vy + 24.0), th.text, TextStyle::new(13.0));
+        self.paint_area(c, AreaId::GqlVars, Rect::new(r.l, vy + 26.0, r.r, r.b.max(vy + 80.0)));
+    }
+
+    fn paint_gql_tree(&mut self, c: &mut dyn Canvas, th: &Theme, tree: Rect) {
+        const RH: f32 = 22.0;
+        let orange = Color::hex(0xe68019);
+        if self.tabs[self.active].gql_schema.is_none() {
+            self.gql_rows.clear();
+            let t = &self.tabs[self.active];
+            let (line1, line2, col) = if t.gql_loading {
+                ("Fetching schema…".to_string(), String::new(), th.text_dim)
+            } else if let Some(e) = &t.gql_error {
+                ("Schema fetch failed".to_string(), e.clone(), th.danger)
+            } else {
+                ("Press ↻ to fetch the schema".to_string(), String::new(), th.text_dim)
+            };
+            c.text(&line1, Rect::new(tree.l + 4.0, tree.t, tree.r, tree.t + 26.0), col, w::UI);
+            if !line2.is_empty() {
+                c.text(&line2, Rect::new(tree.l + 4.0, tree.t + 26.0, tree.r, tree.t + 50.0), th.text_dim, TextStyle::new(12.0));
+            }
+            return;
+        }
+        // build the visible rows with an immutable borrow, then paint with a mutable one
+        let (root_name, root_open, rows) = {
+            let t = &self.tabs[self.active];
+            let schema = t.gql_schema.as_ref().unwrap();
+            let root_name = schema.query_type.name.clone();
+            let open = t.gql_expanded.contains(&root_name);
+            let mut rows = Vec::new();
+            if open {
+                if let Some(rt) = schema.types.iter().find(|x| x.name.as_deref() == Some(root_name.as_str())) {
+                    gql_tree::flatten(&schema.types, rt, &t.gql_expanded, &t.gql_selected, t.gql_search.edit.text(), 1, &root_name, &mut rows);
+                }
+            }
+            (root_name, open, rows)
+        };
+        self.gql_rows = rows;
+        let total = (self.gql_rows.len() as f32 + 1.0) * RH;
+        let max = (total - tree.height()).max(0.0);
+        let scroll = self.tabs[self.active].gql_scroll.clamp(0.0, max);
+        self.tabs[self.active].gql_scroll = scroll;
+
+        c.push_clip(tree);
+        let saved = self.clip;
+        self.clip = Some(tree);
+        let y0 = tree.t - scroll;
+        let root_row = Rect::new(tree.l, y0, tree.r, y0 + RH);
+        c.text(if root_open { "▼" } else { "▶" }, Rect::new(tree.l + 2.0, y0, tree.l + 18.0, y0 + RH), th.text, TextStyle::new(10.0).align(Align::Center));
+        c.text(&root_name, Rect::new(tree.l + 22.0, y0, tree.r, y0 + RH), th.text, w::UI);
+        self.push_hot(root_row, Act::GqlExpand(usize::MAX));
+
+        let n = self.gql_rows.len();
+        let start = ((scroll / RH) as usize).saturating_sub(1).min(n);
+        let end = (start + (tree.height() / RH) as usize + 3).min(n);
+        for i in start..end {
+            let row = self.gql_rows[i].clone();
+            let ry = y0 + (i as f32 + 1.0) * RH;
+            let x0 = tree.l + 14.0 * row.depth as f32;
+            if row.expandable {
+                let ar = Rect::new(x0, ry, x0 + 18.0, ry + RH);
+                c.text(if row.expanded { "▼" } else { "▶" }, ar, th.text_dim, TextStyle::new(10.0).align(Align::Center));
+                self.push_hot(ar, Act::GqlExpand(i));
+            }
+            let cb = Rect::xywh(x0 + 20.0, ry + 4.0, 14.0, 14.0);
+            w::checkbox(c, th, cb, row.selected);
+            self.push_hot(cb.inset(-4.0), Act::GqlCheck(i));
+            let nx = x0 + 40.0;
+            let name_col = if row.is_arg { orange } else { th.text };
+            let nw = c.text_width(&row.name, w::UI);
+            c.text(&row.name, Rect::new(nx, ry, tree.r, ry + RH), name_col, w::UI);
+            c.text(&row.ty, Rect::new(nx + nw + 6.0, ry, tree.r, ry + RH), th.text_dim, TextStyle::new(12.0));
+        }
+        if max > 0.0 {
+            let h = (tree.height() * tree.height() / total).max(24.0);
+            let ty = tree.t + (tree.height() - h) * (scroll / max);
+            c.fill_rect(Rect::new(tree.r - 6.0, ty, tree.r - 2.0, ty + h), th.text_dim.alpha(0.5));
+        }
+        self.clip = saved;
+        c.pop_clip();
+    }
+
     fn paint_cookie_modal(&mut self, c: &mut dyn Canvas, th: &Theme) {
         let (wd, ht) = (self.width, self.height);
         c.fill_rect(Rect::new(0.0, 0.0, wd, ht), Color::hex(0x000000).alpha(0.6));
@@ -2003,15 +2244,7 @@ impl App {
             return a.t + 30.0;
         }
         if t.request_type == RequestType::GraphQL {
-            c.text("Operation:", Rect::new(a.l, a.t, a.l + 90.0, a.t + 32.0), th.text, w::UI);
-            self.paint_input(c, InputId::GqlOp, Rect::new(a.l + 94.0, a.t, a.r, a.t + 32.0));
-            let top = a.t + 42.0;
-            let qh = ((a.b - top - 62.0) * 0.6).max(60.0);
-            c.text("Query", Rect::new(a.l, top, a.l + 200.0, top + 24.0), th.accent, w::UI.bold());
-            self.paint_area(c, AreaId::GqlQuery, Rect::new(a.l, top + 28.0, a.r, top + 28.0 + qh));
-            let vy = top + 28.0 + qh + 8.0;
-            c.text("Variables (JSON)", Rect::new(a.l, vy, a.l + 240.0, vy + 24.0), th.accent, w::UI.bold());
-            self.paint_area(c, AreaId::GqlVars, Rect::new(a.l, vy + 28.0, a.r, (a.b).max(vy + 80.0)));
+            self.paint_gql(c, th, a);
             return a.b;
         }
         if !matches!(t.method, HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH) {
@@ -2384,5 +2617,26 @@ mod tests {
         assert!(h.a.jar.is_empty());
         h.click(Act::CloseCookies);
         assert!(!h.a.cookie_modal);
+    }
+
+    #[test]
+    fn graphql_schema_tree_checkboxes_write_the_query() {
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "GraphQL");
+        h.click(Act::ReqTab(ReqTabKind::Body));
+        h.click(Act::GqlFetch);
+        let jobs = h.a.take_gql_jobs();
+        assert_eq!(jobs.len(), 1);
+        let schema = crabipie_core::parse_graphql_schema(crate::ui::gql_tree::TEST_SCHEMA).unwrap();
+        assert!(h.a.on_schema(jobs[0].tab_id, Ok(schema)));
+        h.repaint();
+        h.click(Act::GqlExpand(0)); // users: reveals its argument and fields
+        h.click(Act::GqlCheck(2)); // rows: users(0), arg: first(1), id(2), name(3)
+        let q = h.a.tab().gql_query.edit.text().to_string();
+        assert_eq!(q, "query {\n  users {\n    id\n  }\n}");
+        h.click(Act::GqlCheck(1)); // the `first` argument
+        let q = h.a.tab().gql_query.edit.text().to_string();
+        assert!(q.starts_with("query ($first: Int) {") && q.contains("users(first: $first) {"), "{q}");
+        assert!(h.a.tab().gql_vars.edit.text().contains("\"first\""));
     }
 }

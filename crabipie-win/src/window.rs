@@ -23,7 +23,7 @@ use crate::platform::clipboard::WinClipboard;
 use crate::platform::file_dialog::pick_file;
 use crate::render::Renderer;
 use crate::ui::input::{Key, Mods};
-use crabipie_core::{run_request, websocket_stream, AuthRefreshOutcome, FlowEvent, ResponseEvent, WsEvent};
+use crabipie_core::{fetch_schema, run_request, websocket_stream, GraphqlSchema, AuthRefreshOutcome, FlowEvent, ResponseEvent, WsEvent};
 use futures_util::StreamExt;
 
 // Not in the bindings I target (WM_MOUSELEAVE lives behind the Controls feature).
@@ -38,6 +38,7 @@ enum BridgeMsg {
     Token { env_id: usize, res: std::result::Result<AuthRefreshOutcome, String> },
     Ws { tab_id: usize, ev: WsEvent },
     WsEnded { tab_id: usize },
+    Schema { tab_id: usize, res: std::result::Result<GraphqlSchema, String> },
 }
 
 /// Called from tokio worker threads: hands an engine event to the UI thread.
@@ -113,8 +114,21 @@ impl Window {
         }
     }
 
+    /// Runs schema introspection requests the app queued.
+    fn dispatch_gql(&mut self) {
+        for job in self.app.take_gql_jobs() {
+            let hwnd_raw = self.hwnd.0 as isize;
+            let tab_id = job.tab_id;
+            self.rt.spawn(async move {
+                let res = fetch_schema(job.state, job.env, job.jar).await;
+                post_to_ui(hwnd_raw, BridgeMsg::Schema { tab_id, res });
+            });
+        }
+    }
+
     fn dispatch_sends(&mut self) {
         self.dispatch_ws();
+        self.dispatch_gql();
         while let Some(job) = self.app.take_send() {
             let hwnd_raw = self.hwnd.0 as isize;
             let tab_id = job.tab_id;
@@ -401,6 +415,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     BridgeMsg::Token { env_id, res } => win.app.on_token(env_id, res),
                     BridgeMsg::Ws { tab_id, ev } => win.app.on_ws_event(tab_id, ev),
                     BridgeMsg::WsEnded { tab_id } => win.app.on_ws_ended(tab_id),
+                    BridgeMsg::Schema { tab_id, res } => win.app.on_schema(tab_id, res),
                 };
                 if repaint {
                     win.invalidate();

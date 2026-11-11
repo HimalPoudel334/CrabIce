@@ -1,6 +1,7 @@
 pub mod canvas;
 pub mod geom;
 pub mod input;
+pub mod gql_tree;
 pub mod json_color;
 pub mod json_fmt;
 pub mod log_color;

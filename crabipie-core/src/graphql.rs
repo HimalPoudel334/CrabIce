@@ -262,3 +262,77 @@ pub fn generate_variables(
     }
     variables
 }
+
+// ───────────── schema browser support ─────────────
+
+use std::collections::{HashMap, HashSet};
+
+/// Variable definitions for the selected arguments, de-duplicated by name.
+fn variable_defs(schema: &GraphqlSchema, selected: &HashSet<String>) -> Vec<(String, String)> {
+    let root = &schema.query_type.name;
+    let Some(rt) = schema.types.iter().find(|t| t.name.as_deref() == Some(root.as_str())) else {
+        return Vec::new();
+    };
+    let raw = generate_variables(&schema.types, rt, selected, root);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let l = line.trim().trim_start_matches('$');
+        if let Some((n, t)) = l.split_once(':') {
+            let (n, t) = (n.trim().to_string(), t.trim().to_string());
+            if !n.is_empty() && seen.insert(n.clone()) {
+                out.push((n, t));
+            }
+        }
+    }
+    out
+}
+
+/// The full query text for the tree's checkbox selection, including the
+/// `($name: Type)` declarations that selected arguments require.
+pub fn build_graphql_document(schema: &GraphqlSchema, selected: &HashSet<String>) -> String {
+    let root = &schema.query_type.name;
+    let Some(rt) = schema.types.iter().find(|t| t.name.as_deref() == Some(root.as_str())) else {
+        return "query {\n}".to_string();
+    };
+    let body = generate_selection_set(&schema.types, rt, selected, 1, root);
+    let defs = variable_defs(schema, selected);
+    let header = if defs.is_empty() {
+        "query {".to_string()
+    } else {
+        let list: Vec<String> = defs.iter().map(|(n, t)| format!("${n}: {t}")).collect();
+        format!("query ({}) {{", list.join(", "))
+    };
+    format!("{header}\n{body}}}")
+}
+
+/// `{ "first": null }` skeleton for the selected arguments (None if there are none).
+pub fn variables_template(schema: &GraphqlSchema, selected: &HashSet<String>) -> Option<String> {
+    let defs = variable_defs(schema, selected);
+    if defs.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = defs.iter().map(|(n, _)| format!("  \"{n}\": null")).collect();
+    Some(format!("{{\n{}\n}}", lines.join(",\n")))
+}
+
+/// Runs the introspection query against the tab's endpoint, using its
+/// headers, auth and environment (the iced app sent it bare).
+pub async fn fetch_schema(
+    mut state: crate::SavedState,
+    env: Option<crate::Environment>,
+    jar: HashMap<String, Vec<crate::CookieEntry>>,
+) -> Result<GraphqlSchema, String> {
+    state.request_type = crate::RequestType::GraphQL;
+    state.graphql_query = crate::INTROSPECTION_QUERY.to_string();
+    state.graphql_variables = String::new();
+    state.graphql_operation = String::new();
+    let (request, _url) = crate::build_request(&state, env.as_ref(), &jar);
+    let resp = request.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {}", text.chars().take(200).collect::<String>()));
+    }
+    parse_graphql_schema(&text)
+}
