@@ -165,13 +165,6 @@ impl Renderer {
         }
     }
 
-    pub fn clear(&self, c: Color) {
-        if let Some(rt) = &self.rt {
-            let col = d_color(c);
-            unsafe { rt.Clear(Some(&col as *const D2D1_COLOR_F)) };
-        }
-    }
-
     fn format(&mut self, style: TextStyle) -> Option<IDWriteTextFormat> {
         let key = ((style.size * 10.0) as u32, style.bold, style.align, style.mono);
         if let Some(f) = self.formats.get(&key) {

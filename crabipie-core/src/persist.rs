@@ -238,3 +238,38 @@ impl SavedState {
         serde_json::from_slice::<SavedState>(&json).ok()
     }
 }
+
+
+/// Panel sizes of the native shell. Kept in its own file so the iced app's
+/// session.json is never touched by it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiLayout {
+    pub sidebar_open: bool,
+    pub sidebar_width: f32,
+    pub split: f32,
+    pub gql_tree_width: f32,
+    pub gql_query_frac: f32,
+}
+
+impl Default for UiLayout {
+    fn default() -> Self {
+        Self { sidebar_open: false, sidebar_width: 240.0, split: 0.5, gql_tree_width: 250.0, gql_query_frac: 0.6 }
+    }
+}
+
+impl UiLayout {
+    pub fn path() -> std::path::PathBuf {
+        state_dir().join("native_ui.json")
+    }
+
+    pub fn load() -> Option<Self> {
+        serde_json::from_slice(&std::fs::read(Self::path()).ok()?).ok()
+    }
+
+    pub fn save(&self) {
+        if let Ok(json) = serde_json::to_vec_pretty(self) {
+            std::fs::write(Self::path(), json).ok();
+        }
+    }
+}

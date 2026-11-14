@@ -390,3 +390,114 @@ fn graphql_document_includes_selected_fields_arguments_and_variable_declarations
     assert!(doc.contains("users(first: $first) {"), "{doc}");
     assert_eq!(variables_template(&schema, &sel).unwrap(), "{\n  \"first\": null\n}");
 }
+
+#[test]
+fn collection_tree_ids_stay_unique_and_folder_options_nest() {
+    let req = |id: usize, name: &str| {
+        CollectionItem::Request(CollectionRequest {
+            id,
+            name: name.into(),
+            method: HttpMethod::GET,
+            saved_state: SavedState::default(),
+        })
+    };
+    let mut items = Vec::new();
+    assert_eq!(next_free_id(&items), 1);
+    let folder = CollectionItem::Folder(CollectionFolder { id: 1, name: "Auth".into(), expanded: false, children: vec![req(2, "Login")] });
+    assert!(insert_into(&mut items, None, folder));
+    let sub = CollectionItem::Folder(CollectionFolder { id: 3, name: "Admin".into(), expanded: false, children: vec![] });
+    assert!(insert_into(&mut items, Some(1), sub));
+    assert_eq!(next_free_id(&items), 4);
+
+    let labels: Vec<String> = folder_options(&items).into_iter().map(|(_, l)| l).collect();
+    assert_eq!(labels, ["Root", "Auth", "› Admin"]);
+    assert_eq!(find_name(&items, 2).as_deref(), Some("Login"));
+    assert!(expand_item(&mut items, 3));
+
+    let mut next = next_free_id(&items);
+    assert!(duplicate_item_fresh(&mut items, 1, &mut next));
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[1].name(), "Auth (copy)");
+    assert_eq!(next_free_id(&items), next);
+    // the copy's children got new ids, so removing one leaves the original alone
+    assert!(remove_item(&mut items, 4).is_some());
+    assert_eq!(find_name(&items, 2).as_deref(), Some("Login"));
+}
+
+#[test]
+fn move_item_reorders_nests_and_refuses_cycles() {
+    let req = |id: usize, name: &str| {
+        CollectionItem::Request(CollectionRequest { id, name: name.into(), method: HttpMethod::GET, saved_state: SavedState::default() })
+    };
+    let folder = |id: usize, name: &str, children: Vec<CollectionItem>| {
+        CollectionItem::Folder(CollectionFolder { id, name: name.into(), expanded: false, children })
+    };
+    // A(1)[ B(2)[ x(3) ] ], y(4)
+    let mut items = vec![folder(1, "A", vec![folder(2, "B", vec![req(3, "x")])]), req(4, "y")];
+    assert!(!move_item(&mut items, 1, DropAt::Into(Some(2))), "folder into its own child");
+    assert!(!move_item(&mut items, 1, DropAt::Into(Some(1))), "folder into itself");
+    assert!(!move_item(&mut items, 4, DropAt::Into(Some(3))), "target is a request");
+    assert!(move_item(&mut items, 4, DropAt::Before(3)));
+    let CollectionItem::Folder(a) = &items[0] else { panic!() };
+    let CollectionItem::Folder(b) = &a.children[0] else { panic!() };
+    assert_eq!(b.children.iter().map(|c| c.id()).collect::<Vec<_>>(), [4, 3]);
+    assert!(move_item(&mut items, 2, DropAt::After(1)));
+    assert_eq!(items.iter().map(|c| c.id()).collect::<Vec<_>>(), [1, 2]);
+    assert!(move_item(&mut items, 3, DropAt::Into(None)));
+    assert_eq!(items.iter().map(|c| c.id()).collect::<Vec<_>>(), [1, 2, 3]);
+    assert!(move_item(&mut items, 3, DropAt::Into(Some(1))));
+    let CollectionItem::Folder(a) = &items[0] else { panic!() };
+    assert!(a.expanded);
+    collapse_all(&mut items);
+    let CollectionItem::Folder(a) = &items[0] else { panic!() };
+    assert!(!a.expanded);
+}
+
+#[test]
+fn ui_layout_tolerates_missing_fields() {
+    let l: UiLayout = serde_json::from_str(r#"{"split":0.7}"#).unwrap();
+    assert_eq!(l.split, 0.7);
+    assert_eq!(l.sidebar_width, 240.0);
+    assert!(!l.sidebar_open);
+}
+
+#[test]
+fn cookies_follow_rfc6265_path_domain_secure_and_expiry() {
+    let now = chrono::Utc::now();
+    let mut jar: HashMap<String, Vec<CookieEntry>> = HashMap::new();
+    let url = "https://api.example.com/app/login";
+    merge_set_cookies(
+        &mut jar,
+        url,
+        &[
+            "a=1".into(),                                  // default path: /app
+            "b=2; Path=/; Secure".into(),
+            "c=3; Domain=.example.com; Path=/".into(),    // sent to subdomains too
+            "d=4; Domain=other.com".into(),               // not ours: rejected
+        ],
+    );
+    assert!(!jar.contains_key("other.com"));
+    let h = |u: &str| cookie_header(&jar, u, now).unwrap_or_default();
+    assert_eq!(h("https://api.example.com/app/x"), "a=1; b=2; c=3", "longest path first");
+    assert_eq!(h("https://api.example.com/other"), "b=2; c=3", "path /app does not match /other");
+    assert_eq!(h("https://api.example.com/application"), "b=2; c=3", "/app must not match /application");
+    assert_eq!(h("http://api.example.com/app/x"), "a=1; c=3", "Secure cookies stay off plain http");
+    assert_eq!(h("https://www.example.com/"), "c=3", "host-only cookies don't leak to other hosts");
+    assert_eq!(h("https://evilexample.com/"), "");
+
+    // Max-Age=0 deletes (same name+path), a future Max-Age keeps
+    merge_set_cookies(&mut jar, url, &["a=; Max-Age=0".into()]);
+    assert_eq!(h("https://api.example.com/app/x"), "b=2; c=3");
+    merge_set_cookies(&mut jar, url, &["e=5; Path=/; Max-Age=3600".into()]);
+    assert!(h("https://api.example.com/").contains("e=5"));
+    // a past Expires is treated as already gone
+    merge_set_cookies(&mut jar, url, &["f=6; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT".into()]);
+    assert!(!h("https://api.example.com/").contains("f=6"));
+    // and an expired entry already in the jar is never sent
+    let mut old = CookieEntry::new("g", "7", "api.example.com");
+    old.expires = Some("Wed, 21-Oct-2015 07:28:00 GMT".into());
+    jar.entry("api.example.com".into()).or_default().push(old);
+    assert!(!h("https://api.example.com/").contains("g=7"));
+    purge_expired(&mut jar, now);
+    assert!(jar["api.example.com"].iter().all(|c| c.name != "g"));
+}

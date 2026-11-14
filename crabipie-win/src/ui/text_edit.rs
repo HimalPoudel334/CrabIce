@@ -1,7 +1,9 @@
 //! Single-line text editing model: caret, selection, word movement, undo.
-//! Offsets are byte indices that always sit on `char` boundaries. (Combining
-//! marks / emoji ZWJ sequences count as several chars: fine for URLs, header
-//! values and JSON; revisit when the multi-line editor lands.)
+//! Offsets are byte indices that always sit on `char` boundaries. Arrow keys and
+//! Delete move by grapheme cluster (Devanagari syllables, emoji); Backspace removes
+//! the last Indic code point (vowel sign, virama) or else a whole cluster.
+
+use unicode_segmentation::GraphemeCursor;
 
 const MAX_UNDO: usize = 200;
 
@@ -20,10 +22,19 @@ pub struct LineEdit {
     undo: Vec<Snap>,
     redo: Vec<Snap>,
     multiline: bool,
+    /// Bumped on every change to `text`, so viewers can cache per-text work.
+    rev: u64,
+}
+
+/// Indic scripts (Devanagari .. Sinhala) are written with combining vowel signs and
+/// viramas that `is_alphanumeric` rejects: without this a word would break inside a conjunct.
+fn is_indic(c: char) -> bool {
+    let cp = c as u32;
+    (0x0900..=0x0DFF).contains(&cp) && cp != 0x0964 && cp != 0x0965 || cp == 0x200C || cp == 0x200D
 }
 
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    c.is_alphanumeric() || c == '_' || is_indic(c)
 }
 
 /// Single-line edits drop line breaks; multiline keeps '\n'. CRs are always
@@ -38,6 +49,10 @@ fn sanitize(s: &str, multiline: bool) -> String {
 impl LineEdit {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn rev(&self) -> u64 {
+        self.rev
     }
 
     pub fn multiline() -> Self {
@@ -58,11 +73,13 @@ impl LineEdit {
     pub fn append(&mut self, s: &str) {
         let s = sanitize(s, self.multiline);
         self.text.push_str(&s);
+        self.rev += 1;
     }
 
     /// Programmatic replace (e.g. loading a saved URL). Clears undo history.
     pub fn set_text(&mut self, s: &str) {
         self.text = sanitize(s, self.multiline);
+        self.rev += 1;
         self.caret = self.text.len();
         self.anchor = self.caret;
         self.undo.clear();
@@ -88,12 +105,42 @@ impl LineEdit {
         i
     }
 
+    /// Start of the code point before `i`.
     fn prev_boundary(&self, i: usize) -> usize {
         self.text[..i].char_indices().next_back().map(|(p, _)| p).unwrap_or(0)
     }
 
+    /// End of the code point at `i`.
     fn next_boundary(&self, i: usize) -> usize {
         self.text[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(self.text.len())
+    }
+
+    /// Start of the user-perceived character (grapheme cluster) before `i`:
+    /// "के" and the conjunct "स्ते" are each one step for the arrow keys.
+    fn prev_grapheme(&self, i: usize) -> usize {
+        let mut cur = GraphemeCursor::new(i, self.text.len(), true);
+        match cur.prev_boundary(&self.text, 0) {
+            Ok(Some(b)) => b,
+            _ => self.prev_boundary(i),
+        }
+    }
+
+    fn next_grapheme(&self, i: usize) -> usize {
+        let mut cur = GraphemeCursor::new(i, self.text.len(), true);
+        match cur.next_boundary(&self.text, 0) {
+            Ok(Some(b)) => b,
+            _ => self.next_boundary(i),
+        }
+    }
+
+    /// Floors `i` to a grapheme boundary (for mouse clicks).
+    fn snap_grapheme(&self, i: usize) -> usize {
+        let i = self.clamp(i);
+        let mut cur = GraphemeCursor::new(i, self.text.len(), true);
+        match cur.is_boundary(&self.text, 0) {
+            Ok(false) => self.prev_grapheme(i),
+            _ => i,
+        }
     }
 
     /// Start of the word before `i` (skips separators first, then the word).
@@ -142,6 +189,7 @@ impl LineEdit {
 
     fn restore(&mut self, s: Snap) {
         self.text = s.text;
+        self.rev += 1;
         self.caret = s.caret;
         self.anchor = s.anchor;
     }
@@ -149,6 +197,7 @@ impl LineEdit {
     fn remove_selection(&mut self) -> bool {
         if let Some((a, b)) = self.selection() {
             self.text.replace_range(a..b, "");
+            self.rev += 1;
             self.caret = a;
             self.anchor = a;
             true
@@ -174,6 +223,7 @@ impl LineEdit {
         self.record();
         self.remove_selection();
         self.text.insert_str(self.caret, &s);
+        self.rev += 1;
         self.caret += s.len();
         self.anchor = self.caret;
         true
@@ -188,8 +238,17 @@ impl LineEdit {
             return false;
         }
         self.record();
-        let start = if word { self.prev_word(self.caret) } else { self.prev_boundary(self.caret) };
+        let start = if word {
+            self.prev_word(self.caret)
+        } else {
+            // Like other editors for Indic text: Backspace undoes the last typed code
+            // point (a vowel sign, a virama) instead of the whole syllable; everything
+            // else (emoji sequences, accented letters) goes as a unit.
+            let cp = self.prev_boundary(self.caret);
+            if self.text[cp..self.caret].chars().next().map_or(false, is_indic) { cp } else { self.prev_grapheme(self.caret) }
+        };
         self.text.replace_range(start..self.caret, "");
+        self.rev += 1;
         self.caret = start;
         self.anchor = start;
         true
@@ -204,8 +263,9 @@ impl LineEdit {
             return false;
         }
         self.record();
-        let end = if word { self.next_word(self.caret) } else { self.next_boundary(self.caret) };
+        let end = if word { self.next_word(self.caret) } else { self.next_grapheme(self.caret) };
         self.text.replace_range(self.caret..end, "");
+        self.rev += 1;
         true
     }
 
@@ -245,7 +305,7 @@ impl LineEdit {
                 return;
             }
         }
-        let to = if word { self.prev_word(self.caret) } else { self.prev_boundary(self.caret) };
+        let to = if word { self.prev_word(self.caret) } else { self.prev_grapheme(self.caret) };
         self.move_to(to, extend);
     }
 
@@ -256,7 +316,7 @@ impl LineEdit {
                 return;
             }
         }
-        let to = if word { self.next_word(self.caret) } else { self.next_boundary(self.caret) };
+        let to = if word { self.next_word(self.caret) } else { self.next_grapheme(self.caret) };
         self.move_to(to, extend);
     }
 
@@ -269,7 +329,7 @@ impl LineEdit {
     }
 
     pub fn set_caret(&mut self, idx: usize, extend: bool) {
-        let idx = self.clamp(idx);
+        let idx = self.snap_grapheme(idx);
         self.move_to(idx, extend);
     }
 
@@ -406,5 +466,36 @@ mod tests {
         assert!(!{ e.undo(); e.undo(); e.undo() }); // history exhausted
         e.insert("z");
         assert!(!e.redo()); // new edit clears redo
+    }
+
+    #[test]
+    fn devanagari_moves_by_syllable_and_backspace_by_sign() {
+        // क + े : one user-perceived letter
+        let mut e = ed("के");
+        e.home(false);
+        e.move_right(false, false);
+        assert_eq!(e.caret(), e.text().len(), "one arrow step crosses the vowel sign");
+        e.move_left(false, false);
+        assert_eq!(e.caret(), 0);
+        e.end(false);
+        e.backspace(false);
+        assert_eq!(e.text(), "क", "Backspace removes only the vowel sign");
+        let mut e = ed("के");
+        e.home(false);
+        e.delete(false);
+        assert_eq!(e.text(), "", "Delete removes the whole letter");
+
+        // clicking inside a cluster never leaves the caret there
+        let mut e = ed("केब");
+        e.set_caret("क".len(), false);
+        assert_eq!(e.caret(), 0);
+
+        // a word with a conjunct is one word for double-click and Ctrl+arrows
+        let mut e = ed("नमस्ते नेपाल");
+        e.select_word_at(0);
+        assert_eq!(e.selected_text(), Some("नमस्ते"));
+        e.home(false);
+        e.move_right(false, true);
+        assert_eq!(&e.text()[..e.caret()].trim_end(), &"नमस्ते");
     }
 }

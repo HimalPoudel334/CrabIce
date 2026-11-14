@@ -12,15 +12,55 @@ pub enum Tok {
     Plain,
 }
 
-pub fn color(t: Tok) -> Color {
-    match t {
-        Tok::Key => Color::hex(0x9cdcfe),
-        Tok::Str => Color::hex(0xce9178),
-        Tok::Num => Color::hex(0xb5cea8),
-        Tok::Lit => Color::hex(0x569cd6),
-        Tok::Punct => Color::hex(0xd4d4d4),
-        Tok::Plain => Color::hex(0xd4d4d4),
+/// Palettes: key, string, number, true/false/null, punctuation, plain text.
+/// The first three match the iced app (its built-in themes all share "Custom Dark").
+const THEMES: [(&str, [u32; 6]); 5] = [
+    ("VS Code Dark", [0x9cdcfe, 0xce9178, 0xb5cea8, 0x569cd6, 0xd4d4d4, 0xd4d4d4]),
+    ("Custom Dark", [0x66c2f0, 0xbadd87, 0xe0ba87, 0xdb78a6, 0xcccccc, 0xffffff]),
+    ("Solarized Dark", [0x829400, 0x29a199, 0xcc4a17, 0xd43582, 0x94a1a1, 0x94a1a1]),
+    ("Monokai", [0x66d9ef, 0xe6db74, 0xae81ff, 0xf92672, 0xf8f8f2, 0xf8f8f2]),
+    ("One Dark", [0xe06c75, 0x98c379, 0xd19a66, 0x56b6c2, 0xabb2bf, 0xabb2bf]),
+];
+
+static THEME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn theme_names() -> Vec<String> {
+    THEMES.iter().map(|(n, _)| n.to_string()).collect()
+}
+
+pub fn theme_index() -> usize {
+    THEME.load(std::sync::atomic::Ordering::Relaxed).min(THEMES.len() - 1)
+}
+
+pub fn set_theme(i: usize) {
+    THEME.store(i.min(THEMES.len() - 1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Maps a saved theme name (ours, or one the iced app wrote) to a palette index.
+pub fn index_of(name: &str) -> usize {
+    let n = name.to_lowercase();
+    if let Some(i) = THEMES.iter().position(|(t, _)| t.to_lowercase() == n) {
+        return i;
     }
+    if n.contains("solarized") {
+        2
+    } else if n.contains("base16") || n.contains("github") || n.contains("custom") {
+        1 // iced maps every other built-in to the Custom Dark colors
+    } else {
+        0
+    }
+}
+
+pub fn color(t: Tok) -> Color {
+    let p = &THEMES[theme_index()].1;
+    Color::hex(match t {
+        Tok::Key => p[0],
+        Tok::Str => p[1],
+        Tok::Num => p[2],
+        Tok::Lit => p[3],
+        Tok::Punct => p[4],
+        Tok::Plain => p[5],
+    })
 }
 
 /// Byte ranges (start, end, kind) of the non-whitespace tokens in one line.
@@ -100,5 +140,15 @@ mod tests {
         );
         assert!(tokenize("\"unterminated").len() == 1);
         let _ = tokenize("héllo 日本"); // must not split a char
+    }
+
+    #[test]
+    fn saved_theme_names_map_to_palettes() {
+        assert_eq!(index_of("VS Code Dark"), 0);
+        assert_eq!(index_of("solarized dark"), 2);
+        assert_eq!(index_of("Solarized (dark)"), 2);
+        assert_eq!(index_of("base16-ocean.dark"), 1);
+        assert_eq!(index_of(""), 0);
+        assert_eq!(theme_names().len(), 5);
     }
 }

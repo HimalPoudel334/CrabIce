@@ -6,10 +6,6 @@ use super::theme::Theme;
 
 pub const UI: TextStyle = TextStyle::new(14.0);
 
-pub fn label(c: &mut dyn Canvas, th: &Theme, r: Rect, s: &str) {
-    c.text(s, r, th.text, UI);
-}
-
 pub fn picker(c: &mut dyn Canvas, th: &Theme, r: Rect, label: &str, open: bool) {
     c.fill_rect(r, th.surface);
     c.stroke_rect(r.inset(0.5), if open { th.accent } else { th.border }, 1.0);

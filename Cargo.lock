@@ -1077,8 +1077,10 @@ dependencies = [
  "crabipie-core",
  "futures",
  "futures-util",
+ "serde",
  "serde_json",
  "tokio",
+ "unicode-segmentation",
  "windows 0.58.0",
 ]
 

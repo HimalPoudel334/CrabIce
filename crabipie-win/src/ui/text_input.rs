@@ -38,10 +38,6 @@ impl TextInput {
         Rect::new(self.rect.l + PAD, self.rect.t, self.rect.r - PAD, self.rect.b)
     }
 
-    pub fn contains(&self, x: f32, y: f32) -> bool {
-        self.rect.contains(x, y)
-    }
-
     pub fn blur(&mut self) {
         self.focused = false;
         self.dragging = false;
@@ -96,10 +92,6 @@ impl TextInput {
 
     pub fn mouse_up(&mut self) {
         self.dragging = false;
-    }
-
-    pub fn is_dragging(&self) -> bool {
-        self.dragging
     }
 
     // ── keyboard ────────────────────────────────────────────────────

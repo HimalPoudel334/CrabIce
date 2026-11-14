@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use windows::core::{w, Error, Result};
+use windows::core::{w, Error, Result, HSTRING};
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -18,9 +18,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::app::App;
+use crate::app::{App, CursorKind, PersistJob};
 use crate::platform::clipboard::WinClipboard;
-use crate::platform::file_dialog::pick_file;
+use crate::platform::file_dialog::{pick_file, save_file};
 use crate::render::Renderer;
 use crate::ui::input::{Key, Mods};
 use crabipie_core::{fetch_schema, run_request, websocket_stream, GraphqlSchema, AuthRefreshOutcome, FlowEvent, ResponseEvent, WsEvent};
@@ -32,6 +32,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_APP_RESPONSE: u32 = 0x8001; // WM_APP + 1
 const BLINK_TIMER: usize = 1;
 const BLINK_MS: u32 = 530;
+const SAVE_TIMER: usize = 2;
+const SAVE_MS: u32 = 1000;
 
 enum BridgeMsg {
     Net { tab_id: usize, ev: ResponseEvent },
@@ -61,9 +63,36 @@ struct Window {
     rt: tokio::runtime::Runtime,
     /// One running socket task per WebSocket tab; aborting it closes the connection.
     ws_tasks: HashMap<usize, tokio::task::JoinHandle<()>>,
+    /// Autosave: jobs go to one writer thread so files are never written concurrently.
+    save_tx: Option<std::sync::mpsc::Sender<PersistJob>>,
+    save_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn msgbox(hwnd: HWND, text: &str) {
+    unsafe {
+        let t = HSTRING::from(text);
+        MessageBoxW(hwnd, &t, w!("CrabiPie"), MB_OK | MB_ICONERROR);
+    }
 }
 
 impl Window {
+    fn queue_save(&self, job: PersistJob) {
+        if let Some(tx) = &self.save_tx {
+            let _ = tx.send(job);
+        }
+    }
+
+    /// Writes any pending changes and waits for the writer: called on exit.
+    fn flush_save(&mut self) {
+        if let Some(job) = self.app.take_save(true) {
+            self.queue_save(job);
+        }
+        self.save_tx = None; // closes the channel: the writer drains it and ends
+        if let Some(h) = self.save_thread.take() {
+            let _ = h.join();
+        }
+    }
+
     fn scale(&self) -> f32 {
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
         if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
@@ -213,6 +242,13 @@ pub fn run() -> Result<()> {
             .enable_all()
             .build()
             .expect("tokio runtime");
+        let (save_tx, save_rx) = std::sync::mpsc::channel::<PersistJob>();
+        let rt_handle = rt.handle().clone();
+        let save_thread = std::thread::spawn(move || {
+            for job in save_rx {
+                rt_handle.block_on(job.write());
+            }
+        });
         let mut app = App::from_disk(&rt);
         app.set_clock(crate::platform::clock::local_clock);
 
@@ -224,6 +260,8 @@ pub fn run() -> Result<()> {
             high_surrogate: None,
             rt,
             ws_tasks: HashMap::new(),
+            save_tx: Some(save_tx),
+            save_thread: Some(save_thread),
         });
         let ptr = Box::into_raw(window);
 
@@ -244,6 +282,7 @@ pub fn run() -> Result<()> {
 
         // caret blink
         SetTimer(hwnd, BLINK_TIMER, BLINK_MS, None);
+        SetTimer(hwnd, SAVE_TIMER, SAVE_MS, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -343,6 +382,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         win.invalidate();
                     }
                 }
+                if let Some((name, json)) = win.app.take_export() {
+                    if let Some(path) = save_file(hwnd, &name) {
+                        if let Err(e) = std::fs::write(&path, json) {
+                            msgbox(hwnd, &format!("Could not save the file: {e}"));
+                        }
+                    }
+                }
+                if win.app.take_import_request() {
+                    if let Some(path) = pick_file(hwnd) {
+                        let res = std::fs::read_to_string(&path).map_err(|e| format!("Could not read the file: {e}")).and_then(|text| win.app.import_tab(&text));
+                        match res {
+                            Ok(()) => win.invalidate(),
+                            Err(e) => msgbox(hwnd, &e),
+                        }
+                    }
+                }
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
@@ -355,7 +410,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_LBUTTONUP => {
                 let _ = ReleaseCapture();
-                win.app.on_left_up();
+                if win.app.on_left_up() {
+                    win.invalidate();
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                let (x, y) = win.pos(lparam);
+                if win.app.on_right_click(x, y) {
+                    win.invalidate();
+                }
                 LRESULT(0)
             }
             WM_MBUTTONUP => {
@@ -366,10 +430,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_SETCURSOR => {
-                if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && win.app.text_cursor_active() {
-                    if let Ok(c) = LoadCursorW(None, IDC_IBEAM) {
-                        let _ = SetCursor(c);
-                        return LRESULT(1);
+                if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                    let id = match win.app.cursor_kind() {
+                        CursorKind::IBeam => Some(IDC_IBEAM),
+                        CursorKind::ResizeWE => Some(IDC_SIZEWE),
+                        CursorKind::ResizeNS => Some(IDC_SIZENS),
+                        CursorKind::Arrow => None,
+                    };
+                    if let Some(id) = id {
+                        if let Ok(c) = LoadCursorW(None, id) {
+                            let _ = SetCursor(c);
+                            return LRESULT(1);
+                        }
                     }
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -410,6 +482,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_APP_RESPONSE => {
+                win.app.touch();
                 let repaint = match *Box::from_raw(lparam.0 as *mut BridgeMsg) {
                     BridgeMsg::Net { tab_id, ev } => win.app.on_response(tab_id, ev),
                     BridgeMsg::Token { env_id, res } => win.app.on_token(env_id, res),
@@ -433,10 +506,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if wparam.0 == BLINK_TIMER && win.app.blink() {
                     win.invalidate();
                 }
+                if wparam.0 == SAVE_TIMER {
+                    if let Some(job) = win.app.take_save(false) {
+                        win.queue_save(job);
+                    }
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
+                win.flush_save();
                 let _ = KillTimer(hwnd, BLINK_TIMER);
+                let _ = KillTimer(hwnd, SAVE_TIMER);
                 PostQuitMessage(0);
                 LRESULT(0)
             }

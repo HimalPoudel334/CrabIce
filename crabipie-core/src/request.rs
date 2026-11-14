@@ -95,19 +95,9 @@ pub fn build_request(
     }
 
     // ── cookie jar ───────────────────────
-    if let Some(domain) = extract_domain(&url) {
-        if let Some(cookies) = cookie_jar.get(&domain) {
-            let cookie_str = cookies
-                .iter()
-                .filter(|c| c.enabled && !c.name.is_empty())
-                .map(|c| format!("{}={}", c.name, c.value))
-                .collect::<Vec<_>>()
-                .join("; ");
-            if !cookie_str.is_empty() {
-                if let Ok(hv) = reqwest::header::HeaderValue::from_str(&cookie_str) {
-                    header_map.insert(reqwest::header::COOKIE, hv);
-                }
-            }
+    if let Some(cookie_str) = cookie_header(cookie_jar, &url, chrono::Utc::now()) {
+        if let Ok(hv) = reqwest::header::HeaderValue::from_str(&cookie_str) {
+            header_map.insert(reqwest::header::COOKIE, hv);
         }
     }
 
@@ -261,24 +251,30 @@ pub fn auth_refresh_failure_body(err: &str) -> String {
 
 // ───────────────────────── cookies ─────────────────────────
 
-/// Merges `Set-Cookie` headers from a response into the jar, keyed by the
-/// request URL's domain. Same-named cookies are replaced.
+/// Merges `Set-Cookie` headers from a response into the jar (RFC 6265 rules:
+/// Domain/Path/Max-Age/Expires/Secure). A cookie with the same name, domain and
+/// path is replaced; an expired one deletes it.
 pub fn merge_set_cookies(
     jar: &mut HashMap<String, Vec<CookieEntry>>,
     url: &str,
     set_cookies: &[String],
 ) {
-    let Some(domain) = extract_domain(url) else {
-        return;
-    };
+    let now = chrono::Utc::now();
+    purge_expired(jar, now);
     for raw in set_cookies {
-        if let Some(cookie) = parse_set_cookie(raw) {
-            let entries = jar.entry(domain.clone()).or_default();
-            if let Some(existing) = entries.iter_mut().find(|c| c.name == cookie.name) {
-                *existing = cookie;
-            } else {
-                entries.push(cookie);
+        let Some((key, cookie, expired)) = parse_set_cookie_at(raw, url, now) else { continue };
+        let entries = jar.entry(key.clone()).or_default();
+        let same = |c: &CookieEntry| c.name == cookie.name && c.path == cookie.path;
+        match (entries.iter().position(same), expired) {
+            (Some(i), true) => {
+                entries.remove(i);
             }
+            (Some(i), false) => entries[i] = cookie,
+            (None, true) => {}
+            (None, false) => entries.push(cookie),
+        }
+        if entries.is_empty() {
+            jar.remove(&key);
         }
     }
 }
