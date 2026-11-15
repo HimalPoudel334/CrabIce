@@ -50,4 +50,26 @@ pub trait Canvas: TextMeasure {
     fn text(&mut self, s: &str, r: Rect, c: Color, style: TextStyle);
     fn push_clip(&mut self, r: Rect);
     fn pop_clip(&mut self);
+
+    /// Decodes an image (whatever the OS can: PNG, JPEG, GIF, BMP, TIFF, ICO, maybe WebP)
+    /// and keeps it under `key`. Returns its size, or None if it can't be decoded.
+    fn load_image(&mut self, _key: u64, _bytes: &[u8]) -> Option<ImageInfo> {
+        None
+    }
+
+    /// Draws a loaded image stretched into `dst`.
+    fn draw_image(&mut self, _key: u64, _dst: Rect) {}
+
+    /// Forgets a loaded image.
+    fn free_image(&mut self, _key: u64) {}
+}
+
+/// Pixel size of a decoded image. Very large images are scaled down while decoding, so
+/// `w`/`h` (what is drawn) can be smaller than `full_w`/`full_h` (the file's real size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub w: u32,
+    pub h: u32,
+    pub full_w: u32,
+    pub full_h: u32,
 }

@@ -45,6 +45,32 @@ pub struct TextArea {
 }
 
 /// Byte ranges of each line (excluding the '\n').
+/// Line byte ranges and the longest line (in characters).
+fn index_text(text: &str) -> (Vec<(usize, usize)>, usize) {
+    let lines = line_ranges(text);
+    let max_cols = lines.iter().map(|&(s, e)| text[s..e].chars().count()).max().unwrap_or(0);
+    (lines, max_cols)
+}
+
+/// A big response made ready on a worker thread: pretty-printed (JSON), sanitised and
+/// line-indexed, so the UI thread only has to swap it in.
+pub struct PreparedText {
+    text: String,
+    lines: Vec<(usize, usize)>,
+    max_cols: usize,
+}
+
+impl PreparedText {
+    pub fn build(body: String, json: bool) -> Self {
+        let text = match json.then(|| super::json_fmt::pretty(&body)).flatten() {
+            Some(pretty) => pretty,
+            None => super::text_edit::sanitize_text(&body),
+        };
+        let (lines, max_cols) = index_text(&text);
+        Self { text, lines, max_cols }
+    }
+}
+
 fn line_ranges(t: &str) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
     let mut s = 0;
@@ -148,11 +174,22 @@ impl TextArea {
 
     fn ensure_lines(&mut self) {
         if self.lines_rev != self.edit.rev() {
-            let text = self.edit.text();
-            self.lines = line_ranges(text);
-            self.max_cols = self.lines.iter().map(|&(s, e)| text[s..e].chars().count()).max().unwrap_or(0);
+            let (lines, max_cols) = index_text(self.edit.text());
+            self.lines = lines;
+            self.max_cols = max_cols;
             self.lines_rev = self.edit.rev();
         }
+    }
+
+    /// Installs text whose line index was built elsewhere: no copy, no rescan on the UI thread.
+    pub fn set_prepared(&mut self, p: PreparedText) {
+        self.edit.set_text_trusted(p.text);
+        self.edit.set_caret(0, false);
+        self.lines = p.lines;
+        self.max_cols = p.max_cols;
+        self.lines_rev = self.edit.rev();
+        self.scroll = 0.0;
+        self.hscroll = 0.0;
     }
 
     fn origin_x(&self) -> f32 {
@@ -172,8 +209,19 @@ impl TextArea {
         self.grab = None;
     }
 
-    fn on_bar(&self, x: f32, y: f32) -> bool {
-        self.vtrack.contains(x, y) || self.htrack.contains(x, y)
+    #[cfg(test)]
+    pub fn rect(&self) -> Rect {
+        self.rect
+    }
+
+    #[cfg(test)]
+    pub fn v_thumb(&self) -> Rect {
+        self.vthumb
+    }
+
+    /// True over a scrollbar (or while dragging one): the cursor is an arrow there, not an I-beam.
+    pub fn on_bar(&self, x: f32, y: f32) -> bool {
+        self.grab.is_some() || self.vtrack.contains(x, y) || self.htrack.contains(x, y)
     }
 
     fn max_hscroll(&self) -> f32 {
@@ -606,5 +654,18 @@ mod tests {
         a.paint(&mut c, &th, rect);
         assert!((a.scroll - a.max_scroll()).abs() < 0.5);
         assert_eq!(a.lines.len(), 104);
+    }
+
+    #[test]
+    fn prepared_text_arrives_sanitised_and_indexed() {
+        let mut a = TextArea::readonly("");
+        a.set_prepared(PreparedText::build("a\r\nbb\tb\nccc".into(), false));
+        assert_eq!(a.edit.text(), "a\nbb b\nccc");
+        assert_eq!(a.lines.len(), 3);
+        assert_eq!(a.max_cols, 4);
+        assert_eq!(a.lines_rev, a.edit.rev(), "nothing left to index at paint time");
+        let json = PreparedText::build(r#"{"k":[1,2]}"#.into(), true);
+        a.set_prepared(json);
+        assert!(a.edit.text().starts_with("{\n  \"k\": ["));
     }
 }

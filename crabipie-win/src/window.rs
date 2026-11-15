@@ -19,11 +19,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::app::{App, CursorKind, PersistJob};
+use crate::ui::text_area::PreparedText;
 use crate::platform::clipboard::WinClipboard;
 use crate::platform::file_dialog::{pick_file, save_file};
 use crate::render::Renderer;
 use crate::ui::input::{Key, Mods};
-use crabipie_core::{fetch_schema, run_request, websocket_stream, GraphqlSchema, AuthRefreshOutcome, FlowEvent, ResponseEvent, WsEvent};
+use crabipie_core::{fetch_schema, run_request, test_login, websocket_stream, FieldSuggestion, GraphqlSchema, AuthRefreshOutcome, FlowEvent, ResponseEvent, WsEvent, HTTP_CLIENT};
 use futures_util::StreamExt;
 
 // Not in the bindings I target (WM_MOUSELEAVE lives behind the Controls feature).
@@ -41,6 +42,8 @@ enum BridgeMsg {
     Ws { tab_id: usize, ev: WsEvent },
     WsEnded { tab_id: usize },
     Schema { tab_id: usize, res: std::result::Result<GraphqlSchema, String> },
+    AuthTest { env_id: usize, res: std::result::Result<Vec<FieldSuggestion>, String> },
+    Formatted { tab_id: usize, id: u64, json: bool, prepared: PreparedText },
 }
 
 /// Called from tokio worker threads: hands an engine event to the UI thread.
@@ -66,6 +69,8 @@ struct Window {
     /// Autosave: jobs go to one writer thread so files are never written concurrently.
     save_tx: Option<std::sync::mpsc::Sender<PersistJob>>,
     save_thread: Option<std::thread::JoinHandle<()>>,
+    /// (build ms, present ms) of recent frames, for the Ctrl+Shift+P overlay.
+    frame_ms: std::collections::VecDeque<(f32, f32)>,
 }
 
 fn msgbox(hwnd: HWND, text: &str) {
@@ -108,10 +113,31 @@ impl Window {
         if !self.renderer.begin_draw() {
             return;
         }
+        let t0 = std::time::Instant::now();
         let (w, h) = self.renderer.size();
         self.app.on_resize(w, h);
         self.app.paint(&mut self.renderer);
-        self.renderer.end_draw();
+        let build = t0.elapsed();
+        self.renderer.end_draw(); // presents; waits for vsync, so it is timed apart
+        let total = t0.elapsed();
+        let calls = self.renderer.take_calls();
+        self.frame_ms.push_back((build.as_secs_f32() * 1000.0, (total - build).as_secs_f32() * 1000.0));
+        if self.frame_ms.len() > 120 {
+            self.frame_ms.pop_front();
+        }
+        let n = self.frame_ms.len() as f32;
+        let (b_avg, p_avg) = (self.frame_ms.iter().map(|f| f.0).sum::<f32>() / n, self.frame_ms.iter().map(|f| f.1).sum::<f32>() / n);
+        let (b_max, p_max) = self.frame_ms.iter().fold((0.0f32, 0.0f32), |m, f| (m.0.max(f.0), m.1.max(f.1)));
+        self.app.set_perf(format!(
+            "{} | build avg {:.1} max {:.1} ms | present avg {:.1} max {:.1} ms | {} calls | last {} frames",
+            self.renderer.gpu_label(),
+            b_avg,
+            b_max,
+            p_avg,
+            p_max,
+            calls,
+            self.frame_ms.len()
+        ));
     }
 
     /// Starts any request the app queued (Send button / Enter).
@@ -155,9 +181,34 @@ impl Window {
         }
     }
 
+    /// Runs "Test Login & Suggest Fields" requests from the environments dialog.
+    fn dispatch_auth_test(&mut self) {
+        for (env_id, env) in self.app.take_auth_test() {
+            let hwnd_raw = self.hwnd.0 as isize;
+            self.rt.spawn(async move {
+                let res = test_login(&HTTP_CLIENT, &env).await;
+                post_to_ui(hwnd_raw, BridgeMsg::AuthTest { env_id, res });
+            });
+        }
+    }
+
+    /// Pretty-prints and line-indexes big responses on the blocking pool.
+    fn dispatch_format(&mut self) {
+        for job in self.app.take_format_jobs() {
+            let hwnd_raw = self.hwnd.0 as isize;
+            self.rt.spawn_blocking(move || {
+                let (tab_id, id, json) = (job.tab_id, job.id, job.json);
+                let prepared = PreparedText::build(job.body, json);
+                post_to_ui(hwnd_raw, BridgeMsg::Formatted { tab_id, id, json, prepared });
+            });
+        }
+    }
+
     fn dispatch_sends(&mut self) {
         self.dispatch_ws();
         self.dispatch_gql();
+        self.dispatch_auth_test();
+        self.dispatch_format();
         while let Some(job) = self.app.take_send() {
             let hwnd_raw = self.hwnd.0 as isize;
             let tab_id = job.tab_id;
@@ -216,6 +267,8 @@ pub fn run() -> Result<()> {
     unsafe {
         // Must happen before any window exists.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // the image decoder (WIC) needs COM on this thread
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
 
         let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class_name = w!("CrabiPieWindow");
@@ -262,6 +315,7 @@ pub fn run() -> Result<()> {
             ws_tasks: HashMap::new(),
             save_tx: Some(save_tx),
             save_thread: Some(save_thread),
+            frame_ms: std::collections::VecDeque::new(),
         });
         let ptr = Box::into_raw(window);
 
@@ -389,6 +443,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         }
                     }
                 }
+                if let Some((name, data)) = win.app.take_save_blob() {
+                    if let Some(path) = save_file(hwnd, &name) {
+                        if let Err(e) = std::fs::write(&path, data.as_slice()) {
+                            msgbox(hwnd, &format!("Could not save the file: {e}"));
+                        }
+                    }
+                }
                 if win.app.take_import_request() {
                     if let Some(path) = pick_file(hwnd) {
                         let res = std::fs::read_to_string(&path).map_err(|e| format!("Could not read the file: {e}")).and_then(|text| win.app.import_tab(&text));
@@ -489,7 +550,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     BridgeMsg::Ws { tab_id, ev } => win.app.on_ws_event(tab_id, ev),
                     BridgeMsg::WsEnded { tab_id } => win.app.on_ws_ended(tab_id),
                     BridgeMsg::Schema { tab_id, res } => win.app.on_schema(tab_id, res),
+                    BridgeMsg::AuthTest { env_id, res } => win.app.on_auth_test(env_id, res),
+                    BridgeMsg::Formatted { tab_id, id, json, prepared } => win.app.on_formatted(tab_id, id, prepared, json),
                 };
+                win.dispatch_sends(); // a response may have queued follow-up work (formatting)
                 if repaint {
                     win.invalidate();
                 }

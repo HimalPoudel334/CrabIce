@@ -505,3 +505,28 @@ pub async fn perform_auth_refresh(
         expires_at,
     })
 }
+
+/// "Test Login": sends the configured login request once and returns the fields
+/// of the JSON response that look like an access token, refresh token or expiry,
+/// so the user can pick the token paths with a click instead of typing them.
+pub async fn test_login(client: &reqwest::Client, env: &Environment) -> Result<Vec<FieldSuggestion>, String> {
+    let cfg = env.auth_config.as_ref().ok_or_else(|| "No auth settings for this environment".to_string())?;
+    if cfg.login_endpoint.trim().is_empty() {
+        return Err("No login endpoint set".to_string());
+    }
+    let resp = build_auth_request(client, env, &cfg.login_endpoint, cfg.login_method, cfg.login_body_format, &cfg.login_body_template)?
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Login endpoint returned {status}"));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("Response wasn't valid JSON: {e}"))?;
+    let suggestions = suggest_token_fields(&json);
+    if suggestions.is_empty() {
+        Err("No token-shaped fields found in the response".to_string())
+    } else {
+        Ok(suggestions)
+    }
+}

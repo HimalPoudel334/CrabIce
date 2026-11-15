@@ -501,3 +501,16 @@ fn cookies_follow_rfc6265_path_domain_secure_and_expiry() {
     purge_expired(&mut jar, now);
     assert!(jar["api.example.com"].iter().all(|c| c.name != "g"));
 }
+
+#[test]
+fn test_login_suggests_token_fields_and_reports_a_missing_endpoint() {
+    let base = auth_server();
+    let env = auth_env(&base, "", None);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let found = rt.block_on(test_login(&reqwest::Client::new(), &env)).unwrap();
+    assert!(found.iter().any(|f| f.path == "access_token" && f.kind == SuggestionKind::AccessToken && f.sample_value == "T1"));
+
+    let mut blank = env;
+    blank.auth_config.as_mut().unwrap().login_endpoint.clear();
+    assert!(rt.block_on(test_login(&reqwest::Client::new(), &blank)).is_err());
+}

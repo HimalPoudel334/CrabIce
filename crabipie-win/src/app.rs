@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ui::icons::{self, Icon};
+use crate::ui::image_view::{self, ImageView};
 use crate::ui::canvas::{Align, Canvas, TextMeasure, TextStyle};
 use crate::ui::geom::{Color, Rect};
 use crate::ui::input::{Clipboard, Key, Mods};
 use crate::ui::gql_tree::{self, TreeRow};
 use crate::ui::json_fmt;
 use crate::ui::tab_bar::{Hit, TabBar, TabItem};
-use crate::ui::text_area::TextArea;
+use crate::ui::text_area::{PreparedText, TextArea};
 use crate::ui::text_input::TextInput;
 use crate::ui::theme::Theme;
 use crate::ui::widgets as w;
@@ -31,6 +32,17 @@ use crabipie_core::{
 pub const DEFAULT_URL: &str = "https://jsonplaceholder.typicode.com/posts";
 const ROW_H: f32 = 34.0;
 const ROW_STEP: f32 = 42.0;
+/// Response bodies above this are formatted off the UI thread.
+const BIG_BODY: usize = 256 * 1024;
+
+/// A big response waiting to be pretty-printed and line-indexed on a worker.
+pub struct FormatJob {
+    pub tab_id: usize,
+    pub id: u64,
+    pub body: String,
+    pub json: bool,
+}
+
 /// Collections sidebar width and row height (DIPs).
 pub const SB_W: f32 = 240.0; // default; the user can drag it
 const SB_ROW: f32 = 28.0;
@@ -79,6 +91,10 @@ pub enum Act {
     GqlFetch,
     GqlCollapse,
     GqlClearSel,
+    ImageView,
+    SaveBlob,
+    AuthTest,
+    ApplySuggestion(usize),
     GqlExpand(usize),
     GqlCheck(usize),
     OpenCookies,
@@ -126,7 +142,7 @@ struct Hot { rect: Rect, act: Act }
 
 /// Mouse drags in progress: panel splitters and sidebar item moves.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Drag { Sidebar, Split, GqlTree, GqlHeight, Item { id: usize, sx: f32, sy: f32, active: bool } }
+enum Drag { Sidebar, Split, GqlTree, GqlHeight, Pan { lx: f32, ly: f32 }, Item { id: usize, sx: f32, sy: f32, active: bool } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorKind { Arrow, IBeam, ResizeWE, ResizeNS }
@@ -189,6 +205,15 @@ impl Canvas for Shift<'_, '_> {
     fn pop_clip(&mut self) {
         self.inner.pop_clip();
     }
+    fn load_image(&mut self, key: u64, bytes: &[u8]) -> Option<crate::ui::canvas::ImageInfo> {
+        self.inner.load_image(key, bytes)
+    }
+    fn draw_image(&mut self, key: u64, dst: Rect) {
+        self.inner.draw_image(key, shifted(dst, self.dx));
+    }
+    fn free_image(&mut self, key: u64) {
+        self.inner.free_image(key);
+    }
 }
 
 struct Popup { kind: PickerKind, button: Rect, items: Vec<String>, current: usize, hover: Option<usize>, up: bool }
@@ -240,6 +265,12 @@ pub struct RespState {
     pub tab: RespTab,
     pub body: TextArea,
     pub headers: TextArea,
+    /// Non-zero while a background format job for this response is still running.
+    pub fmt_id: u64,
+    /// Set for image responses: shown by the image viewer instead of the text area.
+    pub image: Option<ImageView>,
+    /// A binary response's file name and bytes (the Save button).
+    pub blob: Option<(String, std::sync::Arc<Vec<u8>>)>,
 }
 
 impl RespState {
@@ -250,6 +281,9 @@ impl RespState {
             tab: RespTab::Body,
             body: TextArea::readonly("(empty body)"),
             headers: TextArea::readonly("(no headers)"),
+            fmt_id: 0,
+            image: None,
+            blob: None,
         }
     }
     fn area_mut(&mut self) -> &mut TextArea {
@@ -702,6 +736,17 @@ pub struct App {
     gql_vsplit: Rect,
     gql_hsplit: Rect,
     gql_hs: (f32, f32),
+    // "Test Login & Suggest Fields" in the environments dialog
+    auth_test_jobs: Vec<(usize, Environment)>,
+    auth_test_loading: Option<usize>,
+    auth_test_result: HashMap<usize, Result<Vec<crabipie_core::FieldSuggestion>, String>>,
+    fmt_seq: u64,
+    blob_req: bool,
+    format_jobs: Vec<FormatJob>,
+    show_perf: bool,
+    perf_line: String,
+    perf_rect: Rect,
+    perf_copied: bool,
     /// Icon button under the mouse (hover highlight + tooltip).
     hover_act: Option<Act>,
     // persistence
@@ -795,6 +840,16 @@ impl App {
             gql_vsplit: Rect::default(),
             gql_hsplit: Rect::default(),
             gql_hs: (0.0, 1.0),
+            auth_test_jobs: Vec::new(),
+            auth_test_loading: None,
+            auth_test_result: HashMap::new(),
+            fmt_seq: 0,
+            blob_req: false,
+            format_jobs: Vec::new(),
+            show_perf: false,
+            perf_line: String::new(),
+            perf_rect: Rect::default(),
+            perf_copied: false,
             hover_act: None,
             dirty_at: None,
             coll_dirty: false,
@@ -1182,10 +1237,19 @@ impl App {
             ResponseEvent::Response(r) => {
                 let url = self.tabs[ix].sent_url.clone();
                 merge_set_cookies(&mut self.jar, &url, &r.set_cookies);
+                // big bodies are formatted and indexed on a worker thread; show a placeholder meanwhile
+                let big = !r.is_streaming && r.body.len() > BIG_BODY;
+                let mut rs = if big { Self::resp_state_pending(&r) } else { Self::resp_state(&r) };
+                Self::attach_binary(&mut rs, &r);
+                if big {
+                    self.fmt_seq += 1;
+                    rs.fmt_id = self.fmt_seq;
+                    self.format_jobs.push(FormatJob { tab_id, id: self.fmt_seq, body: r.body.clone(), json: r.content_type.contains("json") });
+                }
                 let t = &mut self.tabs[ix];
                 t.sending = r.is_streaming;
                 t.streaming = r.is_streaming;
-                t.resp = Some(Self::resp_state(&r));
+                t.resp = Some(rs);
             }
             ResponseEvent::Chunk(s) => {
                 if let Some(rs) = self.tabs[ix].resp.as_mut() {
@@ -1199,6 +1263,60 @@ impl App {
             }
         }
         true
+    }
+
+    fn resp_state_pending(r: &HttpResponse) -> RespState {
+        let mut rs = RespState::empty(&r.status);
+        rs.body.set_text(&format!("Formatting response ({:.1} MB)…", r.body.len() as f64 / 1_048_576.0));
+        rs.headers.set_text(&r.headers);
+        rs.elapsed = r.response_time;
+        rs
+    }
+
+    pub fn take_format_jobs(&mut self) -> Vec<FormatJob> {
+        std::mem::take(&mut self.format_jobs)
+    }
+
+    /// A worker finished formatting a big response. Stale results (the tab sent
+    /// another request or cleared the response meanwhile) are dropped.
+    pub fn on_formatted(&mut self, tab_id: usize, id: u64, p: PreparedText, json: bool) -> bool {
+        let Some(rs) = self.tabs.iter_mut().find(|t| t.id == tab_id).and_then(|t| t.resp.as_mut()) else { return false };
+        if rs.fmt_id != id {
+            return false;
+        }
+        rs.fmt_id = 0;
+        rs.body.set_prepared(p);
+        rs.body.set_highlight(json);
+        true
+    }
+
+    /// Binary responses: an image goes to the viewer, SVG is shown as text, everything keeps a Save button.
+    fn attach_binary(rs: &mut RespState, r: &HttpResponse) {
+        if !r.is_binary || r.bytes.is_empty() {
+            return;
+        }
+        let data = std::sync::Arc::new(r.bytes.clone());
+        rs.blob = Some((r.filename.clone(), data.clone()));
+        if r.content_type.contains("svg") {
+            rs.body.set_text(&String::from_utf8_lossy(&r.bytes));
+            return;
+        }
+        let kind = image_view::sniff(&r.bytes).or_else(|| r.content_type.starts_with("image/").then_some("image"));
+        if let Some(kind) = kind {
+            rs.image = Some(ImageView::new(data, kind));
+        }
+    }
+
+    fn image_view_mut(&mut self) -> Option<&mut ImageView> {
+        self.tabs[self.active].resp.as_mut().and_then(|r| r.image.as_mut())
+    }
+
+    /// (file name, bytes) when the user pressed Save on a binary response.
+    pub fn take_save_blob(&mut self) -> Option<(String, std::sync::Arc<Vec<u8>>)> {
+        if !std::mem::take(&mut self.blob_req) {
+            return None;
+        }
+        self.tab().resp.as_ref().and_then(|r| r.blob.clone())
     }
 
     fn resp_state(r: &HttpResponse) -> RespState {
@@ -1646,6 +1764,10 @@ impl App {
                 t.gql_expanded.clear();
                 t.gql_scroll = 0.0;
             }
+            Act::SaveBlob => self.blob_req = true,
+            Act::ImageView => {} // handled by the mouse code (pan / zoom / double-click)
+            Act::AuthTest => self.auth_test_start(),
+            Act::ApplySuggestion(i) => self.apply_suggestion(i),
             Act::GqlClearSel => {
                 let t = self.tab_mut();
                 t.gql_selected.clear();
@@ -1874,6 +1996,13 @@ impl App {
     pub fn on_left_down(&mut self, m: &mut dyn TextMeasure, cb: &mut dyn Clipboard, wx: f32, y: f32, shift: bool) -> bool {
         self.touch();
         self.hover_act = None;
+        // clicking the Ctrl+Shift+P overlay copies its text
+        if self.show_perf && !self.perf_line.is_empty() && self.perf_rect.contains(wx, y) {
+            cb.set_text(&self.perf_line);
+            self.perf_copied = true;
+            return true;
+        }
+        self.perf_copied = false;
         let ox = self.ox();
         // An open popup owns the click, wherever it lands.
         if let Some(p) = self.popup.take() {
@@ -1921,6 +2050,11 @@ impl App {
                 }
                 true
             }
+            Some((Act::ImageView, _)) => {
+                self.set_focus(Focus::None);
+                self.drag = Some(Drag::Pan { lx: x, ly: y });
+                true
+            }
             Some((act, rect)) => {
                 self.set_focus(Focus::None);
                 self.run(act, rect, cb);
@@ -1957,6 +2091,12 @@ impl App {
 
     fn double_click_main(&mut self, m: &mut dyn TextMeasure, x: f32, y: f32) -> bool {
         match self.hot_at(x, y) {
+            Some((Act::ImageView, _)) => {
+                if let Some(iv) = self.image_view_mut() {
+                    iv.toggle_fit();
+                }
+                true
+            }
             Some((Act::Input(id), _)) => {
                 self.set_focus(Focus::Input(id));
                 if let Some(i) = self.input_mut(id) {
@@ -2029,6 +2169,16 @@ impl App {
         if let Some((Act::Area(id), _)) = self.hot_at(x, y) {
             return self.area_mut(id).map_or(false, |a| a.wheel(notches));
         }
+        if let Some((Act::ImageView, _)) = self.hot_at(x, y) {
+            return match self.image_view_mut() {
+                Some(iv) => {
+                    let area = iv.area;
+                    iv.zoom_at(area, (x, y), notches);
+                    true
+                }
+                None => false,
+            };
+        }
         if self.any_modal() {
             let max = (self.modal_content_h - self.modal_view_h).max(0.0);
             let before = self.modal_scroll;
@@ -2068,7 +2218,11 @@ impl App {
         if self.mouse_win.0 < self.ox() {
             return matches!(self.sb_hot_at(self.mouse_win.0, self.mouse_win.1), Some((Act::Input(_), _)));
         }
-        matches!(self.hot_at(self.mouse.0, self.mouse.1), Some((Act::Input(_) | Act::Area(_), _)))
+        match self.hot_at(self.mouse.0, self.mouse.1) {
+            Some((Act::Input(_), _)) => true,
+            Some((Act::Area(id), _)) => !self.area_ref(id).map_or(false, |a| a.on_bar(self.mouse.0, self.mouse.1)),
+            _ => false,
+        }
     }
 
     // ── keyboard ────────────────────────────────────────────────────
@@ -2088,6 +2242,10 @@ impl App {
                 }
                 Key::Letter('B') => {
                     self.toggle_sidebar();
+                    return true;
+                }
+                Key::Letter('P') if mods.shift => {
+                    self.show_perf = !self.show_perf;
                     return true;
                 }
                 Key::Letter('S') => {
@@ -2206,6 +2364,9 @@ impl App {
     }
 
     pub fn paint(&mut self, c: &mut dyn Canvas) {
+        for key in image_view::take_freed() {
+            c.free_image(key);
+        }
         let th = self.theme.clone();
         let ox = self.ox();
         c.fill_rect(Rect::new(0.0, 0.0, self.win_w.max(self.width + ox), self.height), th.bg);
@@ -2220,6 +2381,7 @@ impl App {
         self.paint_ctx(c, &th);
         self.paint_tip(c, &th);
         self.paint_item_drag(c, &th);
+        self.paint_perf(c, &th);
     }
 
     fn paint_main(&mut self, c: &mut dyn Canvas) {
@@ -2428,6 +2590,33 @@ impl App {
         }
         y = self.cfg_field(c, th, a, y, "Expiry path (optional)", CfgField::ExpiryPath);
         y = self.cfg_field(c, th, a, y, "Default TTL (secs)", CfgField::Ttl);
+
+        // Test Login & Suggest Fields: run the login once, then click a found field to use its path
+        let env_id = self.cur_env_id();
+        let loading = env_id.is_some() && self.auth_test_loading == env_id;
+        let btn = Rect::new(a.l + 174.0, y, a.l + 424.0, y + 32.0);
+        w::button(c, th, btn, if loading { "Testing…" } else { "Test Login & Suggest Fields" }, !loading);
+        if !loading {
+            self.push_hot(btn, Act::AuthTest);
+        }
+        y += ROW_STEP;
+        match env_id.and_then(|id| self.auth_test_result.get(&id)).cloned() {
+            Some(Ok(list)) => {
+                c.text("Found these candidate fields: click one to use its path.", Rect::new(a.l + 174.0, y, a.r, y + 24.0), th.text_dim, w::UI);
+                y += 26.0;
+                for (i, s) in list.iter().enumerate().take(8) {
+                    let r = Rect::new(a.l + 174.0, y, a.r, y + 26.0);
+                    c.text(&format!("Use as {}: {} = {}", s.kind, s.path, crabipie_core::truncate_str(&s.sample_value, 28)), r, th.accent, w::UI);
+                    self.push_hot(r, Act::ApplySuggestion(i));
+                    y += 28.0;
+                }
+            }
+            Some(Err(e)) => {
+                c.text(&format!("Test login failed: {e}"), Rect::new(a.l + 174.0, y, a.r, y + 26.0), th.danger, w::UI);
+                y += 28.0;
+            }
+            None => {}
+        }
         c.text("Reference the token as {{access_token}} in a tab's Bearer field.", Rect::new(a.l, y, a.r, y + 26.0), th.text_dim, w::UI);
         y += 28.0;
         let err = self.modal.as_ref().and_then(|m| self.envs.get(m.sel)).and_then(|e| e.auth_last_error.clone());
@@ -2887,6 +3076,7 @@ impl App {
         let status = rs.status.clone();
         let elapsed = rs.elapsed.map(format_duration);
         let active = if rs.tab == RespTab::Body { 0 } else { 1 };
+        let image_tab = rs.tab == RespTab::Body && rs.image.is_some();
         c.text(&status, Rect::new(p.l + 92.0, hdr_y, status_r, hdr_y + 24.0), col, w::UI);
         if let Some(e) = elapsed {
             let x0 = p.l + 92.0 + 8.0 * status.chars().count() as f32 + 16.0;
@@ -2895,7 +3085,11 @@ impl App {
         w::segmented(c, th, seg, &["Body", "Header"], active);
         self.push_hot(w::seg_rect(seg, 2, 0), Act::RespTab(RespTab::Body));
         self.push_hot(w::seg_rect(seg, 2, 1), Act::RespTab(RespTab::Header));
-        self.paint_area(c, AreaId::Resp, body);
+        if image_tab {
+            self.paint_image_view(c, th, body);
+        } else {
+            self.paint_area(c, AreaId::Resp, body);
+        }
     }
 }
 
@@ -3262,6 +3456,13 @@ impl App {
             Drag::GqlHeight => {
                 self.gql_qfrac = ((y - self.gql_hs.0 - 4.0) / self.gql_hs.1).clamp(0.15, 0.85);
             }
+            Drag::Pan { lx, ly } => {
+                if let Some(iv) = self.image_view_mut() {
+                    let area = iv.area;
+                    iv.pan_by(area, x - lx, y - ly);
+                }
+                self.drag = Some(Drag::Pan { lx: x, ly: y });
+            }
             Drag::Item { id, sx, sy, active } => {
                 if !active && ((wx - sx).powi(2) + (y - sy).powi(2)).sqrt() > 5.0 {
                     self.drag = Some(Drag::Item { id, sx, sy, active: true });
@@ -3452,6 +3653,11 @@ fn tip(act: Act) -> Option<&'static str> {
         Act::GqlClearSel => "Clear selection",
         Act::GqlCollapse => "Collapse all types",
         Act::GqlFetch => "Fetch schema",
+        Act::SaveBlob => "Save to file",
+        Act::ClearResp => "Clear",
+        Act::PrettifyResp => "Prettify JSON",
+        Act::CopyResp => "Copy to clipboard",
+        Act::OpenEnv => "Environments",
         _ => return None,
     })
 }
@@ -3494,6 +3700,145 @@ impl App {
         c.fill_rect(r, th.surface);
         c.stroke_rect(r.inset(0.5), th.border, 1.0);
         c.text(text, Rect::new(r.l + 8.0, r.t, r.r, r.b), th.text, style);
+    }
+}
+
+// ───────────────────────── test login & suggest fields ─────────────────────────
+
+impl App {
+    fn cur_env_id(&self) -> Option<usize> {
+        self.modal.as_ref().and_then(|m| self.envs.get(m.sel)).map(|e| e.id)
+    }
+
+    fn auth_test_start(&mut self) {
+        self.store_cfg();
+        let Some(env) = self.modal.as_ref().and_then(|m| self.envs.get(m.sel)).cloned() else { return };
+        if self.auth_test_loading.is_some() {
+            return;
+        }
+        self.auth_test_result.remove(&env.id);
+        if env.auth_config.as_ref().map_or(true, |c| c.login_endpoint.trim().is_empty()) {
+            self.auth_test_result.insert(env.id, Err("Set a login endpoint first".to_string()));
+            return;
+        }
+        self.auth_test_loading = Some(env.id);
+        self.auth_test_jobs.push((env.id, env));
+    }
+
+    pub fn take_auth_test(&mut self) -> Vec<(usize, Environment)> {
+        std::mem::take(&mut self.auth_test_jobs)
+    }
+
+    pub fn on_auth_test(&mut self, env_id: usize, res: Result<Vec<crabipie_core::FieldSuggestion>, String>) -> bool {
+        self.auth_test_loading = None;
+        self.auth_test_result.insert(env_id, res);
+        true
+    }
+
+    /// A suggestion was clicked: put its path in the matching field.
+    fn apply_suggestion(&mut self, i: usize) {
+        use crabipie_core::SuggestionKind;
+        let Some(id) = self.cur_env_id() else { return };
+        let Some(Ok(list)) = self.auth_test_result.get(&id) else { return };
+        let Some(s) = list.get(i).cloned() else { return };
+        let field = match s.kind {
+            SuggestionKind::AccessToken | SuggestionKind::LooksLikeJwt => CfgField::AccessPath,
+            SuggestionKind::RefreshToken => CfgField::RefreshPath,
+            SuggestionKind::Expiry => CfgField::ExpiryPath,
+        };
+        self.cfg_in[field as usize].edit.set_text(&s.path);
+        self.store_cfg();
+    }
+}
+
+// ───────────────────────── diagnostics ─────────────────────────
+
+impl App {
+    /// Latest frame stats from the window (shown by Ctrl+Shift+P).
+    pub fn set_perf(&mut self, line: String) {
+        self.perf_line = line;
+    }
+
+    fn paint_perf(&mut self, c: &mut dyn Canvas, th: &Theme) {
+        if !self.show_perf || self.perf_line.is_empty() {
+            return;
+        }
+        let style = TextStyle::new(11.0).mono();
+        let line = if self.perf_copied { format!("{}  [copied]", self.perf_line) } else { format!("{}  (click to copy)", self.perf_line) };
+        let w = c.text_width(&line, style) + 16.0;
+        let r = Rect::new((self.win_w - w - 8.0).max(0.0), self.height - 28.0, self.win_w - 8.0, self.height - 6.0);
+        self.perf_rect = r;
+        c.fill_rect(r, th.surface);
+        c.stroke_rect(r.inset(0.5), if self.perf_copied { th.accent } else { th.border }, 1.0);
+        c.text(&line, Rect::new(r.l + 8.0, r.t, r.r, r.b), th.text, style);
+    }
+
+    fn area_ref(&self, id: AreaId) -> Option<&TextArea> {
+        let t = &self.tabs[self.active];
+        match id {
+            AreaId::Body => Some(&t.body),
+            AreaId::GqlQuery => Some(&t.gql_query),
+            AreaId::WsLog => Some(&t.ws_log),
+            AreaId::GqlVars => Some(&t.gql_vars),
+            AreaId::RawHeaders => Some(&t.headers_area),
+            AreaId::RawForm => Some(&t.form_area),
+            AreaId::Resp => t.resp.as_ref().map(|r| match r.tab {
+                RespTab::Body => &r.body,
+                RespTab::Header => &r.headers,
+            }),
+            AreaId::LoginBody => Some(&self.login_area),
+            AreaId::RefreshBody => Some(&self.refresh_area),
+        }
+    }
+}
+
+// ───────────────────────── image viewer ─────────────────────────
+
+fn human_size(bytes: usize) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{:.0} KB", (bytes as f64 / 1024.0).max(1.0))
+    }
+}
+
+impl App {
+    fn paint_image_view(&mut self, c: &mut dyn Canvas, th: &Theme, area: Rect) {
+        c.fill_rect(area, th.bar_bg);
+        c.stroke_rect(area.inset(0.5), th.border, 1.0);
+        let inner = area.inset(1.0);
+        let ix = self.active;
+        let Some(iv) = self.tabs[ix].resp.as_mut().and_then(|r| r.image.as_mut()) else { return };
+        iv.area = inner;
+        if iv.info.is_none() && !iv.failed {
+            match c.load_image(iv.key, &iv.bytes) {
+                Some(info) => iv.info = Some(info),
+                None => iv.failed = true,
+            }
+        }
+        let (key, failed, kind) = (iv.key, iv.failed, iv.kind);
+        let dst = iv.dest(inner);
+        let label = iv.info.map(|i| format!("{kind}  {}×{}  {}  {}%", i.full_w, i.full_h, human_size(iv.bytes.len()), iv.percent(inner)));
+        if failed {
+            let msg = format!("Could not decode this {kind} image on this system. Save the file to open it elsewhere.");
+            c.text(&msg, inner, th.text_dim, w::UI.align(Align::Center));
+        } else {
+            c.push_clip(inner);
+            c.draw_image(key, dst);
+            c.pop_clip();
+            if let Some(l) = label {
+                let style = TextStyle::new(12.0);
+                let wd = c.text_width(&l, style) + 16.0;
+                let chip = Rect::new(inner.l + 8.0, inner.b - 28.0, inner.l + 8.0 + wd, inner.b - 6.0);
+                c.fill_rect(chip, th.surface);
+                c.text(&l, Rect::new(chip.l + 8.0, chip.t, chip.r, chip.b), th.text, style);
+            }
+        }
+        self.push_hot(area, Act::ImageView);
+        let sv = Rect::new(area.r - 36.0, area.t + 6.0, area.r - 6.0, area.t + 32.0);
+        c.fill_rect(sv, th.surface);
+        self.icon_button(c, th, sv, Icon::Save, Act::SaveBlob);
+        self.push_hot(sv, Act::SaveBlob);
     }
 }
 
@@ -3965,5 +4310,140 @@ mod tests {
         h.click(Act::GqlClearSel);
         assert!(h.a.tab().gql_selected.is_empty() && h.a.tab().gql_manual.is_empty());
         assert!(!h.a.tab().gql_query.edit.text().contains("users"));
+    }
+
+    #[test]
+    fn test_login_suggestions_fill_the_token_paths() {
+        use crabipie_core::{FieldSuggestion, SuggestionKind};
+        let mut h = H::new();
+        h.click(Act::OpenEnv);
+        h.click(Act::NewEnv);
+        h.click(Act::ToggleAuthSection);
+        h.click(Act::Picker(PickerKind::AuthMode));
+        let (x, y) = h.a.popup.as_ref().unwrap().item_rect(1).center();
+        h.a.on_left_down(&mut h.m, &mut h.cb, x, y, false);
+        h.repaint();
+
+        // no endpoint yet: a message, no job
+        h.a.run(Act::AuthTest, Rect::default(), &mut h.cb);
+        assert!(h.a.take_auth_test().is_empty());
+        assert!(matches!(h.a.auth_test_result.values().next(), Some(Err(_))));
+
+        h.type_into(InputId::Cfg(CfgField::LoginEndpoint), "https://x.dev/login");
+        h.a.run(Act::AuthTest, Rect::default(), &mut h.cb);
+        let jobs = h.a.take_auth_test();
+        assert_eq!(jobs.len(), 1);
+        assert!(h.a.auth_test_loading.is_some());
+        let found = vec![
+            FieldSuggestion { path: "data.access_token".into(), kind: SuggestionKind::AccessToken, sample_value: "abc".into() },
+            FieldSuggestion { path: "data.expires_in".into(), kind: SuggestionKind::Expiry, sample_value: "3600".into() },
+        ];
+        assert!(h.a.on_auth_test(jobs[0].0, Ok(found)));
+        h.repaint(); // the results list paints
+
+        h.a.run(Act::ApplySuggestion(0), Rect::default(), &mut h.cb);
+        h.a.run(Act::ApplySuggestion(1), Rect::default(), &mut h.cb);
+        let cfg = h.a.envs[0].auth_config.clone().unwrap();
+        assert_eq!((cfg.access_token_path.as_str(), cfg.expiry_path.as_str()), ("data.access_token", "data.expires_in"));
+    }
+
+    #[test]
+    fn response_actions_have_tooltips_scrollbars_get_an_arrow_and_perf_overlay_toggles() {
+        for act in [Act::ClearResp, Act::PrettifyResp, Act::CopyResp, Act::OpenEnv] {
+            assert!(tip(act).is_some(), "{act:?} needs a tooltip");
+        }
+        let mut h = H::new();
+        // a tall response gets a vertical bar; over it the cursor is an arrow, over the text an I-beam
+        let tall = "line\n".repeat(400);
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        h.a.on_response(id, ResponseEvent::Response(HttpResponse { status: "200 OK".into(), body: tall, ..Default::default() }));
+        h.repaint();
+        let area = h.a.tab().resp.as_ref().unwrap().body.rect();
+        let bar = h.a.tab().resp.as_ref().unwrap().body.v_thumb();
+        assert!(bar.height() > 0.0);
+        h.a.on_mouse_move(&mut h.m, bar.l + 2.0, bar.t + 2.0);
+        assert_eq!(h.a.cursor_kind(), CursorKind::Arrow);
+        h.a.on_mouse_move(&mut h.m, area.l + 30.0, area.t + 30.0);
+        assert_eq!(h.a.cursor_kind(), CursorKind::IBeam);
+
+        h.a.on_key(Key::Letter('P'), Mods { ctrl: true, shift: true }, &mut h.cb);
+        assert!(h.a.show_perf);
+        h.a.set_perf("GPU  build 1.0 ms  present 2.0 ms  100 draw calls".into());
+        h.repaint();
+
+        // clicking the overlay puts its text on the clipboard
+        let (x, y) = h.a.perf_rect.center();
+        h.a.on_left_down(&mut h.m, &mut h.cb, x, y, false);
+        assert_eq!(h.cb.get_text().as_deref(), Some("GPU  build 1.0 ms  present 2.0 ms  100 draw calls"));
+        assert!(h.a.perf_copied);
+    }
+
+    #[test]
+    fn big_responses_format_off_the_ui_thread_and_stale_results_are_ignored() {
+        let mut h = H::new();
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        let body = format!("[{}]", vec![r#"{"a":1}"#; 50_000].join(","));
+        assert!(body.len() > BIG_BODY);
+        let r = HttpResponse { status: "200 OK".into(), body, content_type: "application/json".into(), ..Default::default() };
+        assert!(h.a.on_response(id, ResponseEvent::Response(r)));
+        assert!(h.a.tab().resp.as_ref().unwrap().body.edit.text().contains("Formatting"), "placeholder while the worker runs");
+        let jobs = h.a.take_format_jobs();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert!(!h.a.on_formatted(id, job.id + 1, PreparedText::build("x".into(), false), false), "stale result ignored");
+        assert!(h.a.on_formatted(id, job.id, PreparedText::build(job.body.clone(), job.json), job.json));
+        assert!(h.a.tab().resp.as_ref().unwrap().body.edit.text().starts_with("[\n  {\n    \"a\": 1"));
+        assert!(!h.a.on_formatted(id, job.id, PreparedText::build("y".into(), false), false), "a job applies once");
+        h.repaint();
+
+        // small bodies stay synchronous
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        let small = HttpResponse { status: "200 OK".into(), body: "{\"k\":1}".into(), content_type: "application/json".into(), ..Default::default() };
+        h.a.on_response(id, ResponseEvent::Response(small));
+        assert!(h.a.take_format_jobs().is_empty());
+    }
+
+    #[test]
+    fn image_responses_get_a_viewer_with_zoom_pan_and_save() {
+        use crate::ui::canvas::ImageInfo;
+        let mut h = H::new();
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        let png = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 0];
+        let r = HttpResponse { status: "200 OK".into(), is_binary: true, filename: "pic.png".into(), content_type: "image/png".into(), bytes: png.clone(), ..Default::default() };
+        h.a.on_response(id, ResponseEvent::Response(r));
+        h.repaint();
+        // the test canvas can't decode: the viewer says so instead of failing
+        assert!(h.a.tab().resp.as_ref().unwrap().image.as_ref().unwrap().failed);
+
+        // pretend the canvas decoded a 2000x1000 image
+        {
+            let iv = h.a.image_view_mut().unwrap();
+            iv.failed = false;
+            iv.info = Some(ImageInfo { w: 2000, h: 1000, full_w: 2000, full_h: 1000 });
+        }
+        h.repaint();
+        let area = h.rect(Act::ImageView);
+        let (cx, cy) = area.center();
+        h.a.on_mouse_move(&mut h.m, cx, cy);
+        assert!(h.a.on_wheel(3.0), "wheel zooms");
+        assert!(!h.a.image_view_mut().unwrap().is_fit());
+        let before = h.a.image_view_mut().unwrap().dest(area);
+        h.a.on_left_down(&mut h.m, &mut h.cb, cx, cy, false);
+        h.a.on_mouse_move(&mut h.m, cx + 40.0, cy + 10.0);
+        h.a.on_left_up();
+        h.repaint();
+        let after = h.a.image_view_mut().unwrap().dest(area);
+        assert!(after.l != before.l || after.t != before.t, "dragging pans");
+        h.a.on_double_click(&mut h.m, cx, cy);
+        assert!(h.a.image_view_mut().unwrap().is_fit(), "double-click toggles back to fit");
+
+        h.a.run(Act::SaveBlob, Rect::default(), &mut h.cb);
+        let (name, data) = h.a.take_save_blob().unwrap();
+        assert_eq!((name.as_str(), data.len()), ("pic.png", png.len()));
+        assert!(tip(Act::SaveBlob).is_some());
     }
 }

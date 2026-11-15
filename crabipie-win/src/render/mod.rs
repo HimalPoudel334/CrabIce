@@ -2,6 +2,7 @@
 //! Everything is drawn in DIPs: the render target's DPI is set to the
 //! window's DPI, so the rest of the app never sees physical pixels.
 
+mod image;
 use std::collections::HashMap;
 
 use windows::core::{Result, HRESULT};
@@ -15,7 +16,7 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_HARDWARE,
     D2D1_RENDER_TARGET_USAGE_NONE,
 };
 use windows::Win32::Graphics::DirectWrite::{
@@ -53,6 +54,19 @@ pub struct Renderer {
     rt: Option<ID2D1HwndRenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
     formats: HashMap<(u32, bool, Align, bool), IDWriteTextFormat>,
+    /// Measured text widths per (size, bold, mono): measuring builds a DirectWrite
+    /// layout, and the UI asks for the same short strings every frame.
+    widths: HashMap<(u32, bool, bool), HashMap<String, f32>>,
+    images: HashMap<u64, image::ImgEntry>,
+    wic: Option<image::Wic>,
+    /// Ready-made text layouts per (style, box size) and string. `DrawText` builds a
+    /// layout on every call; reusing one makes a repeated string almost free, and a
+    /// scrolled line only moves, so it hits the cache.
+    layouts: HashMap<(u32, bool, Align, bool, u32, u32), HashMap<String, IDWriteTextLayout>>,
+    layout_count: usize,
+    /// Draw calls issued since `take_calls` (for the Ctrl+Shift+P overlay).
+    calls: u32,
+    hardware: bool,
 }
 
 impl Renderer {
@@ -68,6 +82,13 @@ impl Renderer {
                 rt: None,
                 brush: None,
                 formats: HashMap::new(),
+                widths: HashMap::new(),
+                images: HashMap::new(),
+                wic: None,
+                layouts: HashMap::new(),
+                layout_count: 0,
+                calls: 0,
+                hardware: false,
             })
         }
     }
@@ -77,6 +98,7 @@ impl Renderer {
     }
 
     fn create_target(&mut self) -> Result<()> {
+        self.image_drop_gpu();
         unsafe {
             let mut rc = RECT::default();
             GetClientRect(self.hwnd, &mut rc)?;
@@ -101,6 +123,13 @@ impl Renderer {
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
             let rt = self.factory.CreateHwndRenderTarget(&props, &hwnd_props)?;
+            // TYPE_DEFAULT already uses the GPU when there is one; ask whether hardware is available.
+            let hw_props = D2D1_RENDER_TARGET_PROPERTIES { r#type: D2D1_RENDER_TARGET_TYPE_HARDWARE, ..props };
+            let hardware = rt.IsSupported(&hw_props).as_bool();
+            if hardware != self.hardware || self.rt.is_none() {
+                println!("Direct2D render target: {}", if hardware { "GPU (hardware)" } else { "software fallback" });
+            }
+            self.hardware = hardware;
             let dpi = GetDpiForWindow(self.hwnd) as f32;
             rt.SetDpi(dpi, dpi);
             let black = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
@@ -133,6 +162,19 @@ impl Renderer {
                 self.rt = None;
                 self.brush = None;
             }
+        }
+    }
+
+    /// Draw calls since the last call.
+    pub fn take_calls(&mut self) -> u32 {
+        std::mem::take(&mut self.calls)
+    }
+
+    pub fn gpu_label(&self) -> &'static str {
+        if self.hardware {
+            "GPU"
+        } else {
+            "software"
         }
     }
 
@@ -232,12 +274,27 @@ impl TextMeasure for Renderer {
         if s.is_empty() {
             return 0.0;
         }
+        let key = ((style.size * 10.0) as u32, style.bold, style.mono);
+        let cacheable = s.len() <= 200;
+        if cacheable {
+            if let Some(w) = self.widths.get(&key).and_then(|m| m.get(s)) {
+                return *w;
+            }
+        }
         let Some(layout) = self.layout(s, style) else { return 0.0 };
         let mut m: DWRITE_TEXT_METRICS = unsafe { std::mem::zeroed() };
         if unsafe { layout.GetMetrics(&mut m) }.is_err() {
             return 0.0;
         }
-        m.widthIncludingTrailingWhitespace
+        let w = m.widthIncludingTrailingWhitespace;
+        if cacheable {
+            let per_style = self.widths.entry(key).or_default();
+            if per_style.len() > 4096 {
+                per_style.clear(); // crude cap: the working set is small and refills in a frame
+            }
+            per_style.insert(s.to_string(), w);
+        }
+        w
     }
 
     fn text_index_at(&mut self, s: &str, style: TextStyle, x: f32) -> usize {
@@ -268,19 +325,35 @@ impl TextMeasure for Renderer {
 }
 
 impl Canvas for Renderer {
+    fn load_image(&mut self, key: u64, bytes: &[u8]) -> Option<crate::ui::canvas::ImageInfo> {
+        self.image_load(key, bytes)
+    }
+
+    fn draw_image(&mut self, key: u64, dst: Rect) {
+        self.calls += 1;
+        self.image_draw(key, dst);
+    }
+
+    fn free_image(&mut self, key: u64) {
+        self.images.remove(&key);
+    }
+
     fn fill_rect(&mut self, r: Rect, c: Color) {
+        self.calls += 1;
         self.with_brush(c, |rt, brush| unsafe {
             rt.FillRectangle(&d_rect(r), brush);
         });
     }
 
     fn stroke_rect(&mut self, r: Rect, c: Color, width: f32) {
+        self.calls += 1;
         self.with_brush(c, |rt, brush| unsafe {
             rt.DrawRectangle(&d_rect(r), brush, width, None::<&ID2D1StrokeStyle>);
         });
     }
 
     fn line(&mut self, a: (f32, f32), b: (f32, f32), c: Color, width: f32) {
+        self.calls += 1;
         self.with_brush(c, |rt, brush| unsafe {
             rt.DrawLine(
                 D2D_POINT_2F { x: a.0, y: a.1 },
@@ -293,18 +366,40 @@ impl Canvas for Renderer {
     }
 
     fn text(&mut self, s: &str, r: Rect, c: Color, style: TextStyle) {
+        self.calls += 1;
+        if s.is_empty() {
+            return;
+        }
         let Some(fmt) = self.format(style) else { return };
-        let wide: Vec<u16> = s.encode_utf16().collect();
-        let rect = d_rect(r);
+        // very long strings aren't worth keeping: draw them the plain way
+        if s.len() > 300 {
+            let wide: Vec<u16> = s.encode_utf16().collect();
+            let rect = d_rect(r);
+            self.with_brush(c, |rt, brush| unsafe {
+                rt.DrawText(&wide, &fmt, &rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            });
+            return;
+        }
+        let key = ((style.size * 10.0) as u32, style.bold, style.align, style.mono, (r.width() * 10.0).round() as u32, (r.height() * 10.0).round() as u32);
+        let cached = self.layouts.get(&key).and_then(|m| m.get(s)).cloned();
+        let layout = match cached {
+            Some(l) => l,
+            None => {
+                let wide: Vec<u16> = s.encode_utf16().collect();
+                let made = unsafe { self.dwrite.CreateTextLayout(&wide, &fmt, r.width().max(1.0), r.height().max(1.0)) };
+                let Ok(l) = made else { return };
+                if self.layout_count >= 4000 {
+                    self.layouts.clear(); // the on-screen working set is a few hundred: it refills in a frame
+                    self.layout_count = 0;
+                }
+                self.layouts.entry(key).or_default().insert(s.to_string(), l.clone());
+                self.layout_count += 1;
+                l
+            }
+        };
+        let origin = D2D_POINT_2F { x: r.l, y: r.t };
         self.with_brush(c, |rt, brush| unsafe {
-            rt.DrawText(
-                &wide,
-                &fmt,
-                &rect,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+            rt.DrawTextLayout(origin, &layout, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
         });
     }
 

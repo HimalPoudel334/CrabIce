@@ -39,6 +39,11 @@ fn is_word(c: char) -> bool {
 
 /// Single-line edits drop line breaks; multiline keeps '\n'. CRs are always
 /// dropped and tabs become spaces.
+/// What a multi-line editor does to pasted/loaded text (drops \r, tabs become spaces).
+pub fn sanitize_text(s: &str) -> String {
+    sanitize(s, true)
+}
+
 fn sanitize(s: &str, multiline: bool) -> String {
     s.chars()
         .filter(|c| *c != '\r' && (multiline || *c != '\n'))
@@ -79,6 +84,16 @@ impl LineEdit {
     /// Programmatic replace (e.g. loading a saved URL). Clears undo history.
     pub fn set_text(&mut self, s: &str) {
         self.text = sanitize(s, self.multiline);
+        self.rev += 1;
+        self.caret = self.text.len();
+        self.anchor = self.caret;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    /// Takes already-clean text without copying or sanitising it (see `PreparedText`).
+    pub fn set_text_trusted(&mut self, s: String) {
+        self.text = s;
         self.rev += 1;
         self.caret = self.text.len();
         self.anchor = self.caret;
