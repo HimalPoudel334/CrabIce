@@ -18,7 +18,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::app::{App, CursorKind, PersistJob};
+use crate::app::{App, CursorKind, MediaCmd, PersistJob};
+use crate::platform::media::Player;
 use crate::ui::text_area::PreparedText;
 use crate::platform::clipboard::WinClipboard;
 use crate::platform::file_dialog::{pick_file, save_file};
@@ -34,6 +35,8 @@ const WM_APP_RESPONSE: u32 = 0x8001; // WM_APP + 1
 const BLINK_TIMER: usize = 1;
 const BLINK_MS: u32 = 530;
 const SAVE_TIMER: usize = 2;
+const MEDIA_TIMER: usize = 3;
+const MEDIA_MS: u32 = 250;
 const SAVE_MS: u32 = 1000;
 
 enum BridgeMsg {
@@ -44,6 +47,7 @@ enum BridgeMsg {
     Schema { tab_id: usize, res: std::result::Result<GraphqlSchema, String> },
     AuthTest { env_id: usize, res: std::result::Result<Vec<FieldSuggestion>, String> },
     Formatted { tab_id: usize, id: u64, json: bool, prepared: PreparedText },
+    PdfPage { tab_id: usize, id: u64, res: std::result::Result<(u32, u32, Vec<u8>), String> },
 }
 
 /// Called from tokio worker threads: hands an engine event to the UI thread.
@@ -71,6 +75,8 @@ struct Window {
     save_thread: Option<std::thread::JoinHandle<()>>,
     /// (build ms, present ms) of recent frames, for the Ctrl+Shift+P overlay.
     frame_ms: std::collections::VecDeque<(f32, f32)>,
+    /// The audio/video player for the response on screen (one at a time).
+    media: Option<Player>,
 }
 
 fn msgbox(hwnd: HWND, text: &str) {
@@ -138,6 +144,7 @@ impl Window {
             calls,
             self.frame_ms.len()
         ));
+        self.sync_media();
     }
 
     /// Starts any request the app queued (Send button / Enter).
@@ -204,11 +211,61 @@ impl Window {
         }
     }
 
+    /// Renders PDF pages with the system PDF component on the blocking pool.
+    fn dispatch_pdf(&mut self) {
+        for job in self.app.take_pdf_jobs() {
+            let hwnd_raw = self.hwnd.0 as isize;
+            self.rt.spawn_blocking(move || {
+                let res = crate::platform::pdf::render_page(&job.bytes, job.page, job.width).map(|p| (p.page_count, job.page.min(p.page_count.saturating_sub(1)), p.png));
+                post_to_ui(hwnd_raw, BridgeMsg::PdfPage { tab_id: job.tab_id, id: job.id, res });
+            });
+        }
+    }
+
+    /// Runs the app's player commands (open/play/pause/seek/...).
+    fn dispatch_media(&mut self) {
+        for cmd in self.app.take_media_cmds() {
+            match cmd {
+                MediaCmd::Open { key, source, audio } => {
+                    self.media = None; // closes the previous player
+                    match Player::open(self.hwnd, key, &source, audio) {
+                        Ok(p) => self.media = Some(p),
+                        Err(e) => self.app.on_media_failed(key, e),
+                    }
+                }
+                MediaCmd::Play => self.media.as_ref().map(|p| p.play()).unwrap_or(()),
+                MediaCmd::Pause => self.media.as_ref().map(|p| p.pause()).unwrap_or(()),
+                MediaCmd::Seek(s) => self.media.as_ref().map(|p| p.seek(s)).unwrap_or(()),
+                MediaCmd::Volume(v) => self.media.as_ref().map(|p| p.set_volume(v)).unwrap_or(()),
+                MediaCmd::Mute(m) => self.media.as_ref().map(|p| p.set_muted(m)).unwrap_or(()),
+                MediaCmd::Close(key) => {
+                    if self.media.as_ref().map_or(false, |p| p.key == key) {
+                        self.media = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Puts the video window where the app painted the video area (or hides it).
+    fn sync_media(&mut self) {
+        let Some(p) = &self.media else { return };
+        match self.app.media_slot(p.key) {
+            Some(r) => {
+                let s = self.scale();
+                p.place(true, (r.l * s) as i32, (r.t * s) as i32, (r.width() * s) as i32, (r.height() * s) as i32);
+            }
+            None => p.place(false, 0, 0, 0, 0),
+        }
+    }
+
     fn dispatch_sends(&mut self) {
+        self.dispatch_media();
         self.dispatch_ws();
         self.dispatch_gql();
         self.dispatch_auth_test();
         self.dispatch_format();
+        self.dispatch_pdf();
         while let Some(job) = self.app.take_send() {
             let hwnd_raw = self.hwnd.0 as isize;
             let tab_id = job.tab_id;
@@ -316,6 +373,7 @@ pub fn run() -> Result<()> {
             save_tx: Some(save_tx),
             save_thread: Some(save_thread),
             frame_ms: std::collections::VecDeque::new(),
+            media: None,
         });
         let ptr = Box::into_raw(window);
 
@@ -337,6 +395,7 @@ pub fn run() -> Result<()> {
         // caret blink
         SetTimer(hwnd, BLINK_TIMER, BLINK_MS, None);
         SetTimer(hwnd, SAVE_TIMER, SAVE_MS, None);
+        SetTimer(hwnd, MEDIA_TIMER, MEDIA_MS, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -552,6 +611,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     BridgeMsg::Schema { tab_id, res } => win.app.on_schema(tab_id, res),
                     BridgeMsg::AuthTest { env_id, res } => win.app.on_auth_test(env_id, res),
                     BridgeMsg::Formatted { tab_id, id, json, prepared } => win.app.on_formatted(tab_id, id, prepared, json),
+                    BridgeMsg::PdfPage { tab_id, id, res } => win.app.on_pdf_page(tab_id, id, res),
                 };
                 win.dispatch_sends(); // a response may have queued follow-up work (formatting)
                 if repaint {
@@ -561,6 +621,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_MOUSEWHEEL => {
                 let notches = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / 120.0;
+                win.app.set_wheel_ctrl(key_down(VK_CONTROL.0 as i32));
                 if win.app.on_wheel(notches) {
                     win.invalidate();
                 }
@@ -569,6 +630,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_TIMER => {
                 if wparam.0 == BLINK_TIMER && win.app.blink() {
                     win.invalidate();
+                }
+                if wparam.0 == MEDIA_TIMER {
+                    let polled = win.media.as_ref().map(|p| (p.key, p.state()));
+                    if let Some((key, st)) = polled {
+                        if win.app.on_media_state(key, st) {
+                            win.invalidate();
+                        }
+                    }
                 }
                 if wparam.0 == SAVE_TIMER {
                     if let Some(job) = win.app.take_save(false) {
@@ -581,6 +650,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 win.flush_save();
                 let _ = KillTimer(hwnd, BLINK_TIMER);
                 let _ = KillTimer(hwnd, SAVE_TIMER);
+                let _ = KillTimer(hwnd, MEDIA_TIMER);
+                win.media = None;
                 PostQuitMessage(0);
                 LRESULT(0)
             }

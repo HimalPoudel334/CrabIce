@@ -39,8 +39,26 @@ pub fn sniff(b: &[u8]) -> Option<&'static str> {
 pub enum Zoom {
     /// As large as fits, never enlarged beyond 100%.
     Fit,
+    /// As wide as fits (a PDF page: read it by scrolling down), never enlarged beyond 100%.
+    FitWidth,
     Scale(f32),
 }
+
+/// Which end of the image a view starts at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Top,
+    Bottom,
+}
+
+/// A scrollbar: its track and the thumb inside it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bar {
+    pub track: Rect,
+    pub thumb: Rect,
+}
+
+const SB: f32 = 10.0;
 
 pub struct ImageView {
     pub key: u64,
@@ -52,7 +70,14 @@ pub struct ImageView {
     /// Where the image was last drawn: the wheel and drags need it.
     pub area: Rect,
     zoom: Zoom,
+    /// What double-click returns to: `Fit`, or `FitWidth` for PDF pages.
+    base_fit: Zoom,
     pan: (f32, f32),
+    /// Scroll to this edge as soon as the image size is known (first paint).
+    pub start: Option<Edge>,
+    /// Scrollbars as last drawn (for hit testing); None when the image fits.
+    pub vbar: Option<Bar>,
+    pub hbar: Option<Bar>,
 }
 
 /// A clone gets its own key (the canvas decodes it again on first paint), so dropping
@@ -61,7 +86,9 @@ impl Clone for ImageView {
     fn clone(&self) -> Self {
         let mut v = Self::new(self.bytes.clone(), self.kind);
         v.zoom = self.zoom;
+        v.base_fit = self.base_fit;
         v.pan = self.pan;
+        v.start = self.start;
         v
     }
 }
@@ -80,17 +107,30 @@ impl Drop for ImageView {
 
 impl ImageView {
     pub fn new(bytes: Arc<Vec<u8>>, kind: &'static str) -> Self {
-        Self { key: NEXT_KEY.fetch_add(1, Ordering::Relaxed), bytes, kind, info: None, failed: false, area: Rect::default(), zoom: Zoom::Fit, pan: (0.0, 0.0) }
+        Self { key: NEXT_KEY.fetch_add(1, Ordering::Relaxed), bytes, kind, info: None, failed: false, area: Rect::default(), zoom: Zoom::Fit, base_fit: Zoom::Fit, pan: (0.0, 0.0), start: None, vbar: None, hbar: None }
+    }
+
+    /// A PDF page: fit to width, starting at the top.
+    pub fn for_page(mut self) -> Self {
+        self.zoom = Zoom::FitWidth;
+        self.base_fit = Zoom::FitWidth;
+        self.start = Some(Edge::Top);
+        self
+    }
+
+    pub fn pan_y(&self) -> f32 {
+        self.pan.1
     }
 
     pub fn is_fit(&self) -> bool {
-        self.zoom == Zoom::Fit
+        matches!(self.zoom, Zoom::Fit | Zoom::FitWidth)
     }
 
     pub fn scale(&self, area: Rect) -> f32 {
         let Some(i) = self.info else { return 1.0 };
         match self.zoom {
             Zoom::Scale(s) => s,
+            Zoom::FitWidth => (area.width() / i.w as f32).min(1.0).max(0.01),
             Zoom::Fit => (area.width() / i.w as f32).min(area.height() / i.h as f32).min(1.0).max(0.01),
         }
     }
@@ -104,10 +144,60 @@ impl ImageView {
     }
 
     fn clamped_pan(&self, area: Rect, s: f32) -> (f32, f32) {
-        let Some(i) = self.info else { return (0.0, 0.0) };
-        let mx = ((i.w as f32 * s - area.width()) / 2.0).max(0.0);
-        let my = ((i.h as f32 * s - area.height()) / 2.0).max(0.0);
+        if self.info.is_none() {
+            return (0.0, 0.0);
+        }
+        let (mx, my) = self.margins(area, s);
         (self.pan.0.clamp(-mx, mx), self.pan.1.clamp(-my, my))
+    }
+
+    /// Half of how far the image overflows the area, per axis (the pan range is +-this).
+    fn margins(&self, area: Rect, s: f32) -> (f32, f32) {
+        let Some(i) = self.info else { return (0.0, 0.0) };
+        (((i.w as f32 * s - area.width()) / 2.0).max(0.0), ((i.h as f32 * s - area.height()) / 2.0).max(0.0))
+    }
+
+    /// Scrollbars for the current zoom/pan: (vertical, horizontal). None on an axis where the image fits.
+    pub fn bars(&self, area: Rect) -> (Option<Bar>, Option<Bar>) {
+        let Some(i) = self.info else { return (None, None) };
+        let s = self.scale(area);
+        let (mx, my) = self.margins(area, s);
+        let (w, h) = (i.w as f32 * s, i.h as f32 * s);
+        let (px, py) = self.clamped_pan(area, s);
+        let (has_v, has_h) = (my > 0.0, mx > 0.0);
+        let vbar = has_v.then(|| {
+            let track = Rect::new(area.r - SB - 2.0, area.t + 2.0, area.r - 2.0, area.b - 2.0 - if has_h { SB } else { 0.0 });
+            let len = (track.height() * area.height() / h).clamp(24.0, track.height());
+            let top = track.t + (my - py) / (2.0 * my) * (track.height() - len);
+            Bar { track, thumb: Rect::new(track.l + 2.0, top, track.r - 2.0, top + len) }
+        });
+        let hbar = has_h.then(|| {
+            let track = Rect::new(area.l + 2.0, area.b - SB - 2.0, area.r - 2.0 - if has_v { SB } else { 0.0 }, area.b - 2.0);
+            let len = (track.width() * area.width() / w).clamp(24.0, track.width());
+            let left = track.l + (mx - px) / (2.0 * mx) * (track.width() - len);
+            Bar { track, thumb: Rect::new(left, track.t + 2.0, left + len, track.b - 2.0) }
+        });
+        (vbar, hbar)
+    }
+
+    /// Moves the scroll position so the thumb's top/left edge is at `pos` (a thumb drag).
+    pub fn set_scroll_from_thumb(&mut self, area: Rect, vertical: bool, pos: f32) {
+        let (vb, hb) = self.bars(area);
+        let Some(b) = (if vertical { vb } else { hb }) else { return };
+        let (room, start) = if vertical { (b.track.height() - b.thumb.height(), b.track.t) } else { (b.track.width() - b.thumb.width(), b.track.l) };
+        let frac = ((pos - start) / room.max(1.0)).clamp(0.0, 1.0);
+        let (mx, my) = self.margins(area, self.scale(area));
+        if vertical {
+            self.pan.1 = my - frac * 2.0 * my;
+        } else {
+            self.pan.0 = mx - frac * 2.0 * mx;
+        }
+    }
+
+    /// Scrolls to the top or bottom edge.
+    pub fn scroll_to(&mut self, area: Rect, edge: Edge) {
+        let (_, my) = self.margins(area, self.scale(area));
+        self.pan.1 = if edge == Edge::Top { my } else { -my };
     }
 
     /// Where the image is drawn: centred in `area`, offset by the pan, which can never
@@ -142,8 +232,11 @@ impl ImageView {
 
     /// Fit <-> 100%.
     pub fn toggle_fit(&mut self) {
-        self.zoom = if self.zoom == Zoom::Fit { Zoom::Scale(1.0) } else { Zoom::Fit };
+        self.zoom = if self.is_fit() { Zoom::Scale(1.0) } else { self.base_fit };
         self.pan = (0.0, 0.0);
+        if self.base_fit == Zoom::FitWidth {
+            self.start = Some(Edge::Top);
+        }
     }
 }
 
@@ -199,5 +292,35 @@ mod tests {
         assert_eq!(sniff(b"GIF89a...."), Some("GIF"));
         assert_eq!(sniff(b"RIFF\x10\0\0\0WEBPVP8 "), Some("WebP"));
         assert_eq!(sniff(b"hello"), None);
+    }
+
+    #[test]
+    fn scrollbars_track_the_scroll_position_and_pages_start_at_an_edge() {
+        let area = Rect::new(0.0, 0.0, 500.0, 400.0);
+        // a tall page: 2000 x 2800 fitted to width 500 -> scale 0.25 -> 500 x 700: overflows vertically only
+        let mut v = view(2000, 2800).for_page();
+        assert!(v.is_fit() && (v.scale(area) - 0.25).abs() < 1e-6);
+        let (vb, hb) = v.bars(area);
+        assert!(vb.is_some() && hb.is_none());
+        v.scroll_to(area, Edge::Top);
+        let top = v.bars(area).0.unwrap();
+        assert!((top.thumb.t - top.track.t).abs() < 0.5, "at the top the thumb is at the top");
+        assert_eq!(v.dest(area).t, area.t);
+        v.scroll_to(area, Edge::Bottom);
+        let bot = v.bars(area).0.unwrap();
+        assert!((bot.thumb.b - bot.track.b).abs() < 0.5);
+        assert_eq!(v.dest(area).b, area.b);
+
+        // dragging the thumb to the middle of its range scrolls to the middle
+        let mid = bot.track.t + (bot.track.height() - bot.thumb.height()) / 2.0;
+        v.set_scroll_from_thumb(area, true, mid);
+        let d = v.dest(area);
+        assert!(((d.t + d.b) / 2.0 - (area.t + area.b) / 2.0).abs() < 1.0, "centred");
+
+        // zooming past the area adds the horizontal bar too
+        v.zoom_at(area, (250.0, 200.0), 8.0);
+        assert!(v.bars(area).1.is_some());
+        v.toggle_fit();
+        assert!(v.is_fit() && v.start == Some(Edge::Top));
     }
 }

@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ui::icons::{self, Icon};
-use crate::ui::image_view::{self, ImageView};
+use crate::ui::image_view::{self, Edge, ImageView};
+use crate::ui::media_view::{self, MediaState, MediaView, Source};
+use crate::ui::pdf_view::{self, PdfView};
 use crate::ui::canvas::{Align, Canvas, TextMeasure, TextStyle};
 use crate::ui::geom::{Color, Rect};
 use crate::ui::input::{Clipboard, Key, Mods};
@@ -34,6 +36,26 @@ const ROW_H: f32 = 34.0;
 const ROW_STEP: f32 = 42.0;
 /// Response bodies above this are formatted off the UI thread.
 const BIG_BODY: usize = 256 * 1024;
+
+/// Orders for the audio/video player (executed by the window).
+pub enum MediaCmd {
+    Open { key: u64, source: Source, audio: bool },
+    Play,
+    Pause,
+    Seek(f64),
+    Volume(f64),
+    Mute(bool),
+    Close(u64),
+}
+
+/// One PDF page to render on a worker thread.
+pub struct PdfJob {
+    pub tab_id: usize,
+    pub id: u64,
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub page: u32,
+    pub width: u32,
+}
 
 /// A big response waiting to be pretty-printed and line-indexed on a worker.
 pub struct FormatJob {
@@ -93,6 +115,12 @@ pub enum Act {
     GqlClearSel,
     ImageView,
     SaveBlob,
+    PdfPrev,
+    PdfNext,
+    MediaPlay,
+    MediaSeek,
+    MediaVolume,
+    MediaMute,
     AuthTest,
     ApplySuggestion(usize),
     GqlExpand(usize),
@@ -142,7 +170,7 @@ struct Hot { rect: Rect, act: Act }
 
 /// Mouse drags in progress: panel splitters and sidebar item moves.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Drag { Sidebar, Split, GqlTree, GqlHeight, Pan { lx: f32, ly: f32 }, Item { id: usize, sx: f32, sy: f32, active: bool } }
+enum Drag { Sidebar, Split, GqlTree, GqlHeight, Pan { lx: f32, ly: f32 }, ImgBar { vertical: bool, grab: f32 }, Seek { track: Rect }, Volume { track: Rect }, Item { id: usize, sx: f32, sy: f32, active: bool } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorKind { Arrow, IBeam, ResizeWE, ResizeNS }
@@ -269,6 +297,10 @@ pub struct RespState {
     pub fmt_id: u64,
     /// Set for image responses: shown by the image viewer instead of the text area.
     pub image: Option<ImageView>,
+    /// Set for PDF responses: the page being shown (rendered into `image`).
+    pub pdf: Option<PdfView>,
+    /// Set for audio/video responses.
+    pub media: Option<MediaView>,
     /// A binary response's file name and bytes (the Save button).
     pub blob: Option<(String, std::sync::Arc<Vec<u8>>)>,
 }
@@ -283,6 +315,8 @@ impl RespState {
             headers: TextArea::readonly("(no headers)"),
             fmt_id: 0,
             image: None,
+            pdf: None,
+            media: None,
             blob: None,
         }
     }
@@ -741,6 +775,12 @@ pub struct App {
     auth_test_loading: Option<usize>,
     auth_test_result: HashMap<usize, Result<Vec<crabipie_core::FieldSuggestion>, String>>,
     fmt_seq: u64,
+    media_cmds: Vec<MediaCmd>,
+    media_live: Option<u64>,
+    media_slot: Option<(u64, Rect)>,
+    wheel_ctrl: bool,
+    pdf_flip_at: Option<std::time::Instant>,
+    pdf_jobs: Vec<PdfJob>,
     blob_req: bool,
     format_jobs: Vec<FormatJob>,
     show_perf: bool,
@@ -844,6 +884,12 @@ impl App {
             auth_test_loading: None,
             auth_test_result: HashMap::new(),
             fmt_seq: 0,
+            media_cmds: Vec::new(),
+            media_live: None,
+            media_slot: None,
+            wheel_ctrl: false,
+            pdf_flip_at: None,
+            pdf_jobs: Vec::new(),
             blob_req: false,
             format_jobs: Vec::new(),
             show_perf: false,
@@ -1240,7 +1286,7 @@ impl App {
                 // big bodies are formatted and indexed on a worker thread; show a placeholder meanwhile
                 let big = !r.is_streaming && r.body.len() > BIG_BODY;
                 let mut rs = if big { Self::resp_state_pending(&r) } else { Self::resp_state(&r) };
-                Self::attach_binary(&mut rs, &r);
+                Self::attach_binary(&mut rs, &r, &url);
                 if big {
                     self.fmt_seq += 1;
                     rs.fmt_id = self.fmt_seq;
@@ -1249,7 +1295,15 @@ impl App {
                 let t = &mut self.tabs[ix];
                 t.sending = r.is_streaming;
                 t.streaming = r.is_streaming;
+                let is_pdf = rs.pdf.is_some();
+                let media_key = rs.media.as_ref().map(|m| m.key);
                 t.resp = Some(rs);
+                if let Some(key) = media_key {
+                    self.media_open(key); // loads paused: the first frame shows, Play starts it
+                }
+                if is_pdf {
+                    self.request_pdf_page(tab_id, 0, Edge::Top);
+                }
             }
             ResponseEvent::Chunk(s) => {
                 if let Some(rs) = self.tabs[ix].resp.as_mut() {
@@ -1291,7 +1345,14 @@ impl App {
     }
 
     /// Binary responses: an image goes to the viewer, SVG is shown as text, everything keeps a Save button.
-    fn attach_binary(rs: &mut RespState, r: &HttpResponse) {
+    fn attach_binary(rs: &mut RespState, r: &HttpResponse, url: &str) {
+        let ct = r.content_type.to_ascii_lowercase();
+        // range-capable audio/video isn't downloaded: the player streams it from the URL
+        if r.bytes.is_empty() && r.accepts_range && !url.is_empty() && (ct.starts_with("video/") || ct.starts_with("audio/")) {
+            let name = if r.filename.is_empty() { url.rsplit('/').next().unwrap_or("media").to_string() } else { r.filename.clone() };
+            rs.media = Some(MediaView::new(Source::Url(url.to_string()), ct.starts_with("audio/"), name));
+            return;
+        }
         if !r.is_binary || r.bytes.is_empty() {
             return;
         }
@@ -1299,6 +1360,15 @@ impl App {
         rs.blob = Some((r.filename.clone(), data.clone()));
         if r.content_type.contains("svg") {
             rs.body.set_text(&String::from_utf8_lossy(&r.bytes));
+            return;
+        }
+        if pdf_view::is_pdf(&r.bytes, &r.content_type) {
+            rs.pdf = Some(PdfView::new(data));
+            return;
+        }
+        if let Some(audio) = media_view::kind(&r.bytes, &r.content_type) {
+            let source = Source::Bytes { data, name: r.filename.clone(), content_type: r.content_type.clone() };
+            rs.media = Some(MediaView::new(source, audio, r.filename.clone()));
             return;
         }
         let kind = image_view::sniff(&r.bytes).or_else(|| r.content_type.starts_with("image/").then_some("image"));
@@ -1765,6 +1835,18 @@ impl App {
                 t.gql_scroll = 0.0;
             }
             Act::SaveBlob => self.blob_req = true,
+            Act::MediaPlay => self.media_toggle(),
+            Act::MediaSeek => {
+                self.media_seek_to(rect, self.mouse.0);
+                self.drag = Some(Drag::Seek { track: rect });
+            }
+            Act::MediaVolume => {
+                self.media_volume_to(rect, self.mouse.0);
+                self.drag = Some(Drag::Volume { track: rect });
+            }
+            Act::MediaMute => self.media_mute(),
+            Act::PdfPrev => self.pdf_step(-1, Edge::Top),
+            Act::PdfNext => self.pdf_step(1, Edge::Top),
             Act::ImageView => {} // handled by the mouse code (pan / zoom / double-click)
             Act::AuthTest => self.auth_test_start(),
             Act::ApplySuggestion(i) => self.apply_suggestion(i),
@@ -2052,7 +2134,24 @@ impl App {
             }
             Some((Act::ImageView, _)) => {
                 self.set_focus(Focus::None);
-                self.drag = Some(Drag::Pan { lx: x, ly: y });
+                let hit = self.image_view_mut().map(|iv| (iv.area, iv.vbar, iv.hbar));
+                let mut drag = Some(Drag::Pan { lx: x, ly: y });
+                if let Some((area, vbar, hbar)) = hit {
+                    for (bar, vertical) in [(vbar, true), (hbar, false)] {
+                        let Some(b) = bar else { continue };
+                        if b.thumb.contains(x, y) {
+                            drag = Some(Drag::ImgBar { vertical, grab: if vertical { y - b.thumb.t } else { x - b.thumb.l } });
+                        } else if b.track.contains(x, y) {
+                            // a click on the track pages toward it
+                            drag = None;
+                            let (dx, dy) = if vertical { (0.0, (if y < b.thumb.t { 1.0 } else { -1.0 }) * area.height() * 0.9) } else { ((if x < b.thumb.l { 1.0 } else { -1.0 }) * area.width() * 0.9, 0.0) };
+                            if let Some(iv) = self.image_view_mut() {
+                                iv.pan_by(area, dx, dy);
+                            }
+                        }
+                    }
+                }
+                self.drag = drag;
                 true
             }
             Some((act, rect)) => {
@@ -2170,6 +2269,10 @@ impl App {
             return self.area_mut(id).map_or(false, |a| a.wheel(notches));
         }
         if let Some((Act::ImageView, _)) = self.hot_at(x, y) {
+            let is_pdf = self.tabs[self.active].resp.as_ref().map_or(false, |r| r.pdf.is_some());
+            if is_pdf && !self.wheel_ctrl {
+                return self.pdf_scroll(notches); // Ctrl+wheel zooms; plain wheel reads the page
+            }
             return match self.image_view_mut() {
                 Some(iv) => {
                     let area = iv.area;
@@ -2367,6 +2470,7 @@ impl App {
         for key in image_view::take_freed() {
             c.free_image(key);
         }
+        self.media_slot = None; // repainted below if a video is visible
         let th = self.theme.clone();
         let ox = self.ox();
         c.fill_rect(Rect::new(0.0, 0.0, self.win_w.max(self.width + ox), self.height), th.bg);
@@ -3076,7 +3180,9 @@ impl App {
         let status = rs.status.clone();
         let elapsed = rs.elapsed.map(format_duration);
         let active = if rs.tab == RespTab::Body { 0 } else { 1 };
-        let image_tab = rs.tab == RespTab::Body && rs.image.is_some();
+        let image_tab = rs.tab == RespTab::Body && (rs.image.is_some() || rs.pdf.is_some());
+        let pdf_tab = rs.pdf.is_some();
+        let media_tab = rs.tab == RespTab::Body && rs.media.is_some();
         c.text(&status, Rect::new(p.l + 92.0, hdr_y, status_r, hdr_y + 24.0), col, w::UI);
         if let Some(e) = elapsed {
             let x0 = p.l + 92.0 + 8.0 * status.chars().count() as f32 + 16.0;
@@ -3085,8 +3191,12 @@ impl App {
         w::segmented(c, th, seg, &["Body", "Header"], active);
         self.push_hot(w::seg_rect(seg, 2, 0), Act::RespTab(RespTab::Body));
         self.push_hot(w::seg_rect(seg, 2, 1), Act::RespTab(RespTab::Header));
-        if image_tab {
-            self.paint_image_view(c, th, body);
+        if media_tab {
+            self.paint_media_view(c, th, body);
+        } else if image_tab && pdf_tab {
+            self.paint_pdf_view(c, th, body);
+        } else if image_tab {
+            self.paint_image_view(c, th, body, false);
         } else {
             self.paint_area(c, AreaId::Resp, body);
         }
@@ -3463,6 +3573,14 @@ impl App {
                 }
                 self.drag = Some(Drag::Pan { lx: x, ly: y });
             }
+            Drag::Seek { track } => self.media_seek_to(track, x),
+            Drag::Volume { track } => self.media_volume_to(track, x),
+            Drag::ImgBar { vertical, grab } => {
+                if let Some(iv) = self.image_view_mut() {
+                    let area = iv.area;
+                    iv.set_scroll_from_thumb(area, vertical, if vertical { y - grab } else { x - grab });
+                }
+            }
             Drag::Item { id, sx, sy, active } => {
                 if !active && ((wx - sx).powi(2) + (y - sy).powi(2)).sqrt() > 5.0 {
                     self.drag = Some(Drag::Item { id, sx, sy, active: true });
@@ -3654,6 +3772,10 @@ fn tip(act: Act) -> Option<&'static str> {
         Act::GqlCollapse => "Collapse all types",
         Act::GqlFetch => "Fetch schema",
         Act::SaveBlob => "Save to file",
+        Act::MediaPlay => "Play / Pause",
+        Act::MediaMute => "Mute",
+        Act::PdfPrev => "Previous page",
+        Act::PdfNext => "Next page",
         Act::ClearResp => "Clear",
         Act::PrettifyResp => "Prettify JSON",
         Act::CopyResp => "Copy to clipboard",
@@ -3803,7 +3925,7 @@ fn human_size(bytes: usize) -> String {
 }
 
 impl App {
-    fn paint_image_view(&mut self, c: &mut dyn Canvas, th: &Theme, area: Rect) {
+    fn paint_image_view(&mut self, c: &mut dyn Canvas, th: &Theme, area: Rect, pdf: bool) {
         c.fill_rect(area, th.bar_bg);
         c.stroke_rect(area.inset(0.5), th.border, 1.0);
         let inner = area.inset(1.0);
@@ -3816,9 +3938,16 @@ impl App {
                 None => iv.failed = true,
             }
         }
+        if let (Some(edge), true) = (iv.start, iv.info.is_some()) {
+            iv.start = None;
+            iv.scroll_to(inner, edge);
+        }
         let (key, failed, kind) = (iv.key, iv.failed, iv.kind);
         let dst = iv.dest(inner);
-        let label = iv.info.map(|i| format!("{kind}  {}×{}  {}  {}%", i.full_w, i.full_h, human_size(iv.bytes.len()), iv.percent(inner)));
+        let (vbar, hbar) = iv.bars(inner);
+        iv.vbar = vbar;
+        iv.hbar = hbar;
+        let label = iv.info.map(|i| if pdf { format!("{}%", iv.percent(inner)) } else { format!("{kind}  {}×{}  {}  {}%", i.full_w, i.full_h, human_size(iv.bytes.len()), iv.percent(inner)) });
         if failed {
             let msg = format!("Could not decode this {kind} image on this system. Save the file to open it elsewhere.");
             c.text(&msg, inner, th.text_dim, w::UI.align(Align::Center));
@@ -3826,6 +3955,10 @@ impl App {
             c.push_clip(inner);
             c.draw_image(key, dst);
             c.pop_clip();
+            let dragging = matches!(self.drag, Some(Drag::ImgBar { .. }));
+            for b in [vbar, hbar].into_iter().flatten() {
+                c.fill_rect(b.thumb, th.text_dim.alpha(if dragging { 0.7 } else { 0.45 }));
+            }
             if let Some(l) = label {
                 let style = TextStyle::new(12.0);
                 let wd = c.text_width(&l, style) + 16.0;
@@ -3835,10 +3968,294 @@ impl App {
             }
         }
         self.push_hot(area, Act::ImageView);
-        let sv = Rect::new(area.r - 36.0, area.t + 6.0, area.r - 6.0, area.t + 32.0);
-        c.fill_rect(sv, th.surface);
+        if !pdf {
+            let sv = Rect::new(area.r - 36.0, area.t + 6.0, area.r - 6.0, area.t + 32.0);
+            c.fill_rect(sv, th.surface);
+            self.icon_button(c, th, sv, Icon::Save, Act::SaveBlob);
+            self.push_hot(sv, Act::SaveBlob);
+        }
+    }
+}
+
+// ───────────────────────── PDF viewer ─────────────────────────
+
+impl App {
+    /// Asks a worker to render `page` of the active response's PDF in tab `tab_id`.
+    fn request_pdf_page(&mut self, tab_id: usize, page: u32, land: Edge) {
+        self.fmt_seq += 1;
+        let id = self.fmt_seq;
+        let Some(pdf) = self.tabs.iter_mut().find(|t| t.id == tab_id).and_then(|t| t.resp.as_mut()).and_then(|r| r.pdf.as_mut()) else { return };
+        pdf.page = page;
+        pdf.land = land;
+        pdf.req_id = id;
+        pdf.loading = true;
+        pdf.error = None;
+        self.pdf_jobs.push(PdfJob { tab_id, id, bytes: pdf.bytes.clone(), page, width: pdf_view::RENDER_WIDTH });
+    }
+
+    fn pdf_step(&mut self, delta: i32, land: Edge) {
+        let tab_id = self.tabs[self.active].id;
+        let Some(pdf) = self.tabs[self.active].resp.as_ref().and_then(|r| r.pdf.as_ref()) else { return };
+        let ok = if delta < 0 { pdf.can_prev() } else { pdf.can_next() };
+        if ok {
+            let to = (pdf.page as i64 + delta as i64) as u32;
+            self.request_pdf_page(tab_id, to, land);
+        }
+    }
+
+    /// Window tells us whether Ctrl is held when the wheel turns.
+    pub fn set_wheel_ctrl(&mut self, ctrl: bool) {
+        self.wheel_ctrl = ctrl;
+    }
+
+    /// Wheel over a PDF page: scroll it; at the end of the page keep scrolling to flip to the next/previous one.
+    fn pdf_scroll(&mut self, notches: f32) -> bool {
+        let loading = self.tabs[self.active].resp.as_ref().and_then(|r| r.pdf.as_ref()).map_or(true, |p| p.loading);
+        let Some(iv) = self.image_view_mut() else { return false };
+        if iv.info.is_none() {
+            return false;
+        }
+        let area = iv.area;
+        let before = iv.pan_y();
+        iv.pan_by(area, 0.0, notches * 80.0);
+        if iv.pan_y() != before {
+            return true;
+        }
+        if loading || self.pdf_flip_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(300)) {
+            return false;
+        }
+        self.pdf_flip_at = Some(std::time::Instant::now());
+        if notches < 0.0 {
+            self.pdf_step(1, Edge::Top);
+        } else {
+            self.pdf_step(-1, Edge::Bottom);
+        }
+        true
+    }
+
+    pub fn take_pdf_jobs(&mut self) -> Vec<PdfJob> {
+        std::mem::take(&mut self.pdf_jobs)
+    }
+
+    /// A worker finished a page: (page count, page shown, PNG bytes) or an error message.
+    pub fn on_pdf_page(&mut self, tab_id: usize, id: u64, res: Result<(u32, u32, Vec<u8>), String>) -> bool {
+        let Some(rs) = self.tabs.iter_mut().find(|t| t.id == tab_id).and_then(|t| t.resp.as_mut()) else { return false };
+        let Some(pdf) = rs.pdf.as_mut() else { return false };
+        if pdf.req_id != id {
+            return false; // a newer page was requested meanwhile
+        }
+        pdf.loading = false;
+        match res {
+            Ok((count, page, png)) => {
+                pdf.pages = Some(count);
+                pdf.page = page;
+                pdf.error = None;
+                let mut page_view = ImageView::new(std::sync::Arc::new(png), "PDF").for_page();
+                page_view.start = Some(pdf.land);
+                rs.image = Some(page_view);
+            }
+            Err(e) => pdf.error = Some(e),
+        }
+        true
+    }
+
+    fn paint_pdf_view(&mut self, c: &mut dyn Canvas, th: &Theme, area: Rect) {
+        const BAR: f32 = 34.0;
+        let Some(pdf) = self.tabs[self.active].resp.as_ref().and_then(|r| r.pdf.clone()) else { return };
+        let has_image = self.tabs[self.active].resp.as_ref().map_or(false, |r| r.image.is_some());
+        c.fill_rect(Rect::new(area.l, area.t, area.r, area.t + BAR), th.surface);
+        c.stroke_rect(area.inset(0.5), th.border, 1.0);
+        let mut x = area.l + 6.0;
+        for (icon, act, enabled) in [(Icon::ChevronLeft, Act::PdfPrev, pdf.can_prev()), (Icon::ChevronRight, Act::PdfNext, pdf.can_next())] {
+            let r = Rect::new(x, area.t + 4.0, x + 30.0, area.t + BAR - 4.0);
+            if enabled {
+                self.icon_button(c, th, r, icon, act);
+                self.push_hot(r, act);
+            } else {
+                icons::draw(c, icon, r, th.text_dim.alpha(0.4));
+            }
+            x += 34.0;
+        }
+        let label = if pdf.loading { format!("{} …", pdf.label()) } else { pdf.label() };
+        c.text(&label, Rect::new(x + 6.0, area.t, area.r - 44.0, area.t + BAR), th.text, TextStyle::new(13.0));
+        let sv = Rect::new(area.r - 36.0, area.t + 4.0, area.r - 6.0, area.t + BAR - 4.0);
         self.icon_button(c, th, sv, Icon::Save, Act::SaveBlob);
         self.push_hot(sv, Act::SaveBlob);
+
+        let viewer = Rect::new(area.l, area.t + BAR, area.r, area.b);
+        if has_image {
+            self.paint_image_view(c, th, viewer, true);
+        } else {
+            c.fill_rect(viewer, th.bar_bg);
+            let (msg, col) = match &pdf.error {
+                Some(e) => (format!("Could not render this PDF: {e}"), th.danger),
+                None => ("Rendering PDF…".to_string(), th.text_dim),
+            };
+            c.text(&msg, viewer, col, TextStyle::new(13.0).align(Align::Center));
+        }
+    }
+}
+
+// ───────────────────────── audio / video player ─────────────────────────
+
+impl App {
+    fn media_view_mut(&mut self, key: u64) -> Option<&mut MediaView> {
+        self.tabs.iter_mut().filter_map(|t| t.resp.as_mut()).filter_map(|r| r.media.as_mut()).find(|m| m.key == key)
+    }
+
+    fn active_media(&self) -> Option<&MediaView> {
+        self.tabs[self.active].resp.as_ref().and_then(|r| r.media.as_ref())
+    }
+
+    /// Hands the response's media to the player (replacing whatever played before).
+    fn media_open(&mut self, key: u64) {
+        let Some((source, audio)) = self.media_view_mut(key).map(|m| (m.source.clone(), m.audio)) else { return };
+        for t in self.tabs.iter_mut() {
+            if let Some(m) = t.resp.as_mut().and_then(|r| r.media.as_mut()) {
+                m.live = m.key == key;
+                if m.key != key {
+                    m.playing = false;
+                }
+            }
+        }
+        self.media_live = Some(key);
+        self.media_cmds.push(MediaCmd::Open { key, source, audio });
+    }
+
+    fn media_toggle(&mut self) {
+        let Some((key, live, playing)) = self.active_media().map(|m| (m.key, m.live, m.playing)) else { return };
+        if !live {
+            self.media_open(key);
+            self.media_cmds.push(MediaCmd::Play);
+        } else if playing {
+            self.media_cmds.push(MediaCmd::Pause);
+        } else {
+            self.media_cmds.push(MediaCmd::Play);
+        }
+        if let Some(m) = self.media_view_mut(key) {
+            m.playing = !playing;
+            m.ended = false;
+        }
+    }
+
+    fn media_seek_to(&mut self, track: Rect, x: f32) {
+        let frac = ((x - track.l) / track.width().max(1.0)).clamp(0.0, 1.0) as f64;
+        let Some(m) = self.tabs[self.active].resp.as_mut().and_then(|r| r.media.as_mut()) else { return };
+        if !m.live || m.duration <= 0.0 {
+            return;
+        }
+        m.position = frac * m.duration;
+        m.ended = false;
+        let pos = m.position;
+        self.media_cmds.push(MediaCmd::Seek(pos));
+    }
+
+    fn media_volume_to(&mut self, track: Rect, x: f32) {
+        let frac = ((x - track.l) / track.width().max(1.0)).clamp(0.0, 1.0) as f64;
+        let Some(m) = self.tabs[self.active].resp.as_mut().and_then(|r| r.media.as_mut()) else { return };
+        m.volume = frac;
+        m.muted = false;
+        self.media_cmds.push(MediaCmd::Mute(false));
+        self.media_cmds.push(MediaCmd::Volume(frac));
+    }
+
+    fn media_mute(&mut self) {
+        let Some(m) = self.tabs[self.active].resp.as_mut().and_then(|r| r.media.as_mut()) else { return };
+        m.muted = !m.muted;
+        let muted = m.muted;
+        self.media_cmds.push(MediaCmd::Mute(muted));
+    }
+
+    /// Commands for the player; also closes players whose response is gone.
+    pub fn take_media_cmds(&mut self) -> Vec<MediaCmd> {
+        let mut cmds = std::mem::take(&mut self.media_cmds);
+        for key in media_view::take_closed() {
+            if self.media_live == Some(key) {
+                self.media_live = None;
+            }
+            cmds.push(MediaCmd::Close(key));
+        }
+        cmds
+    }
+
+    /// The player reported its state. True if the UI has something new to show.
+    pub fn on_media_state(&mut self, key: u64, st: MediaState) -> bool {
+        self.media_view_mut(key).map_or(false, |m| m.apply(&st))
+    }
+
+    pub fn on_media_failed(&mut self, key: u64, msg: String) {
+        if let Some(m) = self.media_view_mut(key) {
+            m.error = Some(msg);
+            m.live = false;
+            m.playing = false;
+        }
+    }
+
+    /// Where the video window should be (window DIPs) if `key` is the video on screen.
+    pub fn media_slot(&self, key: u64) -> Option<Rect> {
+        self.media_slot.filter(|(k, _)| *k == key).map(|(_, r)| r)
+    }
+
+    fn paint_media_view(&mut self, c: &mut dyn Canvas, th: &Theme, area: Rect) {
+        const BAR: f32 = 44.0;
+        let Some(m) = self.active_media().map(|m| m.snap()) else { return };
+        let can_save = self.tabs[self.active].resp.as_ref().map_or(false, |r| r.blob.is_some());
+        c.fill_rect(area, th.bar_bg);
+        c.stroke_rect(area.inset(0.5), th.border, 1.0);
+        let video = Rect::new(area.l + 1.0, area.t + 1.0, area.r - 1.0, area.b - BAR);
+        let centered = TextStyle::new(13.0).align(Align::Center);
+        if let Some(e) = &m.error {
+            c.text(&format!("Cannot play this: {e}"), video, th.danger, centered);
+        } else if m.audio {
+            c.text(&m.name, video, th.text, TextStyle::new(15.0).bold().align(Align::Center));
+        } else if m.live && m.has_video {
+            if !self.any_modal() && self.popup.is_none() {
+                let ox = self.ox();
+                self.media_slot = Some((m.key, Rect::new(video.l + ox, video.t, video.r + ox, video.b)));
+            }
+        } else {
+            let msg = if m.live { "Loading video…" } else { "Press play to load the video" };
+            c.text(msg, video, th.text_dim, centered);
+        }
+
+        // controls
+        let by = area.b - BAR;
+        let mid = by + BAR / 2.0;
+        let play = Rect::new(area.l + 8.0, by + 7.0, area.l + 40.0, area.b - 7.0);
+        self.icon_button(c, th, play, if m.playing { Icon::Pause } else { Icon::Play }, Act::MediaPlay);
+        self.push_hot(play, Act::MediaPlay);
+        let time = format!("{} / {}", media_view::fmt_time(m.position), media_view::fmt_time(m.duration));
+        let tw = c.text_width(&time, TextStyle::new(12.0)) + 10.0;
+        c.text(&time, Rect::new(play.r + 8.0, by, play.r + 8.0 + tw, area.b), th.text, TextStyle::new(12.0));
+        let mut right = area.r - 8.0;
+        if can_save {
+            let sv = Rect::new(right - 30.0, by + 9.0, right, area.b - 9.0);
+            self.icon_button(c, th, sv, Icon::Save, Act::SaveBlob);
+            self.push_hot(sv, Act::SaveBlob);
+            right -= 36.0;
+        }
+        let vol = Rect::new(right - 64.0, by + 8.0, right, area.b - 8.0);
+        self.paint_slider(c, th, vol, if m.muted { 0.0 } else { m.volume as f32 }, Act::MediaVolume);
+        let mute = Rect::new(vol.l - 32.0, by + 9.0, vol.l - 4.0, area.b - 9.0);
+        self.icon_button(c, th, mute, if m.muted { Icon::Muted } else { Icon::Speaker }, Act::MediaMute);
+        self.push_hot(mute, Act::MediaMute);
+        let seek = Rect::new(play.r + 16.0 + tw, by + 8.0, mute.l - 12.0, area.b - 8.0);
+        if seek.width() > 30.0 {
+            let frac = if m.duration > 0.0 { (m.position / m.duration).clamp(0.0, 1.0) as f32 } else { 0.0 };
+            self.paint_slider(c, th, seek, frac, Act::MediaSeek);
+        }
+        let _ = mid;
+    }
+
+    /// A thin track with a filled part and a thumb; the whole rect is the click target.
+    fn paint_slider(&mut self, c: &mut dyn Canvas, th: &Theme, r: Rect, frac: f32, act: Act) {
+        let cy = (r.t + r.b) / 2.0;
+        let track = Rect::new(r.l, cy - 2.0, r.r, cy + 2.0);
+        c.fill_rect(track, th.border);
+        let x = r.l + r.width() * frac.clamp(0.0, 1.0);
+        c.fill_rect(Rect::new(r.l, cy - 2.0, x, cy + 2.0), th.accent);
+        c.fill_rect(Rect::new(x - 4.0, cy - 7.0, x + 4.0, cy + 7.0), th.accent);
+        self.push_hot(r, act);
     }
 }
 
@@ -4445,5 +4862,139 @@ mod tests {
         let (name, data) = h.a.take_save_blob().unwrap();
         assert_eq!((name.as_str(), data.len()), ("pic.png", png.len()));
         assert!(tip(Act::SaveBlob).is_some());
+    }
+
+    #[test]
+    fn pdf_responses_render_page_by_page_and_stale_pages_are_dropped() {
+        let mut h = H::new();
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        let pdf = b"%PDF-1.7\n%fake".to_vec();
+        let r = HttpResponse { status: "200 OK".into(), is_binary: true, filename: "doc.pdf".into(), content_type: "application/pdf".into(), bytes: pdf, ..Default::default() };
+        h.a.on_response(id, ResponseEvent::Response(r));
+        h.repaint(); // "Rendering PDF…" placeholder paints
+        let jobs = h.a.take_pdf_jobs();
+        assert_eq!((jobs.len(), jobs[0].page, jobs[0].width), (1, 0, pdf_view::RENDER_WIDTH));
+        let png = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 0];
+
+        assert!(!h.a.on_pdf_page(id, jobs[0].id + 99, Ok((3, 0, png.clone()))), "unknown request id is ignored");
+        assert!(h.a.on_pdf_page(id, jobs[0].id, Ok((3, 0, png.clone()))));
+        h.repaint();
+        assert!(h.a.tab().resp.as_ref().unwrap().image.is_some());
+        assert_eq!(h.a.tab().resp.as_ref().unwrap().pdf.as_ref().unwrap().label(), "Page 1 / 3");
+
+        // Next asks for page 2; Previous is disabled on page 1 (no hot region), so use the act
+        h.click(Act::PdfNext);
+        let jobs = h.a.take_pdf_jobs();
+        assert_eq!((jobs.len(), jobs[0].page), (1, 1));
+        h.a.run(Act::PdfPrev, Rect::default(), &mut h.cb);
+        let back = h.a.take_pdf_jobs();
+        assert_eq!(back[0].page, 0, "stepping back from the requested page 2");
+        assert!(!h.a.on_pdf_page(id, jobs[0].id, Ok((3, 1, png.clone()))), "the page-2 result is stale now");
+        assert!(h.a.on_pdf_page(id, back[0].id, Err("boom".into())));
+        assert!(h.a.tab().resp.as_ref().unwrap().pdf.as_ref().unwrap().error.is_some());
+        h.repaint();
+    }
+
+    #[test]
+    fn pdf_wheel_scrolls_the_page_then_flips_and_ctrl_wheel_zooms() {
+        use crate::ui::canvas::ImageInfo;
+        let mut h = H::new();
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        let r = HttpResponse { status: "200 OK".into(), is_binary: true, content_type: "application/pdf".into(), bytes: b"%PDF-1.7".to_vec(), ..Default::default() };
+        h.a.on_response(id, ResponseEvent::Response(r));
+        let job = h.a.take_pdf_jobs().remove(0);
+        let png = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 0];
+        h.a.on_pdf_page(id, job.id, Ok((2, 0, png)));
+        h.repaint();
+        {
+            let iv = h.a.image_view_mut().unwrap();
+            iv.failed = false;
+            iv.info = Some(ImageInfo { w: 2000, h: 4000, full_w: 2000, full_h: 4000 });
+        }
+        h.repaint(); // the first paint with a known size starts the page at its top edge
+        let area = h.rect(Act::ImageView);
+        let (cx, cy) = area.center();
+        h.a.on_mouse_move(&mut h.m, cx, cy);
+        let top = h.a.image_view_mut().unwrap().pan_y();
+        assert!(h.a.image_view_mut().unwrap().vbar.is_some(), "a tall page gets a scrollbar");
+
+        assert!(h.a.on_wheel(-1.0), "wheel down scrolls the page");
+        assert!(h.a.image_view_mut().unwrap().pan_y() < top);
+        assert!(h.a.take_pdf_jobs().is_empty());
+
+        // keep scrolling to the end: the next page is requested, landing at its top
+        let mut flipped = None;
+        for _ in 0..200 {
+            h.a.on_wheel(-1.0);
+            if let Some(j) = h.a.take_pdf_jobs().pop() {
+                flipped = Some(j);
+                break;
+            }
+        }
+        assert_eq!(flipped.map(|j| j.page), Some(1));
+
+        // Ctrl+wheel zooms instead
+        h.a.on_pdf_page(id, h.a.tab().resp.as_ref().unwrap().pdf.as_ref().unwrap().req_id, Ok((2, 1, vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 0])));
+        {
+            let iv = h.a.image_view_mut().unwrap();
+            iv.failed = false;
+            iv.info = Some(ImageInfo { w: 2000, h: 4000, full_w: 2000, full_h: 4000 });
+        }
+        h.repaint();
+        h.a.on_mouse_move(&mut h.m, cx, cy);
+        h.a.set_wheel_ctrl(true);
+        assert!(h.a.on_wheel(2.0));
+        assert!(!h.a.image_view_mut().unwrap().is_fit(), "Ctrl+wheel zoomed");
+    }
+
+    #[test]
+    fn media_responses_get_a_player_with_controls() {
+        let mut h = H::new();
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        // audio bytes
+        let r = HttpResponse { status: "200 OK".into(), is_binary: true, filename: "song.mp3".into(), content_type: "audio/mpeg".into(), bytes: b"ID3\x04\0\0\0\0\0\0abcdef".to_vec(), ..Default::default() };
+        h.a.on_response(id, ResponseEvent::Response(r));
+        let cmds = h.a.take_media_cmds();
+        assert!(matches!(cmds.as_slice(), [MediaCmd::Open { audio: true, .. }]), "opens paused on arrival");
+        let key = h.a.active_media().unwrap().key;
+        h.repaint();
+
+        h.click(Act::MediaPlay);
+        assert!(matches!(h.a.take_media_cmds().as_slice(), [MediaCmd::Play]));
+        assert!(h.a.on_media_state(key, MediaState { position: 3.0, duration: 100.0, ..Default::default() }));
+        h.repaint();
+        assert!(h.a.active_media().unwrap().playing);
+        h.click(Act::MediaPlay);
+        assert!(matches!(h.a.take_media_cmds().as_slice(), [MediaCmd::Pause]));
+
+        // click the middle of the seek bar: seeks to about half of 100 s
+        let track = h.rect(Act::MediaSeek);
+        h.a.on_mouse_move(&mut h.m, track.center().0, track.center().1);
+        h.a.on_left_down(&mut h.m, &mut h.cb, track.center().0, track.center().1, false);
+        h.a.on_left_up();
+        let seek = h.a.take_media_cmds();
+        assert!(matches!(seek.as_slice(), [MediaCmd::Seek(p)] if (*p - 50.0).abs() < 2.0));
+        h.click(Act::MediaMute);
+        assert!(matches!(h.a.take_media_cmds().as_slice(), [MediaCmd::Mute(true)]));
+
+        // range-capable video is streamed from the URL: no bytes, a Url source, and a video slot once it has video
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        let v = HttpResponse { status: "200 OK".into(), is_binary: true, content_type: "video/mp4".into(), accepts_range: true, ..Default::default() };
+        h.a.on_response(id, ResponseEvent::Response(v));
+        let cmds = h.a.take_media_cmds();
+        assert!(cmds.iter().any(|c| matches!(c, MediaCmd::Open { source: Source::Url(_), audio: false, .. })));
+        let vkey = h.a.active_media().unwrap().key;
+        h.repaint();
+        assert!(h.a.media_slot(vkey).is_none(), "no video window until the player reports video");
+        h.a.on_media_state(vkey, MediaState { duration: 60.0, has_video: true, paused: true, video_size: (1280, 720), ..Default::default() });
+        h.repaint();
+        assert!(h.a.media_slot(vkey).is_some());
+        h.a.on_media_failed(vkey, "nope".into());
+        h.repaint();
+        assert!(h.a.media_slot(vkey).is_none());
     }
 }

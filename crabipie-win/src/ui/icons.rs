@@ -20,6 +20,12 @@ pub enum Icon {
     Clear,
     /// Circular arrow: reload.
     Refresh,
+    ChevronLeft,
+    ChevronRight,
+    Play,
+    Pause,
+    Speaker,
+    Muted,
 }
 
 pub fn draw(c: &mut dyn Canvas, icon: Icon, r: Rect, col: Color) {
@@ -64,6 +70,25 @@ pub fn draw(c: &mut dyn Canvas, icon: Icon, r: Rect, col: Color) {
             path(c, &[(5.0, 5.0), (11.0, 11.0)], false);
             path(c, &[(11.0, 5.0), (5.0, 11.0)], false);
         }
+        Icon::Play => {
+            path(c, &[(4.0, 2.0), (13.5, 8.0), (4.0, 14.0)], true);
+        }
+        Icon::Pause => {
+            box_(c, 3.5, 2.5, 6.5, 13.5);
+            box_(c, 9.5, 2.5, 12.5, 13.5);
+        }
+        Icon::Speaker | Icon::Muted => {
+            path(c, &[(2.0, 6.0), (5.5, 6.0), (9.0, 3.0), (9.0, 13.0), (5.5, 10.0), (2.0, 10.0)], true);
+            if icon == Icon::Speaker {
+                path(c, &[(11.0, 5.5), (12.5, 8.0), (11.0, 10.5)], false);
+                path(c, &[(12.5, 3.5), (14.5, 8.0), (12.5, 12.5)], false);
+            } else {
+                path(c, &[(11.0, 5.5), (15.0, 10.5)], false);
+                path(c, &[(15.0, 5.5), (11.0, 10.5)], false);
+            }
+        }
+        Icon::ChevronLeft => path(c, &[(10.0, 2.5), (4.5, 8.0), (10.0, 13.5)], false),
+        Icon::ChevronRight => path(c, &[(6.0, 2.5), (11.5, 8.0), (6.0, 13.5)], false),
         Icon::Refresh => {
             // 280 degree arc, then an arrow head at its end
             let (cx, cy, rad) = (8.0f32, 8.0f32, 5.5f32);
@@ -94,7 +119,7 @@ mod tests {
 
     #[test]
     fn every_icon_draws_something() {
-        for icon in [Icon::Save, Icon::Open, Icon::NewFolder, Icon::Collapse, Icon::Bookmark, Icon::Clear, Icon::Refresh] {
+        for icon in [Icon::Save, Icon::Open, Icon::NewFolder, Icon::Collapse, Icon::Bookmark, Icon::Clear, Icon::Refresh, Icon::ChevronLeft, Icon::ChevronRight, Icon::Play, Icon::Pause, Icon::Speaker, Icon::Muted] {
             let mut c = MonoCanvas::default();
             draw(&mut c, icon, Rect::new(0.0, 0.0, 30.0, 26.0), Color::hex(0xffffff));
             assert!(!c.ops.is_empty(), "{icon:?} drew nothing");
