@@ -26,6 +26,8 @@ pub enum Icon {
     Pause,
     Speaker,
     Muted,
+    Fullscreen,
+    ExitFullscreen,
 }
 
 pub fn draw(c: &mut dyn Canvas, icon: Icon, r: Rect, col: Color) {
@@ -69,6 +71,18 @@ pub fn draw(c: &mut dyn Canvas, icon: Icon, r: Rect, col: Color) {
             box_(c, 1.5, 1.5, 14.5, 14.5);
             path(c, &[(5.0, 5.0), (11.0, 11.0)], false);
             path(c, &[(11.0, 5.0), (5.0, 11.0)], false);
+        }
+        Icon::Fullscreen => {
+            path(c, &[(2.0, 6.0), (2.0, 2.0), (6.0, 2.0)], false);
+            path(c, &[(10.0, 2.0), (14.0, 2.0), (14.0, 6.0)], false);
+            path(c, &[(14.0, 10.0), (14.0, 14.0), (10.0, 14.0)], false);
+            path(c, &[(6.0, 14.0), (2.0, 14.0), (2.0, 10.0)], false);
+        }
+        Icon::ExitFullscreen => {
+            path(c, &[(6.0, 2.0), (6.0, 6.0), (2.0, 6.0)], false);
+            path(c, &[(10.0, 2.0), (10.0, 6.0), (14.0, 6.0)], false);
+            path(c, &[(14.0, 10.0), (10.0, 10.0), (10.0, 14.0)], false);
+            path(c, &[(2.0, 10.0), (6.0, 10.0), (6.0, 14.0)], false);
         }
         Icon::Play => {
             path(c, &[(4.0, 2.0), (13.5, 8.0), (4.0, 14.0)], true);
@@ -119,7 +133,7 @@ mod tests {
 
     #[test]
     fn every_icon_draws_something() {
-        for icon in [Icon::Save, Icon::Open, Icon::NewFolder, Icon::Collapse, Icon::Bookmark, Icon::Clear, Icon::Refresh, Icon::ChevronLeft, Icon::ChevronRight, Icon::Play, Icon::Pause, Icon::Speaker, Icon::Muted] {
+        for icon in [Icon::Save, Icon::Open, Icon::NewFolder, Icon::Collapse, Icon::Bookmark, Icon::Clear, Icon::Refresh, Icon::ChevronLeft, Icon::ChevronRight, Icon::Play, Icon::Pause, Icon::Speaker, Icon::Muted, Icon::Fullscreen, Icon::ExitFullscreen] {
             let mut c = MonoCanvas::default();
             draw(&mut c, icon, Rect::new(0.0, 0.0, 30.0, 26.0), Color::hex(0xffffff));
             assert!(!c.ops.is_empty(), "{icon:?} drew nothing");

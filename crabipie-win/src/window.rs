@@ -6,7 +6,7 @@ use std::ffi::c_void;
 
 use windows::core::{w, Error, Result, HSTRING};
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect, HBRUSH};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ValidateRect, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -47,6 +47,7 @@ enum BridgeMsg {
     Schema { tab_id: usize, res: std::result::Result<GraphqlSchema, String> },
     AuthTest { env_id: usize, res: std::result::Result<Vec<FieldSuggestion>, String> },
     Formatted { tab_id: usize, id: u64, json: bool, prepared: PreparedText },
+    Download { done: u64, total: Option<u64>, finished: Option<std::result::Result<(), String>> },
     PdfPage { tab_id: usize, id: u64, res: std::result::Result<(u32, u32, Vec<u8>), String> },
 }
 
@@ -77,6 +78,8 @@ struct Window {
     frame_ms: std::collections::VecDeque<(f32, f32)>,
     /// The audio/video player for the response on screen (one at a time).
     media: Option<Player>,
+    /// Window style and placement to restore when leaving fullscreen.
+    windowed: Option<(WINDOWPLACEMENT, isize)>,
 }
 
 fn msgbox(hwnd: HWND, text: &str) {
@@ -259,7 +262,37 @@ impl Window {
         }
     }
 
+    /// Borderless fullscreen on the current monitor and back (the usual style/placement dance).
+    fn set_fullscreen(&mut self, on: bool) {
+        unsafe {
+            if on && self.windowed.is_none() {
+                let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+                wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                let _ = GetWindowPlacement(self.hwnd, &mut wp);
+                let style = GetWindowLongPtrW(self.hwnd, GWL_STYLE);
+                let mut mi: MONITORINFO = std::mem::zeroed();
+                mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                if GetMonitorInfoW(MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+                    self.windowed = Some((wp, style));
+                    SetWindowLongPtrW(self.hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW.0 as isize));
+                    let r = mi.rcMonitor;
+                    let _ = SetWindowPos(self.hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+                }
+            } else if !on {
+                if let Some((wp, style)) = self.windowed.take() {
+                    SetWindowLongPtrW(self.hwnd, GWL_STYLE, style);
+                    let _ = SetWindowPlacement(self.hwnd, &wp);
+                    let _ = SetWindowPos(self.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+                }
+            }
+        }
+        self.invalidate();
+    }
+
     fn dispatch_sends(&mut self) {
+        if let Some(on) = self.app.take_fullscreen() {
+            self.set_fullscreen(on);
+        }
         self.dispatch_media();
         self.dispatch_ws();
         self.dispatch_gql();
@@ -374,6 +407,7 @@ pub fn run() -> Result<()> {
             save_thread: Some(save_thread),
             frame_ms: std::collections::VecDeque::new(),
             media: None,
+            windowed: None,
         });
         let ptr = Box::into_raw(window);
 
@@ -502,6 +536,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         }
                     }
                 }
+                if let Some((url, name)) = win.app.take_save_url() {
+                    if let Some(path) = save_file(hwnd, &name) {
+                        win.app.begin_download();
+                        let hwnd_raw = hwnd.0 as isize;
+                        win.rt.spawn(async move {
+                            let mut last = std::time::Instant::now();
+                            let res = crabipie_core::download_to_file(&HTTP_CLIENT, &url, std::path::Path::new(&path), |done, total| {
+                                if last.elapsed() >= std::time::Duration::from_millis(250) {
+                                    last = std::time::Instant::now();
+                                    post_to_ui(hwnd_raw, BridgeMsg::Download { done, total, finished: None });
+                                }
+                            })
+                            .await;
+                            let done = *res.as_ref().unwrap_or(&0);
+                            post_to_ui(hwnd_raw, BridgeMsg::Download { done, total: Some(done), finished: Some(res.map(|_| ())) });
+                        });
+                    }
+                }
                 if let Some((name, data)) = win.app.take_save_blob() {
                     if let Some(path) = save_file(hwnd, &name) {
                         if let Err(e) = std::fs::write(&path, data.as_slice()) {
@@ -612,6 +664,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     BridgeMsg::AuthTest { env_id, res } => win.app.on_auth_test(env_id, res),
                     BridgeMsg::Formatted { tab_id, id, json, prepared } => win.app.on_formatted(tab_id, id, prepared, json),
                     BridgeMsg::PdfPage { tab_id, id, res } => win.app.on_pdf_page(tab_id, id, res),
+                    BridgeMsg::Download { done, total, finished } => win.app.on_download(done, total, finished),
                 };
                 win.dispatch_sends(); // a response may have queued follow-up work (formatting)
                 if repaint {

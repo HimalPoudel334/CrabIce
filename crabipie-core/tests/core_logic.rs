@@ -514,3 +514,28 @@ fn test_login_suggests_token_fields_and_reports_a_missing_endpoint() {
     blank.auth_config.as_mut().unwrap().login_endpoint.clear();
     assert!(rt.block_on(test_login(&reqwest::Client::new(), &blank)).is_err());
 }
+
+#[test]
+fn download_to_file_streams_the_body_and_reports_progress() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let body = vec![b'x'; 300_000];
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(&body).unwrap();
+        }
+    });
+    let path = std::env::temp_dir().join(format!("crabipie_dl_{}.bin", std::process::id()));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let mut last = (0u64, None);
+    let n = rt.block_on(download_to_file(&reqwest::Client::new(), &format!("http://{addr}/f.bin"), &path, |d, t| last = (d, t))).unwrap();
+    assert_eq!(n, 300_000);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 300_000);
+    assert_eq!(last, (300_000, Some(300_000)));
+    std::fs::remove_file(&path).ok();
+}

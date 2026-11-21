@@ -227,3 +227,25 @@ pub async fn execute_request(
 
     emit(ResponseEvent::Done);
 }
+
+/// Streams `url` into the file at `path` (no authentication: same as playing it from the URL).
+/// `progress(done, total)` is called after every chunk. Returns the number of bytes written.
+pub async fn download_to_file(client: &reqwest::Client, url: &str, path: &std::path::Path, mut progress: impl FnMut(u64, Option<u64>)) -> Result<u64, String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+    let resp = client.get(url).send().await.map_err(|e| format!("Request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("The server answered {}", resp.status()));
+    }
+    let total = resp.content_length();
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| format!("Cannot create the file: {e}"))?);
+    let (mut done, mut stream) = (0u64, resp.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download failed: {e}"))?;
+        file.write_all(&chunk).map_err(|e| format!("Write failed: {e}"))?;
+        done += chunk.len() as u64;
+        progress(done, total);
+    }
+    file.flush().map_err(|e| format!("Write failed: {e}"))?;
+    Ok(done)
+}

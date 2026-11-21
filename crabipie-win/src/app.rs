@@ -37,6 +37,24 @@ const ROW_STEP: f32 = 42.0;
 /// Response bodies above this are formatted off the UI thread.
 const BIG_BODY: usize = 256 * 1024;
 
+/// A "save the streamed video to a file" download in progress (or just finished).
+struct Download {
+    done: u64,
+    total: Option<u64>,
+    finished: Option<Result<(), String>>,
+}
+
+impl Download {
+    fn label(&self) -> String {
+        match (&self.finished, self.total) {
+            (Some(Ok(())), _) => "Saved".to_string(),
+            (Some(Err(e)), _) => format!("Save failed: {e}"),
+            (None, Some(t)) if t > 0 => format!("Saving {}%", self.done * 100 / t),
+            (None, _) => format!("Saving {} MB", self.done / 1_048_576),
+        }
+    }
+}
+
 /// Orders for the audio/video player (executed by the window).
 pub enum MediaCmd {
     Open { key: u64, source: Source, audio: bool },
@@ -121,6 +139,8 @@ pub enum Act {
     MediaSeek,
     MediaVolume,
     MediaMute,
+    MediaFullscreen,
+    SaveMediaUrl,
     AuthTest,
     ApplySuggestion(usize),
     GqlExpand(usize),
@@ -775,6 +795,10 @@ pub struct App {
     auth_test_loading: Option<usize>,
     auth_test_result: HashMap<usize, Result<Vec<crabipie_core::FieldSuggestion>, String>>,
     fmt_seq: u64,
+    media_fullscreen: bool,
+    fullscreen_cmd: Option<bool>,
+    save_url_req: Option<(String, String)>,
+    download: Option<Download>,
     media_cmds: Vec<MediaCmd>,
     media_live: Option<u64>,
     media_slot: Option<(u64, Rect)>,
@@ -884,6 +908,10 @@ impl App {
             auth_test_loading: None,
             auth_test_result: HashMap::new(),
             fmt_seq: 0,
+            media_fullscreen: false,
+            fullscreen_cmd: None,
+            save_url_req: None,
+            download: None,
             media_cmds: Vec::new(),
             media_live: None,
             media_slot: None,
@@ -1283,6 +1311,7 @@ impl App {
             ResponseEvent::Response(r) => {
                 let url = self.tabs[ix].sent_url.clone();
                 merge_set_cookies(&mut self.jar, &url, &r.set_cookies);
+                self.download = None;
                 // big bodies are formatted and indexed on a worker thread; show a placeholder meanwhile
                 let big = !r.is_streaming && r.body.len() > BIG_BODY;
                 let mut rs = if big { Self::resp_state_pending(&r) } else { Self::resp_state(&r) };
@@ -1349,7 +1378,7 @@ impl App {
         let ct = r.content_type.to_ascii_lowercase();
         // range-capable audio/video isn't downloaded: the player streams it from the URL
         if r.bytes.is_empty() && r.accepts_range && !url.is_empty() && (ct.starts_with("video/") || ct.starts_with("audio/")) {
-            let name = if r.filename.is_empty() { url.rsplit('/').next().unwrap_or("media").to_string() } else { r.filename.clone() };
+            let name = if r.filename.is_empty() { url.split('?').next().unwrap_or(url).rsplit('/').next().unwrap_or("media").to_string() } else { r.filename.clone() };
             rs.media = Some(MediaView::new(Source::Url(url.to_string()), ct.starts_with("audio/"), name));
             return;
         }
@@ -1845,6 +1874,17 @@ impl App {
                 self.drag = Some(Drag::Volume { track: rect });
             }
             Act::MediaMute => self.media_mute(),
+            Act::MediaFullscreen => {
+                let on = !self.media_fullscreen;
+                self.set_media_fullscreen(on);
+            }
+            Act::SaveMediaUrl => {
+                if let Some(m) = self.active_media() {
+                    if let Source::Url(u) = &m.source {
+                        self.save_url_req = Some((u.clone(), m.name.clone()));
+                    }
+                }
+            }
             Act::PdfPrev => self.pdf_step(-1, Edge::Top),
             Act::PdfNext => self.pdf_step(1, Edge::Top),
             Act::ImageView => {} // handled by the mouse code (pan / zoom / double-click)
@@ -2117,6 +2157,13 @@ impl App {
     }
 
     fn left_down_main(&mut self, m: &mut dyn TextMeasure, cb: &mut dyn Clipboard, x: f32, y: f32, shift: bool) -> bool {
+        if self.media_fullscreen {
+            // only the player's controls exist in fullscreen (no tab strip or sidebar underneath)
+            if let Some((act, rect)) = self.hot_at(x, y) {
+                self.run(act, rect, cb);
+            }
+            return true;
+        }
         match self.hot_at(x, y) {
             Some((Act::Input(id), _)) => {
                 self.set_focus(Focus::Input(id));
@@ -2246,7 +2293,7 @@ impl App {
     pub fn on_middle_click(&mut self, wx: f32, y: f32) -> bool {
         self.touch();
         let x = wx - self.ox();
-        if x < 0.0 {
+        if x < 0.0 || self.media_fullscreen {
             return false;
         }
         match TabBar::hit_test(x, y, self.tabs.len(), self.width) {
@@ -2359,6 +2406,10 @@ impl App {
             }
         }
         if key == Key::Escape {
+            if self.media_fullscreen {
+                self.set_media_fullscreen(false);
+                return true;
+            }
             if self.popup.take().is_some() {
                 return true;
             }
@@ -2472,6 +2523,19 @@ impl App {
         }
         self.media_slot = None; // repainted below if a video is visible
         let th = self.theme.clone();
+        if self.media_fullscreen && self.active_media().is_some() {
+            // fullscreen player: nothing but the player fills the window
+            self.sb_hot.clear();
+            self.hot.clear();
+            self.clip = None;
+            self.modal_hot_from = 0;
+            let whole = Rect::new(0.0, 0.0, self.win_w, self.height);
+            c.fill_rect(whole, Color::hex(0x000000));
+            self.paint_media_view(c, &th, whole);
+            self.paint_tip(c, &th);
+            self.paint_perf(c, &th);
+            return;
+        }
         let ox = self.ox();
         c.fill_rect(Rect::new(0.0, 0.0, self.win_w.max(self.width + ox), self.height), th.bg);
         self.sb_hot.clear();
@@ -3207,7 +3271,7 @@ impl App {
 
 impl App {
     fn ox(&self) -> f32 {
-        if self.sidebar_open { self.sb_w } else { 0.0 }
+        if self.sidebar_open && !self.media_fullscreen { self.sb_w } else { 0.0 }
     }
 
     /// `width` is the main area's width: the window minus the sidebar.
@@ -3522,7 +3586,7 @@ impl App {
 impl App {
     /// The splitter under a window-coordinate point, if any.
     fn splitter_at(&self, wx: f32, y: f32) -> Option<Drag> {
-        if self.any_modal() || self.popup.is_some() || self.ctx.is_some() {
+        if self.media_fullscreen || self.any_modal() || self.popup.is_some() || self.ctx.is_some() {
             return None;
         }
         let ox = self.ox();
@@ -3774,6 +3838,8 @@ fn tip(act: Act) -> Option<&'static str> {
         Act::SaveBlob => "Save to file",
         Act::MediaPlay => "Play / Pause",
         Act::MediaMute => "Mute",
+        Act::MediaFullscreen => "Fullscreen (Esc exits)",
+        Act::SaveMediaUrl => "Download this video to a file",
         Act::PdfPrev => "Previous page",
         Act::PdfNext => "Next page",
         Act::ClearResp => "Clear",
@@ -4166,6 +4232,45 @@ impl App {
         self.media_cmds.push(MediaCmd::Mute(muted));
     }
 
+    /// Enters or leaves fullscreen playback (the window applies it: `take_fullscreen`).
+    fn set_media_fullscreen(&mut self, on: bool) {
+        if on && self.active_media().is_none() {
+            return;
+        }
+        self.media_fullscreen = on;
+        self.apply_width();
+        self.fullscreen_cmd = Some(on);
+    }
+
+    /// Fullscreen on/off request for the window. Also leaves fullscreen if the media is gone.
+    pub fn take_fullscreen(&mut self) -> Option<bool> {
+        if self.media_fullscreen && self.active_media().is_none() {
+            self.media_fullscreen = false;
+            self.apply_width();
+            self.fullscreen_cmd = Some(false);
+        }
+        self.fullscreen_cmd.take()
+    }
+
+    /// (url, suggested name) when the user asked to download the streamed video.
+    pub fn take_save_url(&mut self) -> Option<(String, String)> {
+        self.save_url_req.take()
+    }
+
+    pub fn begin_download(&mut self) {
+        self.download = Some(Download { done: 0, total: None, finished: None });
+    }
+
+    pub fn on_download(&mut self, done: u64, total: Option<u64>, finished: Option<Result<(), String>>) -> bool {
+        let Some(d) = self.download.as_mut() else { return false };
+        d.done = done;
+        d.total = total.or(d.total);
+        if finished.is_some() {
+            d.finished = finished;
+        }
+        true
+    }
+
     /// Commands for the player; also closes players whose response is gone.
     pub fn take_media_cmds(&mut self) -> Vec<MediaCmd> {
         let mut cmds = std::mem::take(&mut self.media_cmds);
@@ -4224,14 +4329,26 @@ impl App {
         let play = Rect::new(area.l + 8.0, by + 7.0, area.l + 40.0, area.b - 7.0);
         self.icon_button(c, th, play, if m.playing { Icon::Pause } else { Icon::Play }, Act::MediaPlay);
         self.push_hot(play, Act::MediaPlay);
-        let time = format!("{} / {}", media_view::fmt_time(m.position), media_view::fmt_time(m.duration));
+        let status = self.download.as_ref().map(|d| d.label());
+        let time = match &status {
+            Some(s) => format!("{} / {}   {}", media_view::fmt_time(m.position), media_view::fmt_time(m.duration), s),
+            None => format!("{} / {}", media_view::fmt_time(m.position), media_view::fmt_time(m.duration)),
+        };
         let tw = c.text_width(&time, TextStyle::new(12.0)) + 10.0;
         c.text(&time, Rect::new(play.r + 8.0, by, play.r + 8.0 + tw, area.b), th.text, TextStyle::new(12.0));
         let mut right = area.r - 8.0;
-        if can_save {
+        let fs = Rect::new(right - 30.0, by + 9.0, right, area.b - 9.0);
+        self.icon_button(c, th, fs, if self.media_fullscreen { Icon::ExitFullscreen } else { Icon::Fullscreen }, Act::MediaFullscreen);
+        self.push_hot(fs, Act::MediaFullscreen);
+        right -= 36.0;
+        let streamed = matches!(self.active_media().map(|m| &m.source), Some(Source::Url(_)));
+        if can_save || streamed {
+            let (act, busy) = if can_save { (Act::SaveBlob, false) } else { (Act::SaveMediaUrl, self.download.as_ref().map_or(false, |d| d.finished.is_none())) };
             let sv = Rect::new(right - 30.0, by + 9.0, right, area.b - 9.0);
-            self.icon_button(c, th, sv, Icon::Save, Act::SaveBlob);
-            self.push_hot(sv, Act::SaveBlob);
+            self.icon_button(c, th, sv, Icon::Save, act);
+            if !busy {
+                self.push_hot(sv, act);
+            }
             right -= 36.0;
         }
         let vol = Rect::new(right - 64.0, by + 8.0, right, area.b - 8.0);
@@ -4996,5 +5113,47 @@ mod tests {
         h.a.on_media_failed(vkey, "nope".into());
         h.repaint();
         assert!(h.a.media_slot(vkey).is_none());
+    }
+
+    #[test]
+    fn streamed_video_can_go_fullscreen_and_be_downloaded() {
+        let mut h = H::new();
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        let v = HttpResponse { status: "200 OK".into(), is_binary: true, content_type: "video/mp4".into(), accepts_range: true, ..Default::default() };
+        h.a.on_response(id, ResponseEvent::Response(v));
+        h.a.take_media_cmds();
+        let key = h.a.active_media().unwrap().key;
+        h.a.on_media_state(key, MediaState { duration: 60.0, has_video: true, paused: true, video_size: (1280, 720), ..Default::default() });
+        h.repaint();
+        let normal = h.a.media_slot(key).unwrap();
+
+        // fullscreen: the player fills the whole window, nothing else is clickable
+        h.click(Act::MediaFullscreen);
+        assert_eq!(h.a.take_fullscreen(), Some(true));
+        h.repaint();
+        let full = h.a.media_slot(key).unwrap();
+        assert!(full.width() > normal.width() && full.width() > h.a.win_w - 4.0 && full.t <= 2.0);
+        assert!(h.a.hot.iter().all(|x| matches!(x.act, Act::MediaPlay | Act::MediaSeek | Act::MediaVolume | Act::MediaMute | Act::MediaFullscreen | Act::SaveMediaUrl)));
+        h.a.on_key(Key::Escape, Mods::default(), &mut h.cb);
+        assert_eq!(h.a.take_fullscreen(), Some(false));
+        h.repaint();
+        assert!(h.a.media_slot(key).unwrap().width() < full.width());
+
+        // a streamed video has no bytes: Save downloads from the URL, with progress shown in the bar
+        h.click(Act::SaveMediaUrl);
+        let (url, _name) = h.a.take_save_url().unwrap();
+        assert!(url.starts_with("http"));
+        h.a.begin_download();
+        assert!(h.a.on_download(50, Some(200), None));
+        assert_eq!(h.a.download.as_ref().unwrap().label(), "Saving 25%");
+        h.a.on_download(200, Some(200), Some(Ok(())));
+        assert_eq!(h.a.download.as_ref().unwrap().label(), "Saved");
+
+        // leaving the response while fullscreen drops back to the normal window
+        h.click(Act::MediaFullscreen);
+        h.a.take_fullscreen();
+        h.a.tab_mut().resp = None;
+        assert_eq!(h.a.take_fullscreen(), Some(false));
     }
 }
