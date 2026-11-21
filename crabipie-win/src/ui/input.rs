@@ -13,6 +13,9 @@ pub enum Key {
     Delete,
     Enter,
     Escape,
+    Space,
+    /// Top-row digit 1..=9 (for Ctrl+N tab jumps).
+    Digit(u8),
     /// Uppercase ASCII letter, for shortcuts (Ctrl+C etc).
     Letter(char),
 }

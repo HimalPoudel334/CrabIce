@@ -143,6 +143,10 @@ impl TextArea {
         Self { readonly: true, ..Self::new(placeholder) }
     }
 
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
     /// Replaces the content and scrolls to the top (read-only viewers).
     pub fn set_text(&mut self, s: &str) {
         self.edit.set_text(s);

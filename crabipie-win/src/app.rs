@@ -1202,6 +1202,18 @@ impl App {
         self.set_focus(Focus::Input(InputId::Url));
     }
 
+    /// Ctrl+D: a copy of the current request (not its response) in a new tab.
+    pub fn duplicate_tab(&mut self) {
+        let saved = self.tab().to_saved(self.theme.name);
+        self.set_focus(Focus::None);
+        let t = Tab::from_saved(self.next_id, &saved);
+        self.next_id += 1;
+        self.tabs.push(t);
+        self.active = self.tabs.len() - 1;
+        self.req_scroll = 0.0;
+        self.set_focus(Focus::Input(InputId::Url));
+    }
+
     pub fn select_tab(&mut self, i: usize) {
         if i < self.tabs.len() {
             self.set_focus(Focus::None);
@@ -2402,6 +2414,38 @@ impl App {
                     self.open_save_modal();
                     return true;
                 }
+                Key::Digit(n) if !self.media_fullscreen => {
+                    let ix = if n == 9 { self.tabs.len() - 1 } else { n as usize - 1 };
+                    self.select_tab(ix); // out-of-range numbers do nothing
+                    return true;
+                }
+                Key::Letter('D') if !self.media_fullscreen => {
+                    self.duplicate_tab();
+                    return true;
+                }
+                Key::Letter('L') if !self.media_fullscreen => {
+                    self.set_focus(Focus::Input(InputId::Url));
+                    if let Some(i) = self.input_mut(InputId::Url) {
+                        i.edit.select_all();
+                    }
+                    return true;
+                }
+                Key::Enter if !self.media_fullscreen => {
+                    if self.focus == Focus::Input(InputId::WsMsg) {
+                        self.ws_send();
+                    } else {
+                        self.trigger_send();
+                    }
+                    return true;
+                }
+                Key::Tab if !self.media_fullscreen => {
+                    let n = self.tabs.len();
+                    if n > 1 {
+                        let next = if mods.shift { (self.active + n - 1) % n } else { (self.active + 1) % n };
+                        self.select_tab(next);
+                    }
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -2434,6 +2478,51 @@ impl App {
             }
             return self.set_focus(Focus::None);
         }
+        if self.focus == Focus::None && !mods.ctrl && !self.any_modal() && self.popup.is_none() && self.ctx.is_none() && self.player_keys_active() {
+            match key {
+                Key::Space => {
+                    self.media_toggle();
+                    return true;
+                }
+                Key::Left => {
+                    self.media_seek_by(-5.0);
+                    return true;
+                }
+                Key::Right => {
+                    self.media_seek_by(5.0);
+                    return true;
+                }
+                Key::Up => {
+                    self.media_volume_by(0.1);
+                    return true;
+                }
+                Key::Down => {
+                    self.media_volume_by(-0.1);
+                    return true;
+                }
+                Key::Letter('M') => {
+                    self.media_mute();
+                    return true;
+                }
+                Key::Letter('F') if self.active_media().map_or(false, |m| m.has_video) => {
+                    let on = !self.media_fullscreen;
+                    self.set_media_fullscreen(on);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if key == Key::Tab && !mods.ctrl && !self.media_fullscreen {
+            // Editable text areas keep Tab for indentation; Shift+Tab still leaves them.
+            let focus = self.focus;
+            let in_editor = match focus {
+                Focus::Area(id) => self.area_mut(id).map_or(false, |a| !a.is_readonly()),
+                _ => false,
+            };
+            if !in_editor || mods.shift {
+                return self.move_focus(!mods.shift);
+            }
+        }
         if key == Key::Enter && self.focus == Focus::Input(InputId::SbRename) {
             self.sb_commit_rename();
             return true;
@@ -2458,6 +2547,34 @@ impl App {
         };
         self.after_edit(before);
         handled
+    }
+
+    /// Tab order = paint order of the visible inputs/areas (modal regions only while a modal is open).
+    fn move_focus(&mut self, forward: bool) -> bool {
+        let from = if self.any_modal() { self.modal_hot_from.min(self.hot.len()) } else { 0 };
+        let mut order: Vec<Focus> = Vec::new();
+        for h in &self.hot[from..] {
+            let f = match h.act {
+                Act::Input(id) => Focus::Input(id),
+                Act::Area(id) => Focus::Area(id),
+                _ => continue,
+            };
+            if !order.contains(&f) {
+                order.push(f);
+            }
+        }
+        let n = order.len();
+        if n == 0 {
+            return false;
+        }
+        let next = match order.iter().position(|f| *f == self.focus) {
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            None if forward => 0,
+            None => n - 1,
+        };
+        self.set_focus(order[next]);
+        true
     }
 
     pub fn on_char(&mut self, ch: char) -> bool {
@@ -4225,6 +4342,32 @@ impl App {
         self.media_cmds.push(MediaCmd::Volume(frac));
     }
 
+    /// Player keys apply while the player is on screen (Body tab, or fullscreen).
+    fn player_keys_active(&self) -> bool {
+        self.media_fullscreen
+            || self.tabs[self.active].resp.as_ref().map_or(false, |r| r.tab == RespTab::Body && r.media.is_some())
+    }
+
+    fn media_seek_by(&mut self, delta: f64) {
+        let Some(m) = self.tabs[self.active].resp.as_mut().and_then(|r| r.media.as_mut()) else { return };
+        if !m.live || m.duration <= 0.0 {
+            return;
+        }
+        m.position = (m.position + delta).clamp(0.0, m.duration);
+        m.ended = false;
+        let pos = m.position;
+        self.media_cmds.push(MediaCmd::Seek(pos));
+    }
+
+    fn media_volume_by(&mut self, delta: f64) {
+        let Some(m) = self.tabs[self.active].resp.as_mut().and_then(|r| r.media.as_mut()) else { return };
+        m.volume = (m.volume + delta).clamp(0.0, 1.0);
+        m.muted = false;
+        let v = m.volume;
+        self.media_cmds.push(MediaCmd::Mute(false));
+        self.media_cmds.push(MediaCmd::Volume(v));
+    }
+
     fn media_mute(&mut self) {
         let Some(m) = self.tabs[self.active].resp.as_mut().and_then(|r| r.media.as_mut()) else { return };
         m.muted = !m.muted;
@@ -5155,5 +5298,121 @@ mod tests {
         h.a.take_fullscreen();
         h.a.tab_mut().resp = None;
         assert_eq!(h.a.take_fullscreen(), Some(false));
+    }
+
+    #[test]
+    fn keyboard_shortcuts_focus_send_and_cycle() {
+        let ctrl = Mods { ctrl: true, shift: false };
+        let ctrl_shift = Mods { ctrl: true, shift: true };
+        let mut h = H::new();
+        h.a.new_tab();
+        h.a.new_tab();
+        assert_eq!(h.a.active, 2);
+
+        // Ctrl+Tab wraps forward, Ctrl+Shift+Tab wraps back
+        h.a.on_key(Key::Tab, ctrl, &mut h.cb);
+        assert_eq!(h.a.active, 0);
+        h.a.on_key(Key::Tab, ctrl_shift, &mut h.cb);
+        assert_eq!(h.a.active, 2);
+
+        // Ctrl+L focuses the URL bar and selects everything
+        h.a.set_focus(Focus::None);
+        h.a.on_key(Key::Letter('L'), ctrl, &mut h.cb);
+        assert_eq!(h.a.focus, Focus::Input(InputId::Url));
+        let t = h.a.tab().url.edit.text().to_string();
+        for ch in "https://x.dev/".chars() {
+            h.a.on_char(ch);
+        }
+        assert_eq!(h.a.tab().url.edit.text(), "https://x.dev/", "typing replaced the selection of {t}");
+
+        // Ctrl+Enter sends from anywhere
+        h.a.set_focus(Focus::None);
+        h.a.on_key(Key::Enter, ctrl, &mut h.cb);
+        assert!(h.a.take_send().is_some());
+    }
+
+    #[test]
+    fn tab_walks_the_visible_inputs_and_wraps() {
+        let shift = Mods { ctrl: false, shift: true };
+        let mut h = H::new();
+        h.a.set_focus(Focus::Input(InputId::Url));
+        h.repaint();
+        h.a.on_key(Key::Tab, Mods::default(), &mut h.cb);
+        assert_ne!(h.a.focus, Focus::Input(InputId::Url));
+        assert_ne!(h.a.focus, Focus::None);
+        h.a.on_key(Key::Tab, shift, &mut h.cb);
+        assert_eq!(h.a.focus, Focus::Input(InputId::Url));
+        // from nothing: Tab lands on the first widget, Shift+Tab on the last
+        h.a.set_focus(Focus::None);
+        h.a.on_key(Key::Tab, Mods::default(), &mut h.cb);
+        let first = h.a.focus;
+        assert_ne!(first, Focus::None);
+        h.a.set_focus(Focus::None);
+        h.a.on_key(Key::Tab, shift, &mut h.cb);
+        assert_ne!(h.a.focus, Focus::None);
+    }
+
+    #[test]
+    fn ctrl_digits_jump_and_ctrl_d_duplicates() {
+        let ctrl = Mods { ctrl: true, shift: false };
+        let mut h = H::new();
+        h.a.new_tab();
+        h.a.new_tab();
+        h.a.on_key(Key::Digit(1), ctrl, &mut h.cb);
+        assert_eq!(h.a.active, 0);
+        h.a.on_key(Key::Digit(9), ctrl, &mut h.cb);
+        assert_eq!(h.a.active, 2, "9 is the last tab");
+        h.a.on_key(Key::Digit(2), ctrl, &mut h.cb);
+        assert_eq!(h.a.active, 1);
+        h.a.on_key(Key::Digit(7), ctrl, &mut h.cb);
+        assert_eq!(h.a.active, 1, "no tab 7: stay put");
+
+        h.type_into(InputId::Url, "https://x.dev/dup");
+        let before = h.a.tabs.len();
+        h.a.on_key(Key::Letter('D'), ctrl, &mut h.cb);
+        assert_eq!(h.a.tabs.len(), before + 1);
+        assert_eq!(h.a.active, before);
+        assert_eq!(h.a.tab().url.edit.text(), "https://x.dev/dup");
+        let ids: Vec<usize> = h.a.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len(), "fresh id");
+    }
+
+    #[test]
+    fn player_keys_work_when_nothing_is_focused() {
+        let mut h = H::new();
+        h.click(Act::Send);
+        let id = h.a.take_send().unwrap().tab_id;
+        let r = HttpResponse { status: "200 OK".into(), is_binary: true, filename: "song.mp3".into(), content_type: "audio/mpeg".into(), bytes: b"ID3\x04\0\0\0\0\0\0abcdef".to_vec(), ..Default::default() };
+        h.a.on_response(id, ResponseEvent::Response(r));
+        h.a.take_media_cmds();
+        let key = h.a.active_media().unwrap().key;
+        h.a.on_media_state(key, MediaState { position: 10.0, duration: 100.0, paused: true, ..Default::default() });
+        h.repaint();
+        h.a.set_focus(Focus::None);
+        let none = Mods::default();
+
+        h.a.on_key(Key::Space, none, &mut h.cb);
+        assert!(matches!(h.a.take_media_cmds().as_slice(), [MediaCmd::Play]));
+        h.a.on_key(Key::Right, none, &mut h.cb);
+        assert!(matches!(h.a.take_media_cmds().as_slice(), [MediaCmd::Seek(p)] if (*p - 15.0).abs() < 0.01));
+        h.a.on_key(Key::Left, none, &mut h.cb);
+        assert!(matches!(h.a.take_media_cmds().as_slice(), [MediaCmd::Seek(p)] if (*p - 10.0).abs() < 0.01));
+        h.a.on_key(Key::Letter('M'), none, &mut h.cb);
+        assert!(matches!(h.a.take_media_cmds().as_slice(), [MediaCmd::Mute(true)]));
+        h.a.on_key(Key::Down, none, &mut h.cb);
+        assert!(matches!(h.a.take_media_cmds().as_slice(), [MediaCmd::Mute(false), MediaCmd::Volume(_)]));
+
+        // F needs video: audio ignores it, video goes fullscreen
+        h.a.on_key(Key::Letter('F'), none, &mut h.cb);
+        assert!(h.a.take_fullscreen().is_none());
+        h.a.on_media_state(key, MediaState { position: 10.0, duration: 100.0, paused: true, has_video: true, video_size: (640, 360), ..Default::default() });
+        h.a.on_key(Key::Letter('F'), none, &mut h.cb);
+        assert_eq!(h.a.take_fullscreen(), Some(true));
+
+        // typing in a field is never hijacked
+        h.a.on_key(Key::Escape, none, &mut h.cb);
+        h.a.set_focus(Focus::Input(InputId::Url));
+        h.a.on_key(Key::Space, none, &mut h.cb);
+        assert!(h.a.take_media_cmds().is_empty());
     }
 }

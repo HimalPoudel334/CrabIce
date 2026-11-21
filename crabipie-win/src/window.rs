@@ -348,6 +348,8 @@ fn map_key(vk: u16) -> Option<Key> {
         v if v == VK_DELETE.0 => Some(Key::Delete),
         v if v == VK_RETURN.0 => Some(Key::Enter),
         v if v == VK_ESCAPE.0 => Some(Key::Escape),
+        0x20 => Some(Key::Space), // VK_SPACE
+        0x31..=0x39 => Some(Key::Digit((vk - 0x30) as u8)),
         0x41..=0x5A => Some(Key::Letter(vk as u8 as char)),
         _ => None,
     }
