@@ -112,8 +112,11 @@ pub fn resolve_dynamic_var(name: &str) -> Option<String> {
         .timestamp()
         .to_string(),
         DynamicVar::RandomInt(lo, hi) => {
-            use rand::Rng;
-            rand::thread_rng().gen_range(lo..=hi).to_string()
+            // uuid is already linked and seeds from the OS, so the `rand` crate isn't needed.
+            // parse_random_int guarantees lo <= hi; the span fits u128 even for the full i64 range.
+            let span = (hi as i128 - lo as i128 + 1) as u128;
+            let r = uuid::Uuid::new_v4().as_u128() % span;
+            (lo as i128 + r as i128).to_string()
         }
     })
 }

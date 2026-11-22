@@ -384,6 +384,7 @@ pub fn run() -> Result<()> {
         }
 
         let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2) // default is one per core; a request client needs two
             .enable_all()
             .build()
             .expect("tokio runtime");
