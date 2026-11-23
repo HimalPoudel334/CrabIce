@@ -12,6 +12,7 @@ pub mod engine;
 pub mod env;
 pub mod flow;
 pub mod graphql;
+pub mod grpc;
 pub mod http;
 pub mod persist;
 pub mod request;
