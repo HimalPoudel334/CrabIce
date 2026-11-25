@@ -534,7 +534,8 @@ impl TextArea {
         self.hthumb = Rect::default();
         if vbar {
             let tr = Rect::new(rect.r - SB - 2.0, rect.t + 2.0, rect.r - 2.0, rect.b - 2.0 - if hbar { SB } else { 0.0 });
-            let len = (tr.height() * h / total_h).clamp(24.0, tr.height());
+            let room = tr.height().max(0.0); // a very short area must not make min > max
+            let len = (tr.height() * h / total_h).clamp(24.0_f32.min(room), room);
             let max = (total_h - h).max(1.0);
             let y = tr.t + (self.scroll / max) * (tr.height() - len);
             self.vtrack = tr;
@@ -543,7 +544,8 @@ impl TextArea {
         }
         if hbar {
             let tr = Rect::new(rect.l + 2.0, rect.b - SB - 2.0, rect.r - 2.0 - if vbar { SB } else { 0.0 }, rect.b - 2.0);
-            let len = (tr.width() * view_w / total_w).clamp(24.0, tr.width());
+            let room = tr.width().max(0.0);
+            let len = (tr.width() * view_w / total_w).clamp(24.0_f32.min(room), room);
             let max = (total_w - view_w).max(1.0);
             let x = tr.l + (self.hscroll / max) * (tr.width() - len);
             self.htrack = tr;
@@ -671,5 +673,16 @@ mod tests {
         let json = PreparedText::build(r#"{"k":[1,2]}"#.into(), true);
         a.set_prepared(json);
         assert!(a.edit.text().starts_with("{\n  \"k\": ["));
+    }
+
+    #[test]
+    fn a_very_short_area_with_scrollbars_does_not_panic() {
+        // a long, wide text makes both scrollbars appear; the rect is shorter than the bars' insets
+        let mut c = MonoCanvas::default();
+        let mut a = TextArea::readonly("");
+        a.set_text(&vec!["x".repeat(400); 40].join("\n"));
+        for h in [60.0, 30.0, 10.0, 0.0, -30.0] {
+            a.paint(&mut c, &Theme::default(), Rect::new(0.0, 0.0, 120.0, h));
+        }
     }
 }

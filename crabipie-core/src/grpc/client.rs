@@ -194,15 +194,7 @@ fn apply_metadata(mut b: http::request::Builder, md: &[(String, String)]) -> Res
     Ok(b)
 }
 
-/// One call with a single request message (unary or server streaming).
-/// Every response message is handed to `on_message` as it arrives. Dropping the
-/// returned future cancels the call. `Err` means the transport failed; a gRPC
-/// error status comes back as `Ok(CallEnd)` with `status != 0`.
-pub async fn call<F>(conn: &Conn, path: &str, metadata: &[(String, String)], request: &[u8], mut on_message: F) -> Result<CallEnd, String>
-where
-    F: FnMut(Vec<u8>),
-{
-    let mut send = conn.send.clone().ready().await.map_err(h2e)?;
+fn build_request(conn: &Conn, path: &str, metadata: &[(String, String)]) -> Result<http::Request<()>, String> {
     let scheme = if conn.tls { "https" } else { "http" };
     let builder = http::Request::builder()
         .method("POST")
@@ -211,9 +203,67 @@ where
         .header("te", "trailers")
         .header("grpc-accept-encoding", "gzip,identity")
         .header("user-agent", "crabipie");
-    let req = apply_metadata(builder, metadata)?.body(()).map_err(|e| format!("bad request: {e}"))?;
+    apply_metadata(builder, metadata)?.body(()).map_err(|e| format!("bad request: {e}"))
+}
+
+/// One call with a single request message (unary or server streaming).
+/// Every response message is handed to `on_message` as it arrives. Dropping the
+/// returned future cancels the call. `Err` means the transport failed; a gRPC
+/// error status comes back as `Ok(CallEnd)` with `status != 0`.
+pub async fn call<F>(conn: &Conn, path: &str, metadata: &[(String, String)], request: &[u8], on_message: F) -> Result<CallEnd, String>
+where
+    F: FnMut(Vec<u8>),
+{
+    let mut send = conn.send.clone().ready().await.map_err(h2e)?;
+    let req = build_request(conn, path, metadata)?;
     let (response, mut tx) = send.send_request(req, false).map_err(h2e)?;
     tx.send_data(Bytes::from(frame(request)), true).map_err(h2e)?;
+    finish_call(response, on_message).await
+}
+
+/// Stops the sender task when the call ends or is cancelled.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A call whose request side stays open (client-streaming and bidirectional
+/// methods). Messages sent on the channel go out as they arrive, while the
+/// responses are read at the same time. Closing the channel (dropping every
+/// sender) ends the request stream. Dropping the returned future cancels the call.
+pub async fn call_stream<F>(
+    conn: &Conn,
+    path: &str,
+    metadata: &[(String, String)],
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    on_message: F,
+) -> Result<CallEnd, String>
+where
+    F: FnMut(Vec<u8>),
+{
+    let mut send = conn.send.clone().ready().await.map_err(h2e)?;
+    let req = build_request(conn, path, metadata)?;
+    let (response, mut tx) = send.send_request(req, false).map_err(h2e)?;
+    let sender = tokio::spawn(async move {
+        while let Some(m) = requests.recv().await {
+            if tx.send_data(Bytes::from(frame(&m)), false).is_err() {
+                return; // the server closed the stream
+            }
+        }
+        let _ = tx.send_data(Bytes::new(), true); // half-close
+    });
+    let _stop_sender = AbortOnDrop(sender);
+    finish_call(response, on_message).await
+}
+
+/// Reads the response: messages as they arrive, then the status from the trailers.
+async fn finish_call<F>(response: h2::client::ResponseFuture, mut on_message: F) -> Result<CallEnd, String>
+where
+    F: FnMut(Vec<u8>),
+{
     let response = response.await.map_err(h2e)?;
     let (parts, mut body) = response.into_parts();
 
@@ -262,6 +312,7 @@ where
     }
     Ok(CallEnd { status, message, headers: headers_vec(&parts.headers), trailers: trailers.as_ref().map(headers_vec).unwrap_or_default() })
 }
+
 
 // -------------------------------------------------------------- reflection
 

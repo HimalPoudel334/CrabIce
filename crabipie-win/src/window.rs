@@ -22,10 +22,11 @@ use crate::app::{App, CursorKind, MediaCmd, PersistJob};
 use crate::platform::media::Player;
 use crate::ui::text_area::PreparedText;
 use crate::platform::clipboard::WinClipboard;
-use crate::platform::file_dialog::{pick_file, save_file};
+use crate::platform::file_dialog::{pick_file, pick_proto, save_file};
 use crate::render::Renderer;
 use crate::ui::input::{Key, Mods};
 use crabipie_core::{fetch_schema, run_request, test_login, websocket_stream, FieldSuggestion, GraphqlSchema, AuthRefreshOutcome, FlowEvent, ResponseEvent, WsEvent, HTTP_CLIENT};
+use crabipie_core::grpc::job::{run_with as grpc_run_with, GrpcEvent, GrpcInput};
 use futures_util::StreamExt;
 
 // Not in the bindings I target (WM_MOUSELEAVE lives behind the Controls feature).
@@ -45,6 +46,7 @@ enum BridgeMsg {
     Ws { tab_id: usize, ev: WsEvent },
     WsEnded { tab_id: usize },
     Schema { tab_id: usize, res: std::result::Result<GraphqlSchema, String> },
+    Grpc { tab_id: usize, ev: GrpcEvent },
     AuthTest { env_id: usize, res: std::result::Result<Vec<FieldSuggestion>, String> },
     Formatted { tab_id: usize, id: u64, json: bool, prepared: PreparedText },
     Download { done: u64, total: Option<u64>, finished: Option<std::result::Result<(), String>> },
@@ -71,6 +73,8 @@ struct Window {
     rt: tokio::runtime::Runtime,
     /// One running socket task per WebSocket tab; aborting it closes the connection.
     ws_tasks: HashMap<usize, tokio::task::JoinHandle<()>>,
+    grpc_tasks: HashMap<usize, tokio::task::JoinHandle<()>>,
+    grpc_inputs: HashMap<usize, tokio::sync::mpsc::UnboundedSender<GrpcInput>>,
     /// Autosave: jobs go to one writer thread so files are never written concurrently.
     save_tx: Option<std::sync::mpsc::Sender<PersistJob>>,
     save_thread: Option<std::thread::JoinHandle<()>>,
@@ -191,6 +195,35 @@ impl Window {
         }
     }
 
+    /// Runs gRPC discovery and calls. A cancelled call is aborted: dropping its future resets the stream.
+    fn dispatch_grpc(&mut self) {
+        for tab_id in self.app.take_grpc_cancels() {
+            self.grpc_inputs.remove(&tab_id);
+            if let Some(h) = self.grpc_tasks.remove(&tab_id) {
+                h.abort();
+            }
+        }
+        for job in self.app.take_grpc_jobs() {
+            if let Some(old) = self.grpc_tasks.remove(&job.tab_id) {
+                old.abort();
+            }
+            // follow-up messages and Finish reach a streaming call through this channel
+            let (itx, irx) = tokio::sync::mpsc::unbounded_channel::<GrpcInput>();
+            self.grpc_inputs.insert(job.tab_id, itx);
+            let hwnd_raw = self.hwnd.0 as isize;
+            let tab_id = job.tab_id;
+            let handle = self.rt.spawn(async move {
+                grpc_run_with(job.call, move |ev| post_to_ui(hwnd_raw, BridgeMsg::Grpc { tab_id, ev }), irx).await;
+            });
+            self.grpc_tasks.insert(tab_id, handle);
+        }
+        for (tab_id, input) in self.app.take_grpc_inputs() {
+            if let Some(tx) = self.grpc_inputs.get(&tab_id) {
+                let _ = tx.send(input);
+            }
+        }
+    }
+
     /// Runs "Test Login & Suggest Fields" requests from the environments dialog.
     fn dispatch_auth_test(&mut self) {
         for (env_id, env) in self.app.take_auth_test() {
@@ -296,6 +329,7 @@ impl Window {
         self.dispatch_media();
         self.dispatch_ws();
         self.dispatch_gql();
+        self.dispatch_grpc();
         self.dispatch_auth_test();
         self.dispatch_format();
         self.dispatch_pdf();
@@ -406,6 +440,8 @@ pub fn run() -> Result<()> {
             high_surrogate: None,
             rt,
             ws_tasks: HashMap::new(),
+            grpc_tasks: HashMap::new(),
+            grpc_inputs: HashMap::new(),
             save_tx: Some(save_tx),
             save_thread: Some(save_thread),
             frame_ms: std::collections::VecDeque::new(),
@@ -564,6 +600,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         }
                     }
                 }
+                if win.app.take_proto_request() {
+                    if let Some(path) = pick_proto(hwnd) {
+                        match win.app.grpc_load_proto(&path) {
+                            Ok(()) => win.invalidate(),
+                            Err(e) => msgbox(hwnd, &e),
+                        }
+                    }
+                }
                 if win.app.take_import_request() {
                     if let Some(path) = pick_file(hwnd) {
                         let res = std::fs::read_to_string(&path).map_err(|e| format!("Could not read the file: {e}")).and_then(|text| win.app.import_tab(&text));
@@ -664,6 +708,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     BridgeMsg::Ws { tab_id, ev } => win.app.on_ws_event(tab_id, ev),
                     BridgeMsg::WsEnded { tab_id } => win.app.on_ws_ended(tab_id),
                     BridgeMsg::Schema { tab_id, res } => win.app.on_schema(tab_id, res),
+                    BridgeMsg::Grpc { tab_id, ev } => win.app.on_grpc_event(tab_id, ev),
                     BridgeMsg::AuthTest { env_id, res } => win.app.on_auth_test(env_id, res),
                     BridgeMsg::Formatted { tab_id, id, json, prepared } => win.app.on_formatted(tab_id, id, prepared, json),
                     BridgeMsg::PdfPage { tab_id, id, res } => win.app.on_pdf_page(tab_id, id, res),

@@ -167,13 +167,15 @@ impl ImageView {
         let (has_v, has_h) = (my > 0.0, mx > 0.0);
         let vbar = has_v.then(|| {
             let track = Rect::new(area.r - SB - 2.0, area.t + 2.0, area.r - 2.0, area.b - 2.0 - if has_h { SB } else { 0.0 });
-            let len = (track.height() * area.height() / h).clamp(24.0, track.height());
+            let room = track.height().max(0.0);
+            let len = (track.height() * area.height() / h).clamp(24.0_f32.min(room), room);
             let top = track.t + (my - py) / (2.0 * my) * (track.height() - len);
             Bar { track, thumb: Rect::new(track.l + 2.0, top, track.r - 2.0, top + len) }
         });
         let hbar = has_h.then(|| {
             let track = Rect::new(area.l + 2.0, area.b - SB - 2.0, area.r - 2.0 - if has_v { SB } else { 0.0 }, area.b - 2.0);
-            let len = (track.width() * area.width() / w).clamp(24.0, track.width());
+            let room = track.width().max(0.0);
+            let len = (track.width() * area.width() / w).clamp(24.0_f32.min(room), room);
             let left = track.l + (mx - px) / (2.0 * mx) * (track.width() - len);
             Bar { track, thumb: Rect::new(left, track.t + 2.0, left + len, track.b - 2.0) }
         });

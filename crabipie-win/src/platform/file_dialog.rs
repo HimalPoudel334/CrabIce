@@ -48,3 +48,24 @@ pub fn save_file(owner: HWND, default_name: &str) -> Option<String> {
         }
     }
 }
+
+/// Native "Open" dialog filtered to .proto files.
+pub fn pick_proto(owner: HWND) -> Option<String> {
+    unsafe {
+        let mut buf = [0u16; 1024];
+        let filter: Vec<u16> = "Protocol Buffers (*.proto)\0*.proto\0All files\0*.*\0\0".encode_utf16().collect();
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = owner;
+        ofn.lpstrFilter = PCWSTR(filter.as_ptr());
+        ofn.lpstrFile = PWSTR(buf.as_mut_ptr());
+        ofn.nMaxFile = buf.len() as u32;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+        if GetOpenFileNameW(&mut ofn).as_bool() {
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Some(String::from_utf16_lossy(&buf[..len]))
+        } else {
+            None
+        }
+    }
+}

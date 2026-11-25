@@ -126,7 +126,7 @@ fn join(prefix: &str, name: &str) -> String {
 }
 
 /// protoc's default JSON name: drop underscores, upper-case the next letter.
-fn lower_camel(name: &str) -> String {
+pub(crate) fn lower_camel(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut up = false;
     for c in name.chars() {
@@ -161,6 +161,23 @@ impl Pool {
 
     pub fn has_file(&self, name: &str) -> bool {
         self.files.contains(name)
+    }
+
+    // Used by the .proto loader, which builds descriptors itself instead of decoding bytes.
+    pub fn mark_file(&mut self, name: &str) {
+        self.files.insert(name.to_string());
+    }
+
+    pub fn insert_message(&mut self, m: Message) {
+        self.messages.insert(m.full_name.clone(), m);
+    }
+
+    pub fn insert_enum(&mut self, e: EnumDesc) {
+        self.enums.insert(e.full_name.clone(), e);
+    }
+
+    pub fn insert_service(&mut self, s: Service) {
+        self.services.push(s);
     }
 
     /// Adds one serialized FileDescriptorProto. Returns the names of its

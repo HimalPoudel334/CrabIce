@@ -8,6 +8,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crabipie_core::grpc::{
+    desc::Pool as GrpcPool,
+    dynmsg as grpc_dynmsg,
+    job::{metadata_from_state, GrpcCall, GrpcEvent, GrpcInput},
+    proto::load_proto as grpc_parse_proto,
+};
+use crabipie_core::resolve_vars;
+
 use crate::ui::icons::{self, Icon};
 use crate::ui::image_view::{self, Edge, ImageView};
 use crate::ui::media_view::{self, MediaState, MediaView, Source};
@@ -102,7 +110,7 @@ pub enum InputId { GqlSearch, CkDomain, CkName, CkValue, WsMsg, GqlOp, EnvName, 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AreaId { WsLog, GqlQuery, GqlVars, Body, RawHeaders, RawForm, Resp, LoginBody, RefreshBody }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PickerKind { AppTheme, WsType, WsBin, TabEnv, EnvSelect, AuthMode, LoginMethod, LoginFormat, RefreshMethod, RefreshFormat, ReqType, Method, Content, AuthType, ApiPos, HeadersView, FieldType(usize), SaveFolder, JsonTheme }
+pub enum PickerKind { AppTheme, WsType, WsBin, TabEnv, EnvSelect, AuthMode, LoginMethod, LoginFormat, RefreshMethod, RefreshFormat, ReqType, Method, Content, AuthType, ApiPos, HeadersView, FieldType(usize), SaveFolder, JsonTheme, GrpcMethod }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus { None, Input(InputId), Area(AreaId) }
 
@@ -129,6 +137,12 @@ pub enum Act {
     ChooseFile(usize),
     WsSend,
     GqlFetch,
+    GrpcLoad,
+    GrpcProto,
+    GrpcStreamSend,
+    GrpcStreamFinish,
+    GrpcInsecure,
+    GrpcTemplate,
     GqlCollapse,
     GqlClearSel,
     ImageView,
@@ -374,6 +388,22 @@ pub struct Tab {
     pub gql_manual: HashSet<String>,
     pub gql_search: TextInput,
     pub gql_scroll: f32,
+    /// gRPC: descriptors from reflection, the flat "pkg.Service/Method" list, and the choice.
+    pub grpc_pool: Option<Arc<GrpcPool>>,
+    pub grpc_methods: Vec<String>,
+    pub grpc_sel: String,
+    /// The .proto the descriptors were loaded from (empty = reflection).
+    pub grpc_proto: String,
+    /// The template last written into the Body, so a method change can tell "untouched" from "edited".
+    pub grpc_template: String,
+    pub grpc_loading: bool,
+    pub grpc_error: Option<String>,
+    pub grpc_insecure: bool,
+    pub grpc_started: Option<std::time::Instant>,
+    pub grpc_msgs: usize,
+    /// A client-streaming/bidirectional call is open: Send message and Finish are offered.
+    pub grpc_stream_open: bool,
+    pub grpc_sent: usize,
     pub ws_state: WsState,
     pub ws_conn: Option<WsConnection>,
     pub ws_log: TextArea,
@@ -436,6 +466,18 @@ impl Tab {
             gql_manual: HashSet::new(),
             gql_search: input("Search fields"),
             gql_scroll: 0.0,
+            grpc_pool: None,
+            grpc_methods: Vec::new(),
+            grpc_sel: String::new(),
+            grpc_proto: String::new(),
+            grpc_template: String::new(),
+            grpc_loading: false,
+            grpc_error: None,
+            grpc_insecure: false,
+            grpc_started: None,
+            grpc_msgs: 0,
+            grpc_stream_open: false,
+            grpc_sent: 0,
             ws_state: WsState::Disconnected,
             ws_conn: None,
             ws_log: TextArea::readonly("(no messages yet)").log(),
@@ -464,6 +506,13 @@ impl Tab {
         };
         t.params_from_url();
         t
+    }
+
+    fn grpc_rebuild_methods(&mut self) {
+        self.grpc_methods = match &self.grpc_pool {
+            Some(p) => p.services().iter().flat_map(|s| s.methods.iter().map(move |m| format!("{}/{}", s.full_name, m.name))).collect(),
+            None => Vec::new(),
+        };
     }
 
     /// Tab strip label: the URL without its scheme, like a browser tab.
@@ -531,6 +580,9 @@ impl Tab {
                 _ => ResponseTab::Body,
             },
             active_environment_id: self.env_id,
+            grpc_method: self.grpc_sel.clone(),
+            grpc_proto: self.grpc_proto.clone(),
+            grpc_insecure: self.grpc_insecure,
             ..base
         }
     }
@@ -558,6 +610,9 @@ impl Tab {
         }
         t.content_type = s.content_type.clone();
         t.body.set_text(&s.body);
+        t.grpc_sel = s.grpc_method.clone();
+        t.grpc_proto = s.grpc_proto.clone();
+        t.grpc_insecure = s.grpc_insecure;
         t.form = s
             .form_data
             .iter()
@@ -712,6 +767,12 @@ pub struct GqlJob {
     pub jar: HashMap<String, Vec<CookieEntry>>,
 }
 
+/// A gRPC discovery or call for the window layer to run on the runtime.
+pub struct GrpcJob {
+    pub tab_id: usize,
+    pub call: GrpcCall,
+}
+
 /// What the window layer must run: build + execute this request on the runtime.
 pub struct SendJob {
     pub tab_id: usize,
@@ -759,6 +820,10 @@ pub struct App {
     gql_rows: Vec<TreeRow>,
     gql_tree_rect: Rect,
     gql_jobs: Vec<GqlJob>,
+    grpc_jobs: Vec<GrpcJob>,
+    grpc_cancels: Vec<usize>,
+    proto_req: bool,
+    grpc_inputs: Vec<(usize, GrpcInput)>,
     cookie_modal: bool,
     ck_domain: TextInput,
     ck_name: TextInput,
@@ -875,6 +940,10 @@ impl App {
             gql_rows: Vec::new(),
             gql_tree_rect: Rect::default(),
             gql_jobs: Vec::new(),
+            grpc_jobs: Vec::new(),
+            grpc_cancels: Vec::new(),
+            proto_req: false,
+            grpc_inputs: Vec::new(),
             cookie_modal: false,
             ck_domain: input("example.com"),
             ck_name: input("name"),
@@ -971,6 +1040,9 @@ impl App {
             app.split = u.split.clamp(0.2, 0.8);
             app.gql_tree_w = u.gql_tree_width.clamp(200.0, 600.0);
             app.gql_qfrac = u.gql_query_frac.clamp(0.15, 0.85);
+        }
+        for ix in 0..app.tabs.len() {
+            app.grpc_reload_proto(ix);
         }
         app
     }
@@ -1236,6 +1308,7 @@ impl App {
             self.active = 0;
             return;
         }
+        self.grpc_cancels.push(self.tabs[i].id);
         self.tabs.remove(i);
         if i < self.active {
             self.active -= 1;
@@ -1257,6 +1330,10 @@ impl App {
             self.ws_toggle();
             return;
         }
+        if self.tab().request_type == RequestType::GRPC {
+            self.grpc_send();
+            return;
+        }
         let t = self.tab_mut();
         if t.sending {
             if t.streaming {
@@ -1265,12 +1342,6 @@ impl App {
             return;
         }
         if t.url.edit.text().trim().is_empty() {
-            return;
-        }
-        if t.request_type == RequestType::GRPC {
-            let mut rs = RespState::empty("Not available yet");
-            rs.body.set_text("gRPC support is not implemented yet.");
-            t.resp = Some(rs);
             return;
         }
         t.send_requested = true;
@@ -1439,6 +1510,275 @@ impl App {
         rs.headers.set_text(&r.headers);
         rs.elapsed = r.response_time;
         rs
+    }
+
+    // ── gRPC ────────────────────────────────────────────────────────
+
+    /// Everything a gRPC job needs from a tab, with variables and auth resolved.
+    fn grpc_call(&self, ix: usize, method: Option<String>) -> GrpcCall {
+        let t = &self.tabs[ix];
+        let env = t.env_id.and_then(|id| self.envs.iter().find(|e| e.id == id));
+        let state = SavedState {
+            headers: t.header_list(),
+            auth_type: t.auth_type,
+            username: t.username.edit.text().to_string(),
+            password: t.password.edit.text().to_string(),
+            bearer_token: t.bearer.edit.text().to_string(),
+            api_key_name: t.api_name.edit.text().to_string(),
+            api_key: t.api_val.edit.text().to_string(),
+            api_key_position: t.api_pos,
+            ..SavedState::default()
+        };
+        GrpcCall {
+            url: resolve_vars(t.url.edit.text().trim(), env),
+            insecure: t.grpc_insecure,
+            metadata: metadata_from_state(&state, env),
+            pool: t.grpc_pool.clone(),
+            method,
+            body: resolve_vars(t.body.edit.text(), env),
+        }
+    }
+
+    /// "Load services": ask the server what it offers (reflection).
+    fn grpc_load(&mut self) {
+        let ix = self.active;
+        if self.tabs[ix].grpc_loading || self.tabs[ix].sending || self.tabs[ix].url.edit.text().trim().is_empty() {
+            return;
+        }
+        let call = self.grpc_call(ix, None);
+        let t = &mut self.tabs[ix];
+        t.grpc_loading = true;
+        t.grpc_error = None;
+        let tab_id = t.id;
+        self.grpc_jobs.push(GrpcJob { tab_id, call });
+    }
+
+    /// Send button on a gRPC tab: starts the call, or cancels the running one.
+    fn grpc_send(&mut self) {
+        let ix = self.active;
+        let tab_id = self.tabs[ix].id;
+        if self.tabs[ix].sending {
+            self.grpc_cancels.push(tab_id);
+            let t = &mut self.tabs[ix];
+            t.sending = false;
+            t.streaming = false;
+            t.grpc_stream_open = false;
+            if let Some(rs) = t.resp.as_mut() {
+                rs.status = "Cancelled".into();
+            }
+            return;
+        }
+        if self.tabs[ix].url.edit.text().trim().is_empty() {
+            return;
+        }
+        if self.tabs[ix].grpc_sel.is_empty() {
+            let mut rs = RespState::empty("No method selected");
+            rs.body.set_text("Use \"Load services\", then pick a method.");
+            self.tabs[ix].resp = Some(rs);
+            return;
+        }
+        let method = self.tabs[ix].grpc_sel.clone();
+        let call = self.grpc_call(ix, Some(method));
+        let t = &mut self.tabs[ix];
+        t.grpc_loading = false; // a running discovery is replaced by this call
+        t.sending = true;
+        t.streaming = true;
+        t.grpc_started = Some(std::time::Instant::now());
+        t.grpc_msgs = 0;
+        t.grpc_sent = 0;
+        t.grpc_stream_open = false;
+        t.resp = Some(RespState::empty("Calling…"));
+        self.grpc_jobs.push(GrpcJob { tab_id, call });
+    }
+
+    /// Loads a .proto into the active tab. Imports are looked up next to the file and in its parent folders.
+    pub fn grpc_load_proto(&mut self, path: &str) -> Result<(), String> {
+        let ix = self.active;
+        self.grpc_load_proto_into(ix, path)?;
+        self.touch();
+        Ok(())
+    }
+
+    fn grpc_load_proto_into(&mut self, ix: usize, path: &str) -> Result<(), String> {
+        let p = std::path::Path::new(path);
+        let text = std::fs::read_to_string(p).map_err(|e| format!("Could not read {path}: {e}"))?;
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file.proto".to_string());
+        let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        // imports are written relative to some project root: try the file's folder, then each parent
+        let find = |imp: &str| -> Option<String> {
+            let mut cur: Option<&std::path::Path> = Some(dir.as_path());
+            for _ in 0..8 {
+                let d = cur?;
+                if let Ok(s) = std::fs::read_to_string(d.join(imp)) {
+                    return Some(s);
+                }
+                cur = d.parent();
+            }
+            None
+        };
+        let mut pool = GrpcPool::default();
+        grpc_parse_proto(&mut pool, &name, &text, &find)?;
+        if pool.services().iter().all(|s| s.methods.is_empty()) {
+            return Err(format!("{name} defines no services (no `service` block with rpc methods)"));
+        }
+        let t = &mut self.tabs[ix];
+        t.grpc_pool = Some(Arc::new(pool));
+        t.grpc_proto = path.to_string();
+        t.grpc_error = None;
+        t.grpc_rebuild_methods();
+        Ok(())
+    }
+
+    /// At startup a gRPC tab saved with a .proto gets its descriptors back from the file.
+    fn grpc_reload_proto(&mut self, ix: usize) {
+        let path = self.tabs[ix].grpc_proto.clone();
+        if path.is_empty() || self.tabs[ix].request_type != RequestType::GRPC {
+            return;
+        }
+        if let Err(e) = self.grpc_load_proto_into(ix, &path) {
+            self.tabs[ix].grpc_error = Some(e);
+        }
+    }
+
+    /// Sends the editor's text as the next message of the open streaming call.
+    fn grpc_stream_send(&mut self) {
+        let t = self.tab();
+        if !t.grpc_stream_open {
+            return;
+        }
+        let (tab_id, text) = (t.id, t.body.edit.text().to_string());
+        self.grpc_inputs.push((tab_id, GrpcInput::Message(text)));
+    }
+
+    /// Closes our side of the request stream (once).
+    fn grpc_stream_finish(&mut self) {
+        let t = self.tab_mut();
+        if !t.grpc_stream_open {
+            return;
+        }
+        t.grpc_stream_open = false;
+        let tab_id = t.id;
+        self.grpc_inputs.push((tab_id, GrpcInput::Finish));
+    }
+
+    /// Follow-up messages and Finish for the window layer to hand to running calls.
+    pub fn take_grpc_inputs(&mut self) -> Vec<(usize, GrpcInput)> {
+        std::mem::take(&mut self.grpc_inputs)
+    }
+
+    pub fn take_grpc_jobs(&mut self) -> Vec<GrpcJob> {
+        std::mem::take(&mut self.grpc_jobs)
+    }
+
+    /// Tabs whose running gRPC task should be aborted.
+    pub fn take_grpc_cancels(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.grpc_cancels)
+    }
+
+    /// Writes an empty request for the chosen method into the Body. Without
+    /// `force` it only replaces a blank body or an untouched earlier template.
+    fn grpc_apply_template(&mut self, force: bool) {
+        let t = self.tab_mut();
+        let Some(pool) = t.grpc_pool.clone() else { return };
+        let Some((svc, name)) = t.grpc_sel.split_once('/') else { return };
+        let Some(m) = pool.find_method(svc, name) else { return };
+        let tpl = serde_json::to_string_pretty(&grpc_dynmsg::skeleton(&pool, &m.input)).unwrap_or_default();
+        let cur = t.body.edit.text().trim().to_string();
+        if force || cur.is_empty() || cur == t.grpc_template.trim() {
+            t.body.set_text(&tpl);
+        }
+        t.grpc_template = tpl;
+    }
+
+    fn grpc_select(&mut self, label: String) {
+        let t = self.tab_mut();
+        let changed = t.grpc_sel != label;
+        t.grpc_sel = label;
+        if changed {
+            self.grpc_apply_template(false);
+        }
+        self.touch();
+    }
+
+    /// Progress from a gRPC task (posted from the runtime). Events for closed tabs are dropped.
+    pub fn on_grpc_event(&mut self, tab_id: usize, ev: GrpcEvent) -> bool {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return false };
+        match ev {
+            GrpcEvent::Pool(p) => {
+                t.grpc_loading = false;
+                t.grpc_error = None;
+                t.grpc_pool = Some(p);
+                t.grpc_proto.clear(); // these came from the server
+                t.grpc_rebuild_methods();
+            }
+            GrpcEvent::DiscoveryFailed(e) => {
+                t.grpc_loading = false;
+                t.grpc_error = Some(e);
+            }
+            GrpcEvent::StreamOpen => t.grpc_stream_open = true,
+            GrpcEvent::Sent(n) => {
+                t.grpc_sent = n;
+                t.grpc_error = None;
+                if let Some(rs) = t.resp.as_mut() {
+                    rs.status = format!("Streaming… ({} received, {n} sent)", t.grpc_msgs);
+                }
+            }
+            GrpcEvent::InputError(e) => t.grpc_error = Some(e),
+            GrpcEvent::Message(json) => {
+                let Some(rs) = t.resp.as_mut() else { return false };
+                if t.grpc_msgs == 0 {
+                    rs.body.set_text(&json);
+                    rs.body.set_highlight(true);
+                } else {
+                    rs.body.append(&format!("\n\n{json}"));
+                }
+                t.grpc_msgs += 1;
+                rs.status = if t.grpc_sent > 0 {
+                    format!("Streaming… ({} received, {} sent)", t.grpc_msgs, t.grpc_sent)
+                } else {
+                    format!("Receiving… ({} message{})", t.grpc_msgs, if t.grpc_msgs == 1 { "" } else { "s" })
+                };
+            }
+            GrpcEvent::Done(end) => {
+                t.sending = false;
+                t.streaming = false;
+                t.grpc_stream_open = false;
+                let elapsed = t.grpc_started.take().map(|s| s.elapsed());
+                if let Some(rs) = t.resp.as_mut() {
+                    rs.status = end.summary();
+                    rs.elapsed = elapsed;
+                    if t.grpc_msgs == 0 {
+                        rs.body.set_text(&if end.ok() { "(the call returned no messages)".to_string() } else { end.summary() });
+                        rs.body.set_highlight(false);
+                    }
+                    let mut head: Vec<String> = end.headers.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+                    if !end.trailers.is_empty() {
+                        head.push(String::new());
+                        head.push("Trailers".to_string());
+                        head.extend(end.trailers.iter().map(|(k, v)| format!("{k}: {v}")));
+                    }
+                    rs.headers.set_text(&head.join("\n"));
+                }
+            }
+            GrpcEvent::Failed(e) => {
+                t.sending = false;
+                t.streaming = false;
+                t.grpc_stream_open = false;
+                t.grpc_started = None;
+                if t.grpc_msgs > 0 {
+                    // keep what already streamed in, and say what went wrong after it
+                    if let Some(rs) = t.resp.as_mut() {
+                        rs.status = "Error".into();
+                        rs.body.append(&format!("\n\n{e}"));
+                    }
+                } else {
+                    let mut rs = RespState::empty("Error");
+                    rs.body.set_text(&e);
+                    t.resp = Some(rs);
+                }
+            }
+        }
+        true
     }
 
     // ── graphql schema browser ──────────────────────────────────────
@@ -1733,6 +2073,17 @@ impl App {
             PickerKind::LoginFormat => (names(&AuthBodyFormat::ALL), AuthBodyFormat::ALL.iter().position(|x| *x == self.cfg_ref().login_body_format).unwrap_or(0)),
             PickerKind::RefreshMethod => (names(&AuthHttpMethod::ALL), AuthHttpMethod::ALL.iter().position(|x| *x == self.cfg_ref().refresh_method).unwrap_or(0)),
             PickerKind::RefreshFormat => (names(&AuthBodyFormat::ALL), AuthBodyFormat::ALL.iter().position(|x| *x == self.cfg_ref().refresh_body_format).unwrap_or(0)),
+            PickerKind::GrpcMethod => {
+                if t.grpc_methods.is_empty() {
+                    let label = if t.grpc_sel.is_empty() { "Select a method…".to_string() } else { t.grpc_sel.clone() };
+                    (vec![label], 0)
+                } else {
+                    let mut v = vec!["Select a method…".to_string()];
+                    v.extend(t.grpc_methods.iter().cloned());
+                    let cur = t.grpc_methods.iter().position(|m| *m == t.grpc_sel).map_or(0, |i| i + 1);
+                    (v, cur)
+                }
+            }
             PickerKind::JsonTheme => (crate::ui::json_color::theme_names(), crate::ui::json_color::theme_index()),
             PickerKind::SaveFolder => {
                 let opts = crabipie_core::folder_options(&self.collection.items);
@@ -1764,6 +2115,13 @@ impl App {
                 }
                 return;
             }
+            PickerKind::GrpcMethod => {
+                let label = if idx == 0 { None } else { self.tab().grpc_methods.get(idx - 1).cloned() };
+                if let Some(label) = label {
+                    self.grpc_select(label);
+                }
+                return;
+            }
             PickerKind::WsType => {
                 self.tab_mut().ws_type = WsMessageType::ALL[idx];
                 return;
@@ -1782,6 +2140,9 @@ impl App {
                 let new = RequestType::ALL[idx];
                 if self.tabs[ix].request_type == RequestType::WebSocket && new != RequestType::WebSocket {
                     self.ws_disconnect_ix(ix);
+                }
+                if new == RequestType::GRPC && self.tabs[ix].request_type != RequestType::GRPC {
+                    self.tabs[ix].req_tab = ReqTabKind::Body; // gRPC lives on the Body tab
                 }
                 self.tabs[ix].request_type = new;
                 return;
@@ -1870,6 +2231,16 @@ impl App {
             Act::Add(k) => self.rows_of(k).push(KvRow::empty()),
             Act::WsSend => self.ws_send(),
             Act::GqlFetch => self.gql_fetch(),
+            Act::GrpcLoad => self.grpc_load(),
+            Act::GrpcProto => self.proto_req = true,
+            Act::GrpcStreamSend => self.grpc_stream_send(),
+            Act::GrpcStreamFinish => self.grpc_stream_finish(),
+            Act::GrpcInsecure => {
+                let t = self.tab_mut();
+                t.grpc_insecure = !t.grpc_insecure;
+                self.touch();
+            }
+            Act::GrpcTemplate => self.grpc_apply_template(true),
             Act::GqlCollapse => {
                 let t = self.tab_mut();
                 t.gql_expanded.clear();
@@ -2433,6 +2804,8 @@ impl App {
                 Key::Enter if !self.media_fullscreen => {
                     if self.focus == Focus::Input(InputId::WsMsg) {
                         self.ws_send();
+                    } else if self.tab().grpc_stream_open {
+                        self.grpc_stream_send(); // not Cancel: the call is a conversation
                     } else {
                         self.trigger_send();
                     }
@@ -2696,11 +3069,12 @@ impl App {
         // request row
         self.paint_picker(c, PickerKind::ReqType, Rect::xywh(10.0, 92.0, 110.0, 38.0));
         let ws = self.tab().request_type == RequestType::WebSocket;
-        if !ws {
+        let grpc = self.tab().request_type == RequestType::GRPC;
+        if !ws && !grpc {
             self.paint_picker(c, PickerKind::Method, Rect::xywh(130.0, 92.0, 100.0, 38.0));
         }
         let send = Rect::new((wd - 110.0).max(240.0), 92.0, (wd - 10.0).max(340.0), 130.0);
-        let url_l = if ws { 130.0 } else { 240.0 };
+        let url_l = if ws || grpc { 130.0 } else { 240.0 };
         self.paint_input(c, InputId::Url, Rect::new(url_l, 92.0, (send.l - 10.0).max(url_l + 10.0), 130.0));
         let (label, primary) = if ws {
             match self.tab().ws_state {
@@ -3260,6 +3634,9 @@ impl App {
             c.text("WebSocket arrives in a later step.", Rect::new(a.l, a.t, a.r, a.t + 28.0), th.text_dim, w::UI);
             return a.t + 30.0;
         }
+        if t.request_type == RequestType::GRPC {
+            return self.paint_grpc(c, th, a);
+        }
         if t.request_type == RequestType::GraphQL {
             self.paint_gql(c, th, a);
             return a.b;
@@ -3291,6 +3668,53 @@ impl App {
             }
             (_, false) => self.paint_kv(c, th, ed, RowKind::Form, ed.t - self.req_scroll),
         }
+    }
+
+    /// gRPC Body tab: method picker, the two ways to load services, TLS checkbox, and the JSON request editor.
+    fn paint_grpc(&mut self, c: &mut dyn Canvas, th: &Theme, a: Rect) -> f32 {
+        c.text("Method:", Rect::new(a.l, a.t, a.l + 60.0, a.t + 32.0), th.text, w::UI);
+        self.paint_picker(c, PickerKind::GrpcMethod, Rect::new(a.l + 64.0, a.t, a.r, a.t + 32.0));
+        let y = a.t + 42.0;
+        let busy = self.tab().grpc_loading;
+        let load = Rect::new(a.l, y, a.l + 130.0, y + 32.0);
+        w::button(c, th, load, if busy { "Loading…" } else { "Load services" }, !busy);
+        self.push_hot(load, Act::GrpcLoad);
+        let proto = Rect::new(a.l + 138.0, y, a.l + 262.0, y + 32.0);
+        w::button(c, th, proto, "Load .proto", false);
+        self.push_hot(proto, Act::GrpcProto);
+        let tpl = Rect::new(a.r - 84.0, y, a.r, y + 32.0);
+        c.text("Template", tpl, th.accent, w::UI.align(Align::Right));
+        self.push_hot(tpl, Act::GrpcTemplate);
+        let y2 = y + 40.0;
+        let cb = Rect::xywh(a.l, y2 + 8.0, 16.0, 16.0);
+        let insecure = self.tab().grpc_insecure;
+        w::checkbox(c, th, cb, insecure);
+        c.text("Skip TLS verification", Rect::new(cb.r + 8.0, y2, cb.r + 190.0, y2 + 32.0), th.text, w::UI);
+        self.push_hot(Rect::new(cb.l - 4.0, y2, cb.r + 190.0, y2 + 32.0), Act::GrpcInsecure);
+        let open = self.tab().grpc_stream_open;
+        if open {
+            let send = Rect::new(cb.r + 200.0, y2, cb.r + 330.0, y2 + 32.0);
+            w::button(c, th, send, "Send message", true);
+            self.push_hot(send, Act::GrpcStreamSend);
+            let fin = Rect::new(send.r + 8.0, y2, send.r + 104.0, y2 + 32.0);
+            w::button(c, th, fin, "Finish", false);
+            self.push_hot(fin, Act::GrpcStreamFinish);
+        }
+        let note_t = y2 + 38.0;
+        let t = self.tab();
+        let from = if t.grpc_proto.is_empty() { "the server".to_string() } else { std::path::Path::new(&t.grpc_proto).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() };
+        let (note, col) = match (&t.grpc_error, t.grpc_methods.len()) {
+            (Some(e), _) => (e.clone(), th.danger),
+            (None, _) if open => (format!("Streaming: {} sent. Edit the message, then Send message (Ctrl+Enter); Finish closes your side.", t.grpc_sent), th.text_dim),
+            (None, 0) => ("No services loaded yet. Press Load services (needs reflection) or Load .proto.".to_string(), th.text_dim),
+            (None, n) => (format!("{n} method{} from {from}", if n == 1 { "" } else { "s" }), th.text_dim),
+        };
+        c.text(&note, Rect::new(a.l, note_t, a.r, note_t + 22.0), col, TextStyle::new(12.0));
+        // the editor keeps a usable height; in a short pane the request panel scrolls
+        let top = note_t + 28.0;
+        let bottom = a.b.max(top + 140.0);
+        self.paint_area(c, AreaId::Body, Rect::new(a.l, top, a.r, bottom));
+        bottom
     }
 
     fn paint_auth(&mut self, c: &mut dyn Canvas, th: &Theme, a: Rect) -> f32 {
@@ -3919,6 +4343,11 @@ impl App {
         Some((format!("{stem}.json"), json))
     }
 
+    /// "Load .proto" was pressed: the window layer shows the file dialog.
+    pub fn take_proto_request(&mut self) -> bool {
+        std::mem::take(&mut self.proto_req)
+    }
+
     pub fn take_import_request(&mut self) -> bool {
         std::mem::take(&mut self.import_req)
     }
@@ -3952,6 +4381,11 @@ fn tip(act: Act) -> Option<&'static str> {
         Act::GqlClearSel => "Clear selection",
         Act::GqlCollapse => "Collapse all types",
         Act::GqlFetch => "Fetch schema",
+        Act::GrpcLoad => "List the server's services (needs gRPC reflection)",
+        Act::GrpcProto => "Read the services from a .proto file (for servers without reflection)",
+        Act::GrpcStreamSend => "Send the request editor's text as the next message (Ctrl+Enter)",
+        Act::GrpcStreamFinish => "Close the request side; the server can keep answering",
+        Act::GrpcTemplate => "Replace the request with an empty template",
         Act::SaveBlob => "Save to file",
         Act::MediaPlay => "Play / Pause",
         Act::MediaMute => "Mute",
@@ -5414,5 +5848,229 @@ mod tests {
         h.a.set_focus(Focus::Input(InputId::Url));
         h.a.on_key(Key::Space, none, &mut h.cb);
         assert!(h.a.take_media_cmds().is_empty());
+    }
+
+    /// proto3, package demo: message Req { string q = 1; } service Echo { rpc Say(Req) returns (Req); }
+    fn grpc_test_pool() -> GrpcPool {
+        use crabipie_core::grpc::wire::*;
+        fn s(out: &mut Vec<u8>, f: u32, v: &str) {
+            put_len(out, f, v.as_bytes());
+        }
+        fn n(out: &mut Vec<u8>, f: u32, v: u64) {
+            put_tag(out, f, VARINT);
+            put_varint(out, v);
+        }
+        let mut q = Vec::new();
+        s(&mut q, 1, "q");
+        n(&mut q, 3, 1);
+        n(&mut q, 4, 1);
+        n(&mut q, 5, 9);
+        let mut req = Vec::new();
+        s(&mut req, 1, "Req");
+        put_len(&mut req, 2, &q);
+        let mut say = Vec::new();
+        s(&mut say, 1, "Say");
+        s(&mut say, 2, ".demo.Req");
+        s(&mut say, 3, ".demo.Req");
+        let mut svc = Vec::new();
+        s(&mut svc, 1, "Echo");
+        put_len(&mut svc, 2, &say);
+        let mut file = Vec::new();
+        s(&mut file, 1, "echo.proto");
+        s(&mut file, 2, "demo");
+        put_len(&mut file, 4, &req);
+        put_len(&mut file, 6, &svc);
+        s(&mut file, 12, "proto3");
+        let mut pool = GrpcPool::default();
+        pool.add_file(&file).unwrap();
+        pool
+    }
+
+    #[test]
+    fn grpc_flow_load_pick_template_send_and_show_messages() {
+        use crabipie_core::grpc::client::CallEnd;
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "GRPC");
+        assert_eq!(h.a.tab().req_tab, ReqTabKind::Body, "gRPC opens on the Body tab");
+        h.type_into(InputId::Url, "localhost:50051");
+
+        // Load services -> a discovery job; the descriptors arrive as an event
+        h.click(Act::GrpcLoad);
+        let jobs = h.a.take_grpc_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].call.method.is_none() && jobs[0].call.pool.is_none());
+        assert_eq!(jobs[0].call.url, "localhost:50051");
+        assert!(h.a.tab().grpc_loading);
+        assert!(h.a.on_grpc_event(jobs[0].tab_id, GrpcEvent::Pool(Arc::new(grpc_test_pool()))));
+        h.repaint();
+        assert!(!h.a.tab().grpc_loading);
+        assert_eq!(h.a.tab().grpc_methods, vec!["demo.Echo/Say".to_string()]);
+
+        // choosing a method writes a request template into the Body
+        h.pick(PickerKind::GrpcMethod, "demo.Echo/Say");
+        assert_eq!(h.a.tab().grpc_sel, "demo.Echo/Say");
+        assert!(h.a.tab().body.edit.text().contains("\"q\""), "template inserted");
+
+        // Send -> a call job that reuses the descriptors
+        h.a.tab_mut().body.set_text("{\"q\": \"hi\"}");
+        h.click(Act::Send);
+        let jobs = h.a.take_grpc_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].call.method.as_deref(), Some("demo.Echo/Say"));
+        assert!(jobs[0].call.pool.is_some());
+        assert!(h.a.tab().sending);
+        let id = jobs[0].tab_id;
+
+        // two streamed messages, then the status
+        h.a.on_grpc_event(id, GrpcEvent::Message("{\n  \"q\": \"hi\"\n}".into()));
+        h.a.on_grpc_event(id, GrpcEvent::Message("{\n  \"q\": \"again\"\n}".into()));
+        h.a.on_grpc_event(id, GrpcEvent::Done(CallEnd::default()));
+        let rs = h.a.tab().resp.as_ref().unwrap();
+        assert_eq!(rs.status, "OK");
+        let text = rs.body.edit.text().to_string();
+        assert!(text.contains("hi") && text.contains("again"), "{text}");
+        assert!(!h.a.tab().sending);
+    }
+
+    #[test]
+    fn grpc_send_needs_a_method_and_a_second_click_cancels() {
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "GRPC");
+        h.click(Act::Send);
+        assert!(h.a.take_grpc_jobs().is_empty());
+        assert_eq!(h.a.tab().resp.as_ref().unwrap().status, "No method selected");
+
+        h.a.tab_mut().grpc_sel = "demo.Echo/Say".into(); // e.g. restored from a saved tab
+        h.click(Act::Send);
+        assert_eq!(h.a.take_grpc_jobs().len(), 1, "no descriptors yet: the job discovers first");
+        assert!(h.a.tab().sending);
+        h.click(Act::Send); // now says Cancel
+        assert_eq!(h.a.take_grpc_cancels(), vec![h.a.tab().id]);
+        assert!(!h.a.tab().sending);
+    }
+
+    #[test]
+    fn grpc_choices_survive_save_and_load() {
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "GRPC");
+        h.a.tab_mut().grpc_sel = "demo.Echo/Say".into();
+        h.click(Act::GrpcInsecure);
+        assert!(h.a.tab().grpc_insecure);
+        let saved = h.a.tab().to_saved("Dark");
+        assert_eq!(saved.grpc_method, "demo.Echo/Say");
+        assert!(saved.grpc_insecure);
+        let t = Tab::from_saved(9, &saved);
+        assert_eq!(t.grpc_sel, "demo.Echo/Say");
+        assert!(t.grpc_insecure);
+    }
+
+    #[test]
+    fn grpc_panel_survives_a_short_window() {
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "GRPC");
+        for height in [700.0, 400.0, 300.0, 240.0, 200.0] {
+            h.a.on_resize(1400.0, height);
+            h.repaint();
+        }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!("crabipie-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn load_proto_fills_the_methods_remembers_the_file_and_finds_imports_in_parent_folders() {
+        let root = temp_dir("proto");
+        std::fs::create_dir_all(root.join("common")).unwrap();
+        std::fs::create_dir_all(root.join("svc")).unwrap();
+        std::fs::write(root.join("common/money.proto"), r#"syntax = "proto3"; package common; message Money { string currency = 1; }"#).unwrap();
+        let shop = root.join("svc/shop.proto");
+        std::fs::write(
+            &shop,
+            r#"syntax = "proto3"; package shop; import "common/money.proto";
+            message Req { common.Money price = 1; }
+            service Shop { rpc Buy(Req) returns (Req); rpc Watch(Req) returns (stream Req); }"#,
+        )
+        .unwrap();
+
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "GRPC");
+        h.click(Act::GrpcProto);
+        assert!(h.a.take_proto_request(), "the button asks the window for a file dialog");
+        h.a.grpc_load_proto(shop.to_str().unwrap()).unwrap();
+        assert_eq!(h.a.tab().grpc_methods, vec!["shop.Shop/Buy".to_string(), "shop.Shop/Watch".to_string()]);
+        h.repaint();
+        h.pick(PickerKind::GrpcMethod, "shop.Shop/Buy");
+        assert!(h.a.tab().body.edit.text().contains("price"), "template built from the parsed message");
+
+        // saved with the tab; a restart gets the descriptors back from the file
+        let saved = h.a.tab().to_saved("Dark");
+        assert_eq!(saved.grpc_proto, shop.to_str().unwrap());
+        let mut app = App::new(vec![Tab::from_saved(0, &saved)], 0, 1);
+        app.grpc_reload_proto(0);
+        assert_eq!(app.tabs[0].grpc_methods.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_proto_explains_missing_files_and_protos_without_services() {
+        let root = temp_dir("proto-err");
+        let plain = root.join("a.proto");
+        std::fs::write(&plain, r#"syntax = "proto3"; message M { }"#).unwrap();
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "GRPC");
+        let e = h.a.grpc_load_proto(plain.to_str().unwrap()).unwrap_err();
+        assert!(e.contains("no services"), "{e}");
+        let e = h.a.grpc_load_proto(root.join("nope.proto").to_str().unwrap()).unwrap_err();
+        assert!(e.contains("Could not read"), "{e}");
+        assert!(h.a.tab().grpc_methods.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn streaming_calls_get_send_and_finish_controls() {
+        use crabipie_core::grpc::client::CallEnd;
+        let mut h = H::new();
+        h.pick(PickerKind::ReqType, "GRPC");
+        h.a.tab_mut().grpc_sel = "demo.Echo/Chat".into();
+        h.click(Act::Send);
+        let id = h.a.take_grpc_jobs()[0].tab_id;
+        h.a.on_grpc_event(id, GrpcEvent::StreamOpen);
+        h.a.on_grpc_event(id, GrpcEvent::Sent(1));
+        h.repaint();
+        assert!(h.a.tab().grpc_stream_open);
+        assert_eq!(h.a.tab().resp.as_ref().unwrap().status, "Streaming… (0 received, 1 sent)");
+
+        // Send message queues the editor text for the running call
+        h.a.tab_mut().body.set_text("{\"q\": \"next\"}");
+        h.click(Act::GrpcStreamSend);
+        match &h.a.take_grpc_inputs()[..] {
+            [(tab, GrpcInput::Message(m))] => {
+                assert_eq!(*tab, id);
+                assert!(m.contains("next"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Ctrl+Enter sends the next message instead of cancelling the call
+        let ctrl = Mods { ctrl: true, shift: false };
+        h.a.on_key(Key::Enter, ctrl, &mut h.cb);
+        assert_eq!(h.a.take_grpc_inputs().len(), 1);
+        assert!(h.a.tab().sending, "the call is still running");
+
+        // a bad message shows up as an error and does not end the call
+        h.a.on_grpc_event(id, GrpcEvent::InputError("request: unknown field \"x\"".into()));
+        assert!(h.a.tab().grpc_error.as_deref().unwrap().contains("unknown field"));
+        assert!(h.a.tab().sending);
+
+        // Finish closes our side once, and the controls go away
+        h.click(Act::GrpcStreamFinish);
+        assert!(matches!(&h.a.take_grpc_inputs()[..], [(_, GrpcInput::Finish)]));
+        assert!(!h.a.tab().grpc_stream_open);
+        h.a.on_grpc_event(id, GrpcEvent::Done(CallEnd::default()));
+        assert!(!h.a.tab().sending);
     }
 }

@@ -6,4 +6,6 @@ pub mod client;
 pub mod desc;
 pub mod dynmsg;
 pub mod frame;
+pub mod job;
+pub mod proto;
 pub mod wire;

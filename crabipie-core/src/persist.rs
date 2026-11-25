@@ -159,6 +159,15 @@ pub struct SavedState {
 
     #[serde(default)]
     pub active_environment_id: Option<usize>,
+
+    // gRPC: the chosen "pkg.Service/Method" and the skip-TLS-verification checkbox
+    #[serde(default)]
+    pub grpc_method: String,
+    #[serde(default)]
+    pub grpc_insecure: bool,
+    /// Path of the .proto the descriptors came from (empty = reflection)
+    #[serde(default)]
+    pub grpc_proto: String,
 }
 
 impl Default for SavedState {
@@ -204,6 +213,9 @@ impl Default for SavedState {
             active_request_tab: RequestTab::Query,
             active_response_tab: ResponseTab::Body,
             active_environment_id: None,
+            grpc_method: String::new(),
+            grpc_insecure: false,
+            grpc_proto: String::new(),
         }
     }
 }
